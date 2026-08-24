@@ -1424,7 +1424,14 @@ The default payload is `POST` JSON, snake_case keys, epoch milliseconds:
       "longitude": 72.5714,
       "accuracy": 8.4,
       "movementSpeed": 12.5,
-      "provider": "fused",
+      "provider": {
+        "network": true,
+        "gps": true,
+        "enabled": true,
+        "status": 3,
+        "accuracyAuthorization": 0,
+        "airplane": false
+      },
       "hasSpeed": true,
       "hasBearing": true,
       "time_zone": "Asia/Kolkata",
@@ -1432,6 +1439,7 @@ The default payload is `POST` JSON, snake_case keys, epoch milliseconds:
       "detected_activity_type": "IN_VEHICLE",
       "detected_activity_start_time": 1755499000000,
       "battery_percentage": "62",
+      "is_charging": false,
       "is_mock": false,
       "integrity_flags": 0,
       "integrity_signals": []
@@ -1442,6 +1450,20 @@ The default payload is `POST` JSON, snake_case keys, epoch milliseconds:
 
 Your server should answer **2xx** for accepted, **401** for expired credentials, **403** for a
 rejected credential, and any other status to have the batch retried.
+
+`provider` describes the location subsystem when the point was captured: which providers were
+enabled, the master switch (`enabled`), the permission tier (`status`: `2` denied, `3` always,
+`4` while in use), accuracy authorization (`0` full, `1` reduced) and airplane mode. It is
+recorded per point rather than sampled at upload time — a batch can span an hour, and a
+permission downgrade inside that hour is exactly what explains a gap. It is absent on points
+stored before the SDK recorded it, which is deliberately not an object full of `false`.
+
+> **Breaking change from earlier releases:** `provider` was the provider *name* as a string
+> (`"fused"`). That name is still on the wire — `activity_status` is
+> `"<provider>@<movementStatus>"` — so read it from there.
+
+`battery_percentage` and `is_charging` describe the power state at capture time. `is_charging`
+is absent rather than `false` when the platform will not say.
 
 `integrity_flags` and `integrity_signals` describe the device when the point was captured — see [§19.4](#194-on-the-wire-and-in-storage) for the frozen bit assignments. Both default, so an existing backend keeps parsing unchanged. Treat them as advisory input to a server-side rule rather than as the defence itself, and be suspicious of a client version that is known to send them and stops.
 

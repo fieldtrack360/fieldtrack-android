@@ -852,6 +852,11 @@ public data class RawPoint(
     val extras: String?,
     /** Device-integrity bitmask when this fix was judged — see `IntegrityReport.flags`. */
     val integrityFlags: Int,
+    /**
+     * Location-subsystem snapshot when this fix was judged — see
+     * `ProviderSnapshot.fromFlags`. `0` means no snapshot was recorded.
+     */
+    val providerFlags: Int = 0,
     /** `ACCEPT`, `SKIP` or `REJECT`. */
     val verdict: String,
     /** The `Reasons` vocabulary — the same strings the decision log uses. */

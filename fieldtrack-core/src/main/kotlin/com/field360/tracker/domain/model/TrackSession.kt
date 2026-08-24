@@ -3,6 +3,7 @@ package com.field360.tracker.domain.model
 import com.field360.traker.geo.model.ActivityType
 import com.field360.traker.geo.model.FixDecision
 import com.field360.traker.geo.model.MotionState
+import com.field360.traker.geo.model.ProviderSnapshot
 import com.field360.traker.geo.model.TrackPoint
 import com.field360.tracker.integrity.IntegrityReport
 import kotlinx.serialization.Serializable
@@ -124,14 +125,50 @@ public enum class PermissionTier { NONE, FOREGROUND_ONLY, FULL }
 
 public enum class LocationAccuracy { APPROXIMATE, PRECISE }
 
+/**
+ * @property locationServicesEnabled the Settings master switch. Not the union of
+ *   [gpsEnabled] and [networkEnabled] — from API 28 the platform answers this directly, and
+ *   the two can disagree: a device with every provider off still reports location "enabled"
+ *   until the switch itself is turned off.
+ * @property airplaneMode airplane mode is on. Not a gate — GPS keeps working in airplane
+ *   mode on most devices, while network positioning does not — but it is the first thing to
+ *   check when a track degrades to GPS-only or stops in a building.
+ */
 public data class ProviderState(
     val gpsEnabled: Boolean = false,
     val networkEnabled: Boolean = false,
+    val locationServicesEnabled: Boolean = false,
     val permission: PermissionTier = PermissionTier.NONE,
     val accuracyAuthorization: LocationAccuracy = LocationAccuracy.APPROXIMATE,
     val fusedAvailable: Boolean = false,
     val powerSaveMode: Boolean = false,
-)
+    val airplaneMode: Boolean = false,
+) {
+    /**
+     * This state as the per-point wire snapshot uploaded with every coordinate.
+     *
+     * The mapping from the SDK's own vocabulary to the wire codes lives here, next to the
+     * state it translates, so the two cannot drift.
+     */
+    internal fun toSnapshot(): ProviderSnapshot = ProviderSnapshot(
+        recorded = true,
+        gpsEnabled = gpsEnabled,
+        networkEnabled = networkEnabled,
+        locationServicesEnabled = locationServicesEnabled,
+        airplaneMode = airplaneMode,
+        authorizationStatus = when (permission) {
+            // Android cannot tell "never asked" from "asked and refused", so both land on
+            // DENIED rather than one of them claiming NOT_DETERMINED it cannot prove.
+            PermissionTier.NONE -> ProviderSnapshot.STATUS_DENIED
+            PermissionTier.FOREGROUND_ONLY -> ProviderSnapshot.STATUS_WHEN_IN_USE
+            PermissionTier.FULL -> ProviderSnapshot.STATUS_ALWAYS
+        },
+        accuracyAuthorization = when (accuracyAuthorization) {
+            LocationAccuracy.PRECISE -> ProviderSnapshot.ACCURACY_FULL
+            LocationAccuracy.APPROXIMATE -> ProviderSnapshot.ACCURACY_REDUCED
+        },
+    )
+}
 
 /**
  * Events the host may observe.

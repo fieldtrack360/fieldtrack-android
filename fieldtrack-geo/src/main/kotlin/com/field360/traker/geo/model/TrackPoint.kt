@@ -47,6 +47,12 @@ public data class TrackPoint(
      * it.
      */
     val integrityFlags: Int = 0,
+    /**
+     * [ProviderSnapshot.toFlags] for the location subsystem when this point was captured —
+     * providers, the master switch, permission tier, accuracy authorization and airplane
+     * mode. [ProviderSnapshot.NOT_RECORDED] on every point captured before it existed.
+     */
+    val providerFlags: Int = ProviderSnapshot.NOT_RECORDED,
     val acceptReason: String,
 )
 

@@ -240,6 +240,12 @@ public class ResolveConfigUseCase internal constructor(
     private val repository: ConfigRepository,
     private val sensorProbe: SensorProbe,
     private val events: MutableSharedFlow<TrackerEvent>,
+    /**
+     * `IntegrityEnvironment.isWaived` — a lambda rather than a `Context` so this class stays
+     * testable on the JVM, and so there is still exactly one definition of "debug build" in
+     * the SDK. See the mock-location guard in [invoke].
+     */
+    private val isDebuggable: () -> Boolean = { false },
 ) {
     public suspend operator fun invoke(supplied: TrackerConfig): Result {
         val persisted = repository.load()
@@ -279,7 +285,17 @@ public class ResolveConfigUseCase internal constructor(
         // also be storing mock fixes because `mockLocationPolicy` was left at FLAG. The
         // stricter of the two wins, and it wins silently — a validation error here would fail
         // `ready()` over a combination the SDK can resolve correctly on its own.
-        val guarded = if (effective.security.mockLocation == IntegrityPolicy.BLOCK &&
+        //
+        // A debuggable host is exempt, and this is the same waiver the integrity layer itself
+        // takes (`IntegrityEnvironment.isWaived`), applied to the one place that was still
+        // enforcing mock policy behind its back. Both defaults are strict — `mockLocation` is
+        // BLOCK — so before this, a developer driving a fake route through the emulator got a
+        // silent, total data loss: `FixMapper` dropped every fix, nothing reached the
+        // database, and no event said why. Release builds are untouched; a repackaged APK
+        // claiming `debuggable` is the case already covered in `IntegrityProbe`'s KDoc.
+        val waiveMock = isDebuggable()
+        val guarded = if (!waiveMock &&
+            effective.security.mockLocation == IntegrityPolicy.BLOCK &&
             effective.geolocation.mockLocationPolicy != MockPolicy.REJECT
         ) {
             effective.copy(

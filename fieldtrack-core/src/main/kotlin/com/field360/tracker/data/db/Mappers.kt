@@ -47,6 +47,7 @@ internal fun TrackPointEntity.toDomain(): TrackPoint = TrackPoint(
     isCharging = isCharging,
     extras = extras,
     integrityFlags = integrityFlags,
+    providerFlags = providerFlags,
     acceptReason = acceptReason,
 )
 
@@ -76,6 +77,7 @@ internal fun TrackPoint.toEntity(): TrackPointEntity = TrackPointEntity(
     isCharging = isCharging,
     extras = extras,
     integrityFlags = integrityFlags,
+    providerFlags = providerFlags,
     acceptReason = acceptReason,
 )
 
@@ -194,6 +196,7 @@ internal fun rawPointEntity(
     isCharging: Boolean?,
     extras: String?,
     integrityFlags: Int,
+    providerFlags: Int,
     point: TrackPoint?,
 ): RawPointEntity {
     val fix = decision.fix
@@ -226,6 +229,7 @@ internal fun rawPointEntity(
         isCharging = isCharging,
         extras = extras,
         integrityFlags = integrityFlags,
+        providerFlags = providerFlags,
         verdict = decision.verdict.storedName(),
         reason = decision.reason,
     )
@@ -256,6 +260,7 @@ internal fun RawPointEntity.toDomain(): RawPoint = RawPoint(
     isCharging = isCharging,
     extras = extras,
     integrityFlags = integrityFlags,
+    providerFlags = providerFlags,
     verdict = verdict,
     reason = reason,
 )

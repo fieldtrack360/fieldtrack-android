@@ -117,6 +117,7 @@ internal class RoomPointStore(
                     isCharging = context.isCharging,
                     extras = context.extras,
                     integrityFlags = context.integrityFlags,
+                    providerFlags = context.providerFlags,
                     point = point,
                 ),
             )

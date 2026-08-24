@@ -6,7 +6,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.location.LocationManager
+import android.os.Build
 import android.os.PowerManager
+import android.provider.Settings
 import com.field360.tracker.data.location.LocationSource
 import com.field360.tracker.domain.model.ErrorCode
 import com.field360.tracker.domain.model.PermissionTier
@@ -34,6 +36,15 @@ internal class ProviderStateMonitor(
 
     private val _state = MutableStateFlow(ProviderState())
     val state: StateFlow<ProviderState> = _state.asStateFlow()
+
+    /**
+     * The current state packed for storage on a point — see `ProviderSnapshot`.
+     *
+     * A plain field read, which is the whole reason it exists: the ingest path stamps this
+     * on every fix and must not be able to trigger permission or Settings queries from
+     * inside the capture loop. [refresh] owns the sampling; this only reads what it left.
+     */
+    val snapshotFlags: Int get() = _state.value.toSnapshot().toFlags()
 
     private val appOps = context.getSystemService(AppOpsManager::class.java)
     private val locationManager = context.getSystemService(LocationManager::class.java)
@@ -67,6 +78,11 @@ internal class ProviderStateMonitor(
             IntentFilter().apply {
                 addAction(LocationManager.PROVIDERS_CHANGED_ACTION) // EC-16
                 addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED) // EC-21
+                // Protected system broadcast, so a context-registered receiver needs no
+                // exported flag even on API 34+. Airplane mode gates network positioning
+                // without touching the GPS provider, which is a degradation that otherwise
+                // reads as "the device stopped reporting" with nothing to explain it.
+                addAction(Intent.ACTION_AIRPLANE_MODE_CHANGED)
             },
         )
 
@@ -95,10 +111,12 @@ internal class ProviderStateMonitor(
             networkEnabled = runCatching {
                 locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
             }.getOrDefault(false),
+            locationServicesEnabled = locationServicesEnabled(),
             permission = permissions.tier(),
             accuracyAuthorization = permissions.accuracy(),
             fusedAvailable = locationSource.isAvailable(),
             powerSaveMode = powerManager.isPowerSaveMode,
+            airplaneMode = airplaneMode(),
         )
         if (next == previous) return
 
@@ -124,4 +142,29 @@ internal class ProviderStateMonitor(
             )
         }
     }
+
+    /**
+     * The Settings master switch, which is **not** the union of the two providers: a device
+     * can report location enabled with GPS switched off, and `isLocationEnabled` is the only
+     * thing that answers the switch itself. Below API 28 there is no such call, so the union
+     * is the honest approximation and is documented as one.
+     */
+    private fun locationServicesEnabled(): Boolean = runCatching {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            locationManager.isLocationEnabled
+        } else {
+            locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
+                locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+        }
+    }.getOrDefault(false)
+
+    /**
+     * `Settings.Global.AIRPLANE_MODE_ON`, which needs no permission. A read that throws
+     * answers `false` rather than propagating — this is a diagnostic field, and an SDK that
+     * fails to start because a Settings read was denied by an OEM is worse than one that
+     * misses a flag.
+     */
+    private fun airplaneMode(): Boolean = runCatching {
+        Settings.Global.getInt(context.contentResolver, Settings.Global.AIRPLANE_MODE_ON, 0) != 0
+    }.getOrDefault(false)
 }

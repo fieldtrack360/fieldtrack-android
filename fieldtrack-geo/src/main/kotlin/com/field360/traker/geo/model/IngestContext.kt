@@ -67,6 +67,16 @@ public data class IngestContext(
      * was taken. Defaulting to `0` keeps every recorded fixture replaying byte-identically.
      */
     val integrityFlags: Int = 0,
+    /**
+     * [ProviderSnapshot.toFlags] for the location subsystem at the time this fix was
+     * ingested. [ProviderSnapshot.NOT_RECORDED] means no snapshot was taken.
+     *
+     * The engine never interprets it — carried onto the accepted point so the row, and the
+     * upload built from that row, say what the device's location stack looked like when the
+     * point was taken. Defaulting to `NOT_RECORDED` keeps every recorded fixture replaying
+     * byte-identically.
+     */
+    val providerFlags: Int = ProviderSnapshot.NOT_RECORDED,
 ) {
     public companion object {
         /** Matches `MotionConfig.bearingChangeCaptureDeg`; a normal road junction is ~90°. */

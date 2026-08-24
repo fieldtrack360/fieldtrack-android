@@ -1315,7 +1315,14 @@ The default payload is `POST` JSON, snake_case keys, epoch milliseconds:
       "longitude": 72.5714,
       "accuracy": 8.4,
       "movementSpeed": 12.5,
-      "provider": "fused",
+      "provider": {
+        "network": true,
+        "gps": true,
+        "enabled": true,
+        "status": 3,
+        "accuracyAuthorization": 0,
+        "airplane": false
+      },
       "hasSpeed": true,
       "hasBearing": true,
       "time_zone": "Asia/Kolkata",
@@ -1323,6 +1330,7 @@ The default payload is `POST` JSON, snake_case keys, epoch milliseconds:
       "detected_activity_type": "IN_VEHICLE",
       "detected_activity_start_time": 1755499000000,
       "battery_percentage": "62",
+      "is_charging": false,
       "is_mock": false
     }
   ]
@@ -1331,6 +1339,12 @@ The default payload is `POST` JSON, snake_case keys, epoch milliseconds:
 
 Your server should answer **2xx** for accepted, **401** for expired credentials, **403** for a
 rejected credential, and any other status to have the batch retried.
+
+`provider` is the location subsystem as it was when the point was captured — providers,
+master switch, permission tier (`status`) and accuracy authorization as numeric codes, and
+airplane mode. It replaces the provider *name* that this key used to carry; the name is still
+available in `activity_status`, which is `"<provider>@<movementStatus>"`. See
+[USER-GUIDE §11](docs/USER-GUIDE.md#11-optional-modules) for the full field table.
 
 ### 14.6 Custom transport
 

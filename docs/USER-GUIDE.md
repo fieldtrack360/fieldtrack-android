@@ -1200,7 +1200,14 @@ request per point.
       "longitude": 72.5714,
       "accuracy": 8.0,
       "movementSpeed": 4.5,
-      "provider": "fused",
+      "provider": {
+        "network": true,
+        "gps": true,
+        "enabled": true,
+        "status": 3,
+        "accuracyAuthorization": 0,
+        "airplane": false
+      },
       "hasSpeed": true,
       "hasBearing": true,
       "time_zone": "Asia/Kolkata",
@@ -1208,6 +1215,7 @@ request per point.
       "detected_activity_type": "WALKING",
       "detected_activity_start_time": 1699999000000,
       "battery_percentage": "82",
+      "is_charging": true,
       "is_mock": false
     }
   ]
@@ -1222,19 +1230,39 @@ request per point.
 | `latitude` / `longitude` | number | WGS-84 degrees. The fix's own coordinates, not a filtered estimate. |
 | `accuracy` | number | Reported error radius, metres. |
 | `movementSpeed` | number | Metres per second. `0.0` when the provider reported none — check `hasSpeed` before trusting it. |
-| `provider` | string | `fused`, `gps`, `network`, `passive`, `unknown`. |
+| `provider` | object? | The location subsystem **as it was when this point was captured** — see the table below. Absent on points stored before the SDK recorded it. |
 | `hasSpeed` / `hasBearing` | boolean | Whether the provider actually supplied them. `0.0` is a legal speed. |
 | `time_zone` | string | IANA id, **per point** — a session can cross zones on a flight. |
-| `activity_status` | string | `"<provider>@<movementStatus>"`, lowercase — e.g. `fused@moving`, `gps@steady`. |
+| `activity_status` | string | `"<provider>@<movementStatus>"`, lowercase — e.g. `fused@moving`, `gps@steady`. **This is where the provider name lives.** |
 | `detected_activity_type` | string? | `WALKING`, `IN_VEHICLE`, `ON_BICYCLE`, `RUNNING`, `STILL`, `ON_FOOT`, `TILTING`, `UNKNOWN`. Enrichment only. |
 | `detected_activity_start_time` | number | Epoch ms, `0` when unknown. |
 | `battery_percentage` | string? | 0..100 **as a string**, e.g. `"82"`. |
-| `is_mock` | boolean | True when the fix was flagged as mock. |
+| `is_charging` | boolean? | Plugged in or full. Absent when the platform will not say — deliberately not `false`, which would read as "confirmed on battery". |
+| `is_mock` | boolean | True when the fix was flagged as mock. See [§11.7](#117-mock-locations-in-development) for when mock fixes are stored at all. |
 
-**Nullable fields are omitted, not sent as `null`.** If `detected_activity_type` or
-`battery_percentage` is unknown, the key is absent from the object. A backend that
-distinguishes absent from null needs to know this; it is pinned by a test
-(`SyncPayloadWireTest`) so a change cannot reach a server silently.
+#### The `provider` object
+
+| Field | Type | Notes |
+|---|---|---|
+| `network` | boolean | The network (Wi-Fi/cell) provider is enabled. |
+| `gps` | boolean | The GPS provider is enabled. |
+| `enabled` | boolean | The location **master switch**. Not the union of the two above — a device can report location enabled with GPS switched off. |
+| `status` | number | Permission tier: `0` not determined, `1` restricted, `2` denied, `3` always (foreground + background), `4` while in use. Android cannot tell "never asked" from "refused", so it never sends `0`. |
+| `accuracyAuthorization` | number | `0` full (fine location), `1` reduced (coarse only). |
+| `airplane` | boolean | Airplane mode was on. Not a gate: GPS keeps working in airplane mode on most devices while network positioning does not. |
+
+It is recorded **per point**, not sampled when the queue drains: a batch of 100 rows can
+span an hour, and a permission downgrade inside that hour is exactly the event that
+explains a gap.
+
+> **Upgrading from a release before this?** `provider` used to be the provider *name* as a
+> string (`"fused"`). The name has not been lost — `activity_status` is
+> `"<provider>@<movementStatus>"` and always was, so read it from there.
+
+**Nullable fields are omitted, not sent as `null`.** If `detected_activity_type`,
+`battery_percentage`, `is_charging` or `provider` is unknown, the key is absent from the
+object. A backend that distinguishes absent from null needs to know this; it is pinned by a
+test (`SyncPayloadWireTest`) so a change cannot reach a server silently.
 
 `gzipRequestBody = true` adds `Content-Encoding: gzip` and compresses bodies over 1 KB. It is
 **off by default and should stay off unless your server expects it** — there is no negotiation
@@ -1304,6 +1332,34 @@ class AppTransport(private val api: MyApi) : SyncTransport {
 exception cannot distinguish a dead credential from a dropped tunnel. `SyncRequest` also
 carries `gzip` and `timeouts` so a custom transport can honour the host's config — ignoring
 them is correct behaviour, not a bug.
+
+#### 11.7 Mock locations in development
+
+Two independent settings decide whether a mock fix is stored and uploaded at all:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `geolocation.mockLocationPolicy` | `MockPolicy.FLAG` | `FLAG` stores mock fixes and marks them `is_mock: true`. `REJECT` drops them in `FixMapper` before anything else runs. |
+| `security.mockLocation` | `IntegrityPolicy.BLOCK` | The integrity layer's verdict on a device with mock locations. |
+
+They are resolved against each other at `ready()`: `security.mockLocation = BLOCK` forces
+`mockLocationPolicy = REJECT`, because an SDK that refuses to run on a mocked device cannot
+also be storing mocked points. The stricter of the two wins, silently.
+
+**A debuggable host app is exempt from that.** Both defaults are strict, so before this
+exemption a developer driving a fake route through the emulator got a total, silent data
+loss: every fix dropped, nothing in the database, no event saying why. A debuggable build
+already waives the whole integrity layer (`IntegrityEnvironment.isWaived`), and this is the
+same waiver applied to the one place that was still enforcing mock policy behind its back.
+
+So, out of the box:
+
+- **Debug build** — mock fixes are stored and uploaded with `is_mock: true`.
+- **Release build** — mock fixes are dropped. Set `mockLocationIntegrityPolicy(WARN)` *and*
+  `mockLocationPolicy(MockPolicy.FLAG)` if you deliberately want them stored in release.
+
+`is_mock` is Android-only; the flag comes from `Location.isMock`, which is the platform's own
+answer and cannot be argued with.
 
 ### `fieldtrack-snap` — OSRM map-matching
 

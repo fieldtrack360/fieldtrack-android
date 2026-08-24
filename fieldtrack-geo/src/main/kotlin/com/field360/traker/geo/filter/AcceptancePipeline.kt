@@ -944,6 +944,7 @@ public class AcceptancePipeline(
             isCharging = context.isCharging,
             extras = context.extras,
             integrityFlags = context.integrityFlags,
+            providerFlags = context.providerFlags,
             acceptReason = reason,
         )
 

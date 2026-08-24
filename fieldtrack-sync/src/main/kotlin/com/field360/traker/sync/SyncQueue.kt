@@ -2,6 +2,7 @@ package com.field360.traker.sync
 
 import com.field360.tracker.domain.repository.PendingUploadStore
 import com.field360.traker.geo.model.MovementStatus
+import com.field360.traker.geo.model.ProviderSnapshot
 import com.field360.traker.geo.model.TrackPoint
 import com.field360.tracker.integrity.IntegritySignal
 import com.field360.traker.geo.port.Clock
@@ -141,7 +142,7 @@ public class SyncQueue internal constructor(
         longitude = point.longitude,
         accuracy = point.accuracy,
         movementSpeed = point.speedMps,
-        provider = point.provider,
+        provider = point.providerSnapshot(),
         hasSpeed = point.hasSpeed,
         hasBearing = point.hasBearing,
         time_zone = point.timezone,
@@ -151,12 +152,31 @@ public class SyncQueue internal constructor(
         detected_activity_type = point.detectedActivity?.name,
         detected_activity_start_time = point.activityStartTimeMs,
         battery_percentage = point.batteryPct?.toString(),
+        is_charging = point.isCharging,
         is_mock = point.isMock,
         integrity_flags = point.integrityFlags,
         integrity_signals = IntegritySignal.entries
             .filter { point.integrityFlags and it.mask != 0 }
             .map { it.name },
     )
+
+    /**
+     * `null` — and so an omitted `provider` key — for a point stored before the SDK began
+     * recording the snapshot. Sending an object of `false`s for those would be a claim about
+     * a device nobody looked at.
+     */
+    private fun TrackPoint.providerSnapshot(): SyncProvider? {
+        val snapshot = ProviderSnapshot.fromFlags(providerFlags)
+        if (!snapshot.recorded) return null
+        return SyncProvider(
+            network = snapshot.networkEnabled,
+            gps = snapshot.gpsEnabled,
+            enabled = snapshot.locationServicesEnabled,
+            status = snapshot.authorizationStatus,
+            accuracyAuthorization = snapshot.accuracyAuthorization,
+            airplane = snapshot.airplaneMode,
+        )
+    }
 
     private fun MovementStatus.wireName() = name.lowercase()
 

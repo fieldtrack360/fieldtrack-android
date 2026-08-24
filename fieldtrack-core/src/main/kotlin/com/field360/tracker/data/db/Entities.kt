@@ -57,6 +57,8 @@ internal data class TrackPointEntity(
     val extras: String?,
     /** `IntegrityReport.flags` when this point was captured; `0` before v7 and in debug (v7). */
     val integrityFlags: Int = 0,
+    /** `ProviderSnapshot.toFlags()` when this point was captured; `0` = not recorded (v8). */
+    val providerFlags: Int = 0,
     val acceptReason: String,
     val syncState: Int = 0,
     val syncTimeMs: Long = 0,
@@ -231,6 +233,8 @@ internal data class RawPointEntity(
     val extras: String?,
     /** `IntegrityReport.flags` when this fix was judged; `0` before v7 and in debug (v7). */
     val integrityFlags: Int = 0,
+    /** `ProviderSnapshot.toFlags()` when this fix was judged; `0` = not recorded (v8). */
+    val providerFlags: Int = 0,
     val verdict: String,
     val reason: String,
 )

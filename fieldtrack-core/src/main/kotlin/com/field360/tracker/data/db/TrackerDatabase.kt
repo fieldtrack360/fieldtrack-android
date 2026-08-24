@@ -18,7 +18,7 @@ import androidx.sqlite.execSQL
         FilterStateEntity::class,
         RawPointEntity::class,
     ],
-    version = 7,
+    version = 8,
     // EC-83: schemas are committed and migrations are explicit. A library that
     // silently wipes its host's data on upgrade is not shippable, so
     // fallbackToDestructiveMigration() is never called anywhere in this module.
@@ -192,6 +192,32 @@ internal abstract class TrackerDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v7 → v8: the location-subsystem snapshot, on the two point-shaped tables.
+         *
+         * Additive and non-destructive, per EC-83. `0` is `ProviderSnapshot.NOT_RECORDED`
+         * and is the correct default for every existing row: it says "no snapshot was
+         * taken", which is exactly true of a point captured before this column existed. It
+         * is deliberately **not** a snapshot with every field off — a row claiming location
+         * services were disabled and permission denied, on points that plainly were
+         * captured, would be worse than no column at all. The `recorded` bit is what keeps
+         * those two apart.
+         *
+         * `raw_fix` is left alone. It is hardware-shaped — what the chip reported — and the
+         * provider state is a fact about the device, not about the fix; `raw_points` already
+         * carries it for every judged fix, accepted or not.
+         */
+        val MIGRATION_7_8: Migration = object : Migration(7, 8) {
+            override fun migrate(connection: SQLiteConnection) {
+                connection.execSQL(
+                    "ALTER TABLE track_point ADD COLUMN providerFlags INTEGER NOT NULL DEFAULT 0",
+                )
+                connection.execSQL(
+                    "ALTER TABLE raw_points ADD COLUMN providerFlags INTEGER NOT NULL DEFAULT 0",
+                )
+            }
+        }
+
         fun build(context: Context): TrackerDatabase =
             Room.databaseBuilder(
                 context.applicationContext,
@@ -205,6 +231,7 @@ internal abstract class TrackerDatabase : RoomDatabase() {
                     MIGRATION_4_5,
                     MIGRATION_5_6,
                     MIGRATION_6_7,
+                    MIGRATION_7_8,
                 )
                 // WAL so host reads never block the ingestor's writes (EC-85).
                 .setJournalMode(JournalMode.WRITE_AHEAD_LOGGING)

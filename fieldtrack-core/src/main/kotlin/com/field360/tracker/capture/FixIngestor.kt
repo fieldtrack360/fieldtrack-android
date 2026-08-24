@@ -10,6 +10,7 @@ import com.field360.traker.geo.filter.TrackerConstants
 import com.field360.traker.geo.model.FilterState
 import com.field360.traker.geo.model.IngestContext
 import com.field360.traker.geo.model.MockPolicy
+import com.field360.traker.geo.model.ProviderSnapshot
 import com.field360.traker.geo.model.Reasons
 import com.field360.traker.geo.model.TrackFix
 import com.field360.traker.geo.model.TrackPoint
@@ -58,6 +59,13 @@ internal class FixIngestor(
      * to trigger a probe from the ingest path, and a field read is all it is allowed.
      */
     private val integrityFlags: () -> Int,
+    /**
+     * The packed location-subsystem snapshot, read once per fix. A lambda over
+     * `ProviderStateMonitor.snapshotFlags` for the same reason [integrityFlags] is one: this
+     * class must not be able to trigger a permission or Settings query from the ingest path,
+     * and a field read is all it is allowed.
+     */
+    private val providerFlags: () -> Int = { ProviderSnapshot.NOT_RECORDED },
 ) {
 
     /**
@@ -329,6 +337,10 @@ internal class FixIngestor(
             batteryPct = power.percent,
             isCharging = power.isCharging,
             integrityFlags = integrityFlags,
+            // Read for every verdict, like the battery above: a rejected fix's raw-point row
+            // is exactly where "location was on but permission had dropped to coarse"
+            // belongs, and that is the row a gap investigation starts from.
+            providerFlags = providerFlags(),
         )
     }
 

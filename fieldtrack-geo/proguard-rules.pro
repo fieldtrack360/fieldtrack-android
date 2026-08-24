@@ -24,6 +24,8 @@
 -keep public class com.field360.traker.geo.model.MotionState { public protected *; }
 -keep public class com.field360.traker.geo.model.MovementStatus { public protected *; }
 -keep public class com.field360.traker.geo.model.PipelineResult { public protected *; }
+-keep public class com.field360.traker.geo.model.ProviderSnapshot { public protected *; }
+-keep public class com.field360.traker.geo.model.ProviderSnapshot$Companion { public protected *; }
 -keep public class com.field360.traker.geo.model.Reasons { public protected *; }
 -keep public class com.field360.traker.geo.model.TrackFix { public protected *; }
 -keep public class com.field360.traker.geo.model.TrackFix$Companion { public protected *; }

@@ -342,6 +342,7 @@ internal class TrackerGraph private constructor(
             battery = batteryMonitor,
             integrityFeed = integrityFeed,
             integrityFlags = { integrityMonitor.flags },
+            providerFlags = { providerStateMonitor.snapshotFlags },
         )
     }
 
@@ -426,7 +427,12 @@ internal class TrackerGraph private constructor(
     }
 
     val resolveConfig: ResolveConfigUseCase by lazy {
-        ResolveConfigUseCase(config, sensorProbe, events)
+        ResolveConfigUseCase(
+            config,
+            sensorProbe,
+            events,
+            isDebuggable = { IntegrityEnvironment.isWaived(context) },
+        )
     }
 
     // ── the public surface ──────────────────────────────────────────────────

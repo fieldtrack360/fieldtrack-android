@@ -113,14 +113,33 @@ public data class SyncPoint(
     val longitude: Double,
     val accuracy: Float,
     val movementSpeed: Float,
-    val provider: String,
+    /**
+     * The location subsystem as it was **when this point was captured** — providers,
+     * permission, accuracy authorization and airplane mode.
+     *
+     * `null` for a point stored before the SDK recorded it, which is deliberately not an
+     * object full of `false`: "we did not look" and "everything was off" are different
+     * answers about a point that plainly exists.
+     *
+     * **Breaking change.** This key previously carried the provider *name* as a string
+     * (`"gps"`, `"fused"`). That name has not been lost — [activity_status] is
+     * `"<provider>@<movementStatus>"` and always was, so a backend that needs the string
+     * reads it from there.
+     */
+    val provider: SyncProvider? = null,
     val hasSpeed: Boolean,
     val hasBearing: Boolean,
     val time_zone: String,
     val activity_status: String,
     val detected_activity_type: String? = null,
     val detected_activity_start_time: Long = 0,
+    /** 0–100 as a string, matching the reference contract. `null` when the platform will not say. */
     val battery_percentage: String? = null,
+    /**
+     * Plugged in or full. `null` when the platform will not say — deliberately not `false`,
+     * which would read as "confirmed on battery".
+     */
+    val is_charging: Boolean? = null,
     val is_mock: Boolean = false,
     /**
      * Device-integrity bitmask observed when this point was captured — `IntegrityReport.flags`
@@ -137,4 +156,32 @@ public data class SyncPoint(
      * deliberately so — the mask is the durable storage form, this is the readable one.
      */
     val integrity_signals: List<String> = emptyList(),
+)
+
+/**
+ * The location subsystem at capture time, as the backend expects it.
+ *
+ * The numeric fields carry codes rather than names because that is the existing wire
+ * contract on the server side; `ProviderSnapshot` in `fieldtrack-geo` is where they are
+ * defined and documented.
+ *
+ * @property network the network (Wi-Fi/cell) provider is enabled.
+ * @property gps the GPS provider is enabled.
+ * @property enabled the location master switch. Not the union of the two above — a device
+ *   can report location enabled with GPS switched off.
+ * @property status permission tier: `0` not determined, `1` restricted, `2` denied,
+ *   `3` always (foreground + background), `4` while in use. Android cannot distinguish
+ *   "never asked" from "refused", so it never emits `0`.
+ * @property accuracyAuthorization `0` full (fine location), `1` reduced (coarse only).
+ * @property airplane airplane mode was on. Not a gate: GPS keeps working in airplane mode
+ *   on most devices while network positioning does not.
+ */
+@Serializable
+public data class SyncProvider(
+    val network: Boolean,
+    val gps: Boolean,
+    val enabled: Boolean,
+    val status: Int,
+    val accuracyAuthorization: Int,
+    val airplane: Boolean,
 )
