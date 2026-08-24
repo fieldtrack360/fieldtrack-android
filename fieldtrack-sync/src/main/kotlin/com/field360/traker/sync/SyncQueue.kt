@@ -7,9 +7,13 @@ import com.field360.traker.geo.model.TrackPoint
 import com.field360.tracker.integrity.IntegritySignal
 import com.field360.traker.geo.port.Clock
 import com.field360.traker.geo.port.TrackLogger
+import com.field360.traker.sync.internal.jsonParamOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.encodeToJsonElement
 
 /**
  * Drains the upload queue.
@@ -85,7 +89,7 @@ public class SyncQueue internal constructor(
                         url = config.url,
                         method = config.method,
                         headers = config.headers,
-                        jsonBody = json.encodeToString(SyncPayload(batch.map(::toSyncPoint))),
+                        jsonBody = encodeBody(batch.map(::toSyncPoint), config.extraParams),
                         gzip = config.gzipRequestBody,
                         timeouts = config.timeouts,
                     ),
@@ -121,6 +125,37 @@ public class SyncQueue internal constructor(
         } finally {
             mutex.unlock()
         }
+    }
+
+    /**
+     * The request body: the host's `extraParams`, then the batch under `location`.
+     *
+     * That order is the reference contract's — an envelope of identity and auth wrapping the
+     * points, not the other way round — and it is stable, because both halves are written in
+     * insertion order.
+     *
+     * With no extra params this takes the original path and produces a byte-identical body,
+     * which is the point: the overwhelmingly common case must not start depending on tree
+     * encoding to stay the same shape it has always been.
+     *
+     * `SyncConfig.validate` has already rejected anything unserializable, so the `?: return`
+     * below is unreachable by construction. It degrades to omitting the key rather than
+     * throwing anyway — a drain is not the place to discover a config problem, and dropping
+     * one parameter beats dropping the batch.
+     */
+    private fun encodeBody(points: List<SyncPoint>, extraParams: Map<String, Any>): String {
+        if (extraParams.isEmpty()) return json.encodeToString(SyncPayload(points))
+
+        val body = buildJsonObject {
+            for ((key, value) in extraParams) {
+                put(key, jsonParamOrNull(value) ?: continue)
+            }
+            put(
+                SyncConfig.LOCATION_KEY,
+                json.encodeToJsonElement(ListSerializer(SyncPoint.serializer()), points),
+            )
+        }
+        return json.encodeToString(body)
     }
 
     public suspend fun pendingCount(): Int = store.pendingCount()

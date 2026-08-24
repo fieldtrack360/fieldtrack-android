@@ -15,8 +15,10 @@ import com.field360.tracker.Tracker
 import com.field360.tracker.TrackerArtifacts
 import com.field360.tracker.domain.repository.SyncTrigger
 import com.field360.traker.geo.port.TrackLogger
+import com.field360.traker.sync.internal.MAX_PARAM_DEPTH
 import com.field360.traker.sync.internal.NoOpTransport
 import com.field360.traker.sync.internal.SyncService
+import com.field360.traker.sync.internal.jsonParamOrNull
 import java.net.URI
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.channels.BufferOverflow
@@ -37,6 +39,15 @@ import kotlinx.coroutines.flow.asSharedFlow
  *   see [validate].
  * @property timeouts applied by the built-in transport. Ignored by a custom [SyncTransport],
  *   which owns the client that would honour them.
+ * @property extraParams merged into the **top level** of every request body, alongside the
+ *   `location` array — the shape most backends want, where the batch travels inside an
+ *   envelope carrying identity (`user_id`, `device_id`, a session token) rather than alone.
+ *
+ *   Values may be a `String`, `Boolean`, any boxed number, or a `Map`/`List`/array of those
+ *   for nested structures — `null` is not a value, omit the key instead. Anything else is
+ *   rejected by [validate], naming the key, rather than failing on the first upload.
+ *
+ *   The key `location` is reserved: it is the batch itself.
  */
 public data class SyncConfig(
     val url: String,
@@ -48,6 +59,7 @@ public data class SyncConfig(
     val gzipRequestBody: Boolean = false,
     val allowCleartext: Boolean = false,
     val timeouts: SyncTimeouts = SyncTimeouts(),
+    val extraParams: Map<String, Any> = emptyMap(),
 ) {
 
     /**
@@ -109,6 +121,34 @@ public data class SyncConfig(
         if (timeouts.connectMs <= 0) add("timeouts.connectMs must be > 0")
         if (timeouts.readMs <= 0) add("timeouts.readMs must be > 0")
         if (timeouts.writeMs <= 0) add("timeouts.writeMs must be > 0")
+
+        // Checked here rather than at upload time on purpose. An unserializable value found
+        // mid-drain has no good answer — the batch cannot be sent and the rows cannot be
+        // blamed — so it is caught while the host is still holding the config it wrote.
+        for ((key, value) in extraParams) {
+            when {
+                key.isBlank() -> add("extraParams keys must not be blank")
+                key == LOCATION_KEY -> add(
+                    "extraParams may not use the key \"$LOCATION_KEY\" — that is the batch " +
+                        "itself. Rename the parameter, or remap the whole body in a custom " +
+                        "SyncTransport.",
+                )
+                jsonParamOrNull(value) == null -> add(
+                    "extraParams[\"$key\"] is ${describe(value)}, which cannot be sent as " +
+                        "JSON. Use a String, Boolean, number, or a Map/List of those; omit " +
+                        "the key rather than passing null.",
+                )
+            }
+        }
+    }
+
+    private fun describe(value: Any?): String = when (value) {
+        null -> "null"
+        // A deep or cyclic structure is the one failure the type name alone does not explain.
+        is Map<*, *>, is Iterable<*>, is Array<*> ->
+            "a ${value.javaClass.simpleName} holding an unsupported value, a non-String key, " +
+                "or nesting deeper than $MAX_PARAM_DEPTH levels"
+        else -> "a ${value.javaClass.name}"
     }
 
     private fun URI.isLoopback(): Boolean = host in LOOPBACK_HOSTS
@@ -176,6 +216,7 @@ public data class SyncConfig(
         private var gzipRequestBody: Boolean = false
         private var allowCleartext: Boolean = false
         private var timeouts: SyncTimeouts = SyncTimeouts()
+        private val extraParams = LinkedHashMap<String, Any>()
 
         /** The whole endpoint. Overrides [baseUrl] and [path] when both are set. */
         public fun url(url: String): Builder = apply { this.url = url }
@@ -214,6 +255,19 @@ public data class SyncConfig(
             apply { timeouts = SyncTimeouts(connectMs, readMs, writeMs) }
 
         /**
+         * Adds one top-level body parameter, sent alongside the `location` array.
+         *
+         * Repeated names replace, matching [header] and the underlying map. See
+         * [SyncConfig.extraParams] for the accepted value types.
+         */
+        public fun extraParam(name: String, value: Any): Builder =
+            apply { extraParams[name] = value }
+
+        /** Adds all of them, keeping anything already set that these do not name. */
+        public fun extraParams(params: Map<String, Any>): Builder =
+            apply { extraParams.putAll(params) }
+
+        /**
          * @throws IllegalArgumentException if [SyncConfig.validate] reports anything.
          *
          * A **path with no base URL is allowed here**, and only here: it means the base is
@@ -244,6 +298,7 @@ public data class SyncConfig(
             gzipRequestBody = gzipRequestBody,
             allowCleartext = allowCleartext,
             timeouts = timeouts,
+            extraParams = extraParams.toMap(),
         )
 
         private fun join(base: String?, path: String?): String {
@@ -263,6 +318,9 @@ public data class SyncConfig(
         public fun builder(): Builder = Builder()
 
         private const val MAX_BATCH_SIZE = 1_000
+
+        /** The body key carrying the batch. Reserved against [extraParams]. */
+        internal const val LOCATION_KEY: String = "location"
 
         /** `10.0.2.2` is the emulator's route to the developer's own machine. */
         private val LOOPBACK_HOSTS = setOf("localhost", "127.0.0.1", "::1", "[::1]", "10.0.2.2")
