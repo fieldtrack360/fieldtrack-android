@@ -171,7 +171,22 @@ database".
 ## 5. Wire format
 
 `POST` (configurable verb) with body `{"location": [ ...points ]}`. snake_case keys, epoch
-milliseconds. One point:
+milliseconds.
+
+Anything the host sets in `SyncConfig.extraParams` is merged into the **top level** of the
+body, before `location` — the envelope shape most backends want, where the batch travels
+with identity (`user_id`, `device_id`, a session token) rather than alone:
+
+```json
+{"user_id": "u-42", "device_id": "d-88", "location": [ ... ]}
+```
+
+Values may be a string, boolean, number, or a map/list of those; types are preserved rather
+than stringified. `SyncConfig.validate()` rejects anything unserializable at `configure()`
+time, so a drain never discovers a config problem. With no extra params the encoder takes
+its original path and the body is byte-identical to earlier releases.
+
+One point:
 
 ```json
 {

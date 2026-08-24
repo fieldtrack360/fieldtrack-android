@@ -787,12 +787,25 @@ data class TrackerState(
 data class ProviderState(
     val gpsEnabled: Boolean = false,
     val networkEnabled: Boolean = false,
+    val locationServicesEnabled: Boolean = false,   // the Settings master switch
     val permission: PermissionTier = PermissionTier.NONE,
     val accuracyAuthorization: LocationAccuracy = LocationAccuracy.APPROXIMATE,
     val fusedAvailable: Boolean = false,
     val powerSaveMode: Boolean = false,
+    val airplaneMode: Boolean = false,
 )
 ```
+
+`locationServicesEnabled` is **not** the union of `gpsEnabled` and `networkEnabled`: a device
+can report location enabled with GPS switched off, and the master switch is what a
+"turn location on" prompt should be driven by.
+
+`airplaneMode` is a diagnostic, never a gate — GPS keeps working in airplane mode on most
+devices while network positioning does not, so it explains a track that degrades to GPS-only
+or stops indoors rather than justifying a refusal to start.
+
+Both are emitted on change through `TrackerEvent.ProviderChange`, like the rest of this
+object; there is no polling.
 
 ### 7.4 `TrackerResult` and `ErrorCode`
 
@@ -860,9 +873,46 @@ data class TrackPoint(
     val isCharging: Boolean? = null,
     val extras: String? = null,
     val integrityFlags: Int = 0,         // device-integrity bitmask at capture — see §19.4
+    val providerFlags: Int = 0,          // location-subsystem snapshot at capture — see below
     val acceptReason: String,            // the Reasons vocabulary
 )
 ```
+
+`providerFlags` records what the location subsystem looked like **when this point was
+captured** — which providers were on, the master switch, the permission tier, accuracy
+authorization and airplane mode. Decode it with `ProviderSnapshot`:
+
+```kotlin
+data class ProviderSnapshot(
+    val recorded: Boolean = false,              // false = no snapshot on this point
+    val gpsEnabled: Boolean = false,
+    val networkEnabled: Boolean = false,
+    val locationServicesEnabled: Boolean = false,
+    val airplaneMode: Boolean = false,
+    val authorizationStatus: Int = STATUS_DENIED,       // 2 denied, 3 always, 4 while-in-use
+    val accuracyAuthorization: Int = ACCURACY_REDUCED,  // 0 full, 1 reduced
+)
+
+val snapshot = ProviderSnapshot.fromFlags(point.providerFlags)
+if (snapshot.recorded && !snapshot.gpsEnabled) {
+    // this point came from network positioning only
+}
+```
+
+The two numeric fields carry **wire codes**, not an SDK enum, because they are a contract with
+your backend and mean the same thing whichever platform sent them. Named constants are on the
+companion: `STATUS_NOT_DETERMINED` (0), `STATUS_RESTRICTED` (1), `STATUS_DENIED` (2),
+`STATUS_ALWAYS` (3), `STATUS_WHEN_IN_USE` (4), `ACCURACY_FULL` (0), `ACCURACY_REDUCED` (1).
+Android cannot tell "never asked" from "asked and refused", so it never emits `0` for status.
+
+`recorded` is `false` — and every other field meaningless — for points captured before the
+SDK began recording this. That is deliberately distinct from a snapshot where everything is
+off: "we did not look" and "location was disabled" are different answers about a point that
+plainly exists.
+
+It is captured per point rather than read when you ask, because the live `ProviderState` tells
+you about *now*: a track recorded over an hour can span a permission downgrade, and the point
+that stopped being precise is the one that carries the reason.
 
 ### 8.2 `TrackSession`
 
@@ -1328,6 +1378,7 @@ is a fallback, never an override.
 | `gzipRequestBody` | `Boolean` | `false` | Compress the JSON body. Off by default — there is no negotiation for request-body encoding, so a server that does not expect gzip answers 400 |
 | `allowCleartext` | `Boolean` | `false` | Permit an `http://` URL. Local development only. Loopback hosts (`localhost`, `127.0.0.1`, `::1`, `10.0.2.2`) are already exempt |
 | `timeouts` | `SyncTimeouts` | 5 s / 30 s / 20 s | Applied by the built-in transport; ignored by a custom one |
+| `extraParams` | `Map<String, Any>` | empty | Merged into the **top level** of every request body, alongside the `location` array — see [§14.1.1](#1411-extraparams--your-own-body-fields) |
 
 > **`method` accepts `POST`, `PUT` or `PATCH`, and nothing else.** The built-in transport
 > is Retrofit, whose verb annotations are compile-time constants — there is no dynamic-verb
@@ -1342,9 +1393,54 @@ is a fallback, never an override.
 **Builder**: `.url()`, `.baseUrl()`, `.path()`, `.method()`, `.header(name, value)`,
 `.headers(map)`, `.autoSync()`, `.batchSize()`, `.requiresUnmeteredNetwork()`,
 `.gzipRequestBody()`, `.allowCleartext()`, `.timeouts(SyncTimeouts)`,
-`.timeouts(connectMs, readMs, writeMs)`, `.build()`, `.buildUnchecked()`.
+`.timeouts(connectMs, readMs, writeMs)`, `.extraParam(name, value)`, `.extraParams(map)`,
+`.build()`, `.buildUnchecked()`.
 
 `baseUrl` and `path` are joined with exactly one `/` regardless of which side carries it.
+
+#### 14.1.1 `extraParams` — your own body fields
+
+Most backends want the batch inside an envelope carrying identity, not on its own. Anything
+you put in `extraParams` is merged into the **top level** of the request body, before the
+`location` array:
+
+```kotlin
+SyncConfig.builder()
+    .baseUrl(BuildConfig.API_BASE_URL)
+    .path("v1/location/batch")
+    .header("Authorization", "Bearer $token")
+    .extraParam("user_id", userId)
+    .extraParam("device_id", deviceId)
+    .extraParam("company_id", 7)
+    .build()
+```
+
+produces:
+
+```json
+{
+  "user_id": "u-42",
+  "device_id": "d-88",
+  "company_id": 7,
+  "location": [ { "uuid": "…" } ]
+}
+```
+
+Values may be a `String`, a `Boolean`, any boxed number, or a `Map` / `List` / array of those
+for nested structures. Numbers stay numbers and booleans stay booleans — nothing is
+stringified on the way out. `null` is not a value: omit the key instead.
+
+**`configure()` rejects an unusable value rather than failing on the first upload.** An
+unserializable object is reported by key name at configuration time — the point where you are
+still holding the config you wrote — rather than mid-drain hours later, where a batch that
+cannot be sent has no good answer. The key `location` is reserved, since that is the batch
+itself.
+
+**With no `extraParams` set, the body is byte-identical to previous releases** — this is
+additive, and an existing backend needs no change.
+
+**These are static config, like `headers`.** A rotating token belongs in a re-`configure()`
+call, or in your own `SyncTransport` where you can compute it per request.
 
 ```kotlin
 data class SyncTimeouts(
@@ -1411,61 +1507,171 @@ lifecycleScope.launch {
 
 ### 14.5 The wire format
 
-The default payload is `POST` JSON, snake_case keys, epoch milliseconds:
+The complete request contract: what the SDK sends, what every field means, and every limit
+that applies. JSON, snake_case keys, epoch milliseconds throughout.
+
+#### 14.5.1 The request line and headers
+
+As sent by the built-in transport. A custom `SyncTransport`
+([§14.6](#146-custom-transport)) owns the whole exchange and none of the header behaviour
+below applies to it.
+
+| Part | Value | Limits |
+|---|---|---|
+| Method | `SyncConfig.method` | `POST`, `PUT` or `PATCH` only. Rejected at `configure()` otherwise |
+| URL | `SyncConfig.url` | Must be `https://`. `http://` only for loopback (`localhost`, `127.0.0.1`, `::1`, `10.0.2.2`) or with `allowCleartext = true` |
+| `Content-Type` | `application/json; charset=utf-8` | Not configurable |
+| `Content-Encoding` | `gzip`, **only** when `gzipRequestBody = true` *and* the body is at least **1,024 characters** | Below that the gzip header and trailer cost more than the saving, so the body is sent uncompressed and this header is omitted entirely. **Your server must handle both**, on the same endpoint, with the same config |
+| Your headers | `SyncConfig.headers` | Sent on every request. Never read back by any SDK API — they carry your credential |
+
+There is no request-body encoding negotiation, so `gzipRequestBody` is off by default:
+a server that does not expect gzip answers `400` or stores the compressed bytes as the
+payload. Turn it on only once your server is known to decode it.
+
+#### 14.5.2 The body envelope
 
 ```json
 {
+  "user_id": "u-42",
+  "device_id": "d-88",
   "location": [
-    {
-      "uuid": "…",
-      "time": 1755500000000,
-      "local_date": "2026-08-18",
-      "latitude": 23.0225,
-      "longitude": 72.5714,
-      "accuracy": 8.4,
-      "movementSpeed": 12.5,
-      "provider": {
-        "network": true,
-        "gps": true,
-        "enabled": true,
-        "status": 3,
-        "accuracyAuthorization": 0,
-        "airplane": false
-      },
-      "hasSpeed": true,
-      "hasBearing": true,
-      "time_zone": "Asia/Kolkata",
-      "activity_status": "MOVING",
-      "detected_activity_type": "IN_VEHICLE",
-      "detected_activity_start_time": 1755499000000,
-      "battery_percentage": "62",
-      "is_charging": false,
-      "is_mock": false,
-      "integrity_flags": 0,
-      "integrity_signals": []
-    }
+    { "uuid": "0f5c8f0e-…", "time": 1755500000000 },
+    { "uuid": "1a6d9e1f-…", "time": 1755500030000 }
   ]
 }
 ```
 
-Your server should answer **2xx** for accepted, **401** for expired credentials, **403** for a
-rejected credential, and any other status to have the batch retried.
+Points are abbreviated here — the full object is in [§14.5.3](#1453-one-point).
 
-`provider` describes the location subsystem when the point was captured: which providers were
-enabled, the master switch (`enabled`), the permission tier (`status`: `2` denied, `3` always,
-`4` while in use), accuracy authorization (`0` full, `1` reduced) and airplane mode. It is
-recorded per point rather than sampled at upload time — a batch can span an hour, and a
-permission downgrade inside that hour is exactly what explains a gap. It is absent on points
-stored before the SDK recorded it, which is deliberately not an object full of `false`.
+| Key | Type | Notes and limits |
+|---|---|---|
+| *(your keys)* | any JSON | Whatever you put in [`extraParams`](#1411-extraparams--your-own-body-fields), in insertion order, **before** `location`. Values may be a string, boolean, number, or a map/list of those, nested up to 10 levels. Types are preserved — a number stays a number. Rejected at `configure()` if unserializable |
+| `location` | array | The batch. **Reserved** — `extraParams` may not use this key. Never empty: a drain with nothing queued sends no request at all |
+
+Rows per request is `batchSize` (default `100`, valid range **1–1000**). A single drain
+uploads at most **20 batches** before returning, so one drain moves at most
+`20 × batchSize` rows; a larger backlog is picked up by the next trigger. This bound exists
+so one call cannot hold the queue through an unbounded backlog.
+
+#### 14.5.3 One point
+
+```json
+{
+  "uuid": "0f5c8f0e-1c2a-4f0b-9a3c-7d1e2b3a4c5d",
+  "time": 1755500000000,
+  "local_date": "2026-08-18",
+  "latitude": 23.0225,
+  "longitude": 72.5714,
+  "accuracy": 8.4,
+  "movementSpeed": 12.5,
+  "provider": {
+    "network": true,
+    "gps": true,
+    "enabled": true,
+    "status": 3,
+    "accuracyAuthorization": 0,
+    "airplane": false
+  },
+  "hasSpeed": true,
+  "hasBearing": true,
+  "time_zone": "Asia/Kolkata",
+  "activity_status": "fused@moving",
+  "detected_activity_type": "IN_VEHICLE",
+  "detected_activity_start_time": 1755499000000,
+  "battery_percentage": "62",
+  "is_charging": false,
+  "is_mock": false,
+  "integrity_flags": 0,
+  "integrity_signals": []
+}
+```
+
+| Field | Type | Always sent? | Meaning and limits |
+|---|---|---|---|
+| `uuid` | string | yes | Stable identity for this point. **Dedupe on this** — see §14.5.5 |
+| `time` | number | yes | Capture time, epoch **milliseconds**, wall clock. Subject to device clock changes; `integrity_flags` reports when the clock looked untrustworthy |
+| `local_date` | string | yes | `yyyy-MM-dd` in the point's own `time_zone`, for day bucketing without server-side zone maths |
+| `latitude` / `longitude` | number | yes | WGS-84 degrees. The fix's own coordinates, not a filtered estimate |
+| `accuracy` | number | yes | Horizontal error radius in **metres**, as the platform reported it. No upper bound — a bad indoor fix can be thousands |
+| `movementSpeed` | number | yes | Metres per second. **`0.0` when the provider reported no speed** — check `hasSpeed` before trusting it |
+| `provider` | object | no | Location subsystem at capture time. See §14.5.4. Absent on points captured before the SDK recorded it |
+| `hasSpeed` / `hasBearing` | boolean | yes | Whether the provider actually supplied the value. `0.0` is a legal speed, so this is the only way to tell "stationary" from "not reported" |
+| `time_zone` | string | yes | IANA id, **per point** — a session can cross zones on a flight, so do not assume one zone per batch |
+| `activity_status` | string | yes | `"<provider>@<movementStatus>"`, lowercase — e.g. `fused@moving`, `gps@steady`. Provider is one of `fused`, `gps`, `network`, `passive`, `unknown`; movement is `moving` or `steady`. **This is where the provider name lives** |
+| `detected_activity_type` | string | no | One of `IN_VEHICLE`, `ON_BICYCLE`, `ON_FOOT`, `WALKING`, `RUNNING`, `STILL`, `TILTING`, `UNKNOWN`. **Enrichment only** — see the caveat below |
+| `detected_activity_start_time` | number | yes | Epoch ms when that activity began; `0` when unknown |
+| `battery_percentage` | string | no | 0–100 **as a string**, e.g. `"62"`. Absent when the platform will not say |
+| `is_charging` | boolean | no | Plugged in or full. Absent — **not `false`** — when the platform will not say |
+| `is_mock` | boolean | yes | The fix was flagged as mock by the OS. Android-only concept. Whether mock points are sent at all depends on policy — see [§19.2](#192-policy) |
+| `integrity_flags` | number | yes | Device-integrity bitmask at capture. `0` = nothing observed. Bit values are frozen — see [§19.4](#194-on-the-wire-and-in-storage) |
+| `integrity_signals` | array of string | yes | The same information by name, for rules that prefer strings to bits. `[]` when nothing was observed |
+
+> **`detected_activity_type` is not a capture gate and should not be one server-side
+> either.** Entire multi-minute drives are reported `STILL` by some devices under battery
+> saver. Treat it as a hint, never as ground truth about whether the user moved.
+
+#### 14.5.4 The `provider` object
+
+| Field | Type | Meaning and limits |
+|---|---|---|
+| `network` | boolean | The network (Wi-Fi/cell) provider is enabled |
+| `gps` | boolean | The GPS provider is enabled |
+| `enabled` | boolean | The location **master switch**. Not the union of the two above — a device can report location enabled with GPS off. Below Android 9 the platform exposes no master switch, so this falls back to the union |
+| `status` | number | Permission tier: `0` not determined, `1` restricted, `2` denied, `3` always (foreground + background), `4` while in use. **Android never sends `0`** — it cannot distinguish "never asked" from "asked and refused", so both are `2` |
+| `accuracyAuthorization` | number | `0` full (fine location), `1` reduced (coarse only). Reduced means a 1–3 km error circle |
+| `airplane` | boolean | Airplane mode was on. **Not a gate** — GPS keeps working in airplane mode on most devices while network positioning does not |
+
+Recorded **per point**, not sampled when the queue drains. A batch can span an hour, and a
+permission downgrade inside that hour is exactly what explains a gap — a single snapshot
+taken at upload time would stamp every row with whatever happened to be true minutes later.
+
+The key is **omitted** for points captured before the SDK recorded it. That is deliberately
+not an object full of `false`: "we did not look" and "everything was off" are different
+answers about a point that plainly exists.
 
 > **Breaking change from earlier releases:** `provider` was the provider *name* as a string
-> (`"fused"`). That name is still on the wire — `activity_status` is
-> `"<provider>@<movementStatus>"` — so read it from there.
+> (`"fused"`). The name is still on the wire — read it from `activity_status`, which is
+> `"<provider>@<movementStatus>"` and always was.
 
-`battery_percentage` and `is_charging` describe the power state at capture time. `is_charging`
-is absent rather than `false` when the platform will not say.
+#### 14.5.5 Rules your server must follow
 
-`integrity_flags` and `integrity_signals` describe the device when the point was captured — see [§19.4](#194-on-the-wire-and-in-storage) for the frozen bit assignments. Both default, so an existing backend keeps parsing unchanged. Treat them as advisory input to a server-side rule rather than as the defence itself, and be suspicious of a client version that is known to send them and stops.
+**Dedupe on `uuid`.** A failed batch is re-sent **whole** on the next attempt, so duplicate
+delivery is guaranteed by design, not an edge case. A batch that your server stored but
+failed to acknowledge — a timeout after the write, a 502 from a proxy — arrives again.
+
+**Absent is not null.** Nullable fields are **omitted from the object**, never sent as
+`null`. If `detected_activity_type`, `battery_percentage`, `is_charging` or `provider` is
+unknown, the key is simply not there. A parser that distinguishes the two needs to know
+this; it is pinned by an automated test, so it cannot change silently.
+
+**New fields will appear.** Every field added so far has been additive with a default, and
+parsing must tolerate unknown keys. Conversely, `integrity_flags` and `integrity_signals`
+are always sent by clients that support them — a client version known to send them that
+suddenly stops is worth treating as suspicious.
+
+**Answer with the right status.** The status code alone decides what the SDK does; the
+success body is ignored entirely.
+
+| Status | SDK behaviour |
+|---|---|
+| **2xx** | Accepted. Rows marked synced, next batch drains immediately |
+| **401** | Terminal. Tracking stops, the queue is **cleared**, config is forgotten |
+| **403** | Terminal for retrying. Uploads halt, rows are **kept**, tracking continues |
+| Anything else | Retried with backoff, rows kept |
+
+See [§14.4](#144-terminal-failure-semantics) for why 401 and 403 differ. Send `Retry-After`
+on a `429` or `503` to control the next attempt: both RFC 9110 forms are accepted
+(delta-seconds or an HTTP-date), and the value is **clamped to 1 second – 6 hours** so one
+bad header cannot park the queue indefinitely.
+
+On a non-2xx the SDK keeps at most **4,096 characters** of your response body for the host
+to inspect, so `500` can be told apart from `500 {"error":"bad geometry"}`. A longer body is
+truncated, not rejected. It is never logged, because an error body can echo a request
+header. Success bodies are discarded unread.
+
+**Treat integrity fields as advisory.** `integrity_flags` is input to a server-side rule,
+not the defence itself — it is a client-side observation, and a client is not a trustworthy
+narrator about itself.
 
 ### 14.6 Custom transport
 
@@ -1612,6 +1818,10 @@ is this point wrong". `RawPoint` has the same columns as `TrackPoint` plus:
 | `isAccepted` | `verdict == "ACCEPT"` |
 
 `RawPoint.uuid` joins back to the stored `TrackPoint` for accepted fixes.
+
+`RawPoint` carries `providerFlags` too, and on this layer it is worth more than on the accepted
+one: a run of rejects whose snapshot shows `accuracyAuthorization = ACCURACY_REDUCED` is a
+permission problem, not a filter problem, and the two look identical from the point table alone.
 
 ### 16.3 Layer 3 — the decision log
 
@@ -1789,7 +1999,25 @@ and motor-impaired users operate a phone, and blocking on them would lock those 
 of your app. Services installed as part of the system image never raise a finding.
 
 Setting `mockLocationIntegrityPolicy(BLOCK)` forces `mockLocationPolicy = REJECT`; the two
-cannot be left contradicting each other.
+cannot be left contradicting each other. An SDK that refuses to run on a mocked device cannot
+also be storing mocked points, so the stricter of the two wins, silently — a validation error
+would fail `ready()` over a combination the SDK can resolve correctly on its own.
+
+**A debuggable build is exempt from that forcing.** Both settings default to strict, so
+without the exemption a developer feeding a fake route through the emulator got a total,
+silent data loss: every fix dropped before it reached storage, nothing in the database, and
+nothing in the event flow saying why. A debuggable build already waives the whole integrity
+layer, and this is the same waiver applied consistently.
+
+In practice:
+
+| Build | Mock fixes |
+|---|---|
+| Debuggable | Stored, and uploaded with `is_mock: true` |
+| Release | Dropped, unless you set `mockLocationIntegrityPolicy(WARN)` **and** `mockLocationPolicy(MockPolicy.FLAG)` deliberately |
+
+`isMock` comes from the platform's own `Location.isMock`, which cannot be argued with. It is
+Android-only.
 
 ### 19.3 Reading the result
 
@@ -1823,8 +2051,8 @@ empty `findings` list is not a claim that the device is clean.
 ### 19.4 On the wire and in storage
 
 Every accepted point carries `integrityFlags` — the bitmask of every signal observed when
-it was captured, `WARN` and `BLOCK` alike. It is stored on `track_point` (schema v7) and
-uploaded by `fieldtrack-sync`:
+it was captured, `WARN` and `BLOCK` alike. It is persisted on the point, readable through
+`TrackPoint.integrityFlags`, and uploaded by `fieldtrack-sync`:
 
 ```json
 {

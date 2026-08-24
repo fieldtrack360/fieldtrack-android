@@ -1264,6 +1264,31 @@ explains a gap.
 object. A backend that distinguishes absent from null needs to know this; it is pinned by a
 test (`SyncPayloadWireTest`) so a change cannot reach a server silently.
 
+**Adding your own top-level fields.** Most backends want the batch inside an envelope
+carrying identity rather than on its own. `SyncConfig.extraParams` is merged into the top
+level of the body, before `location`:
+
+```kotlin
+SyncConfig.builder()
+    .baseUrl(BuildConfig.API_BASE_URL)
+    .path("v1/location/batch")
+    .extraParam("user_id", userId)
+    .extraParam("company_id", 7)
+    .build()
+```
+
+```json
+{ "user_id": "u-42", "company_id": 7, "location": [ … ] }
+```
+
+Values may be a `String`, `Boolean`, any boxed number, or a `Map`/`List`/array of those.
+Types are preserved — a number stays a number. `null` is not a value; omit the key. The key
+`location` is reserved, and `configure()` rejects an unusable value by name rather than
+failing on the first upload. With none set, the body is byte-identical to earlier releases.
+
+They are static config, like `headers` — a rotating token belongs in a re-`configure()` call
+or in your own `SyncTransport`.
+
 `gzipRequestBody = true` adds `Content-Encoding: gzip` and compresses bodies over 1 KB. It is
 **off by default and should stay off unless your server expects it** — there is no negotiation
 mechanism for request-body encoding, so a server that does not expect it answers 400 or stores
