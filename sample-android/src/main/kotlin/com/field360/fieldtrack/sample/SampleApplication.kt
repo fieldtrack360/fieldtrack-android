@@ -2,10 +2,17 @@ package com.field360.fieldtrack.sample
 
 import android.app.Application
 import android.os.Build
+import android.util.Log
 import com.field360.tracker.AccuracyProfile
+import com.field360.tracker.DesiredAccuracy
 import com.field360.tracker.LocationProviderType
 import com.field360.tracker.Tracker
 import com.field360.tracker.TrackerConfig
+import com.field360.tracker.TrackingMode
+import com.field360.tracker.domain.model.TrackerGeofence
+import com.field360.tracker.domain.model.TrackerResult
+import com.field360.tracker.integrity.IntegrityPolicy
+import com.field360.traker.geo.model.MockPolicy
 import com.field360.traker.snap.OsrmSnapProvider
 import com.field360.traker.sync.SyncConfig
 import com.field360.traker.sync.TrackerSync
@@ -76,31 +83,183 @@ class SampleApplication : Application() {
         installRoadSnapping()
         installSync()
         scope.launch {
+            val config = buildTrackerConfig()
+            Log.i(TRACKER_TAG, "ready() config=$config")
+            when (val result = tracker.ready(config)) {
+                is TrackerResult.Ok ->
+                    Log.i(TRACKER_TAG, "ready() ok state=${result.value}")
+
+                is TrackerResult.Error ->
+                    Log.e(TRACKER_TAG, "ready() failed code=${result.code} message=${result.message}")
+            }
+        }
+    }
+
+    /**
+     * Every option the SDK exposes, set explicitly.
+     *
+     * A real host sets four or five of these and takes the defaults for the rest — that is
+     * the intended way to use the builder, and every value below that carries no comment
+     * *is* the default. It is written out in full for one reason: a configuration surface
+     * nobody exercises is a surface nobody knows is broken. Setting each one here means a
+     * renamed setter, a removed one, or a value the validator now refuses fails at this
+     * call site, in the sample, rather than in a host's app.
+     *
+     * Two deliberate omissions, both because they cannot coexist with what is set:
+     *
+     *  - `geolocation()`, `motion()`, `service()`, `persistence()`, `sensors()`,
+     *    `security()` and `accuracy()` each take a whole sub-config object and **replace**
+     *    it. Calling one after the granular setters below would silently discard them, so a
+     *    host picks one style or the other. This uses the granular one.
+     *  - `maxAccuracyMeters()` implies `AccuracyProfile.CUSTOM`, and `validate()` rejects
+     *    it against any other profile rather than ignoring it. With `STRICT` set below it
+     *    is not an option that exists — see `AccuracyConfig`.
+     */
+    @Suppress("LongMethod") // The length is the point: every setter, none hidden.
+    private fun buildTrackerConfig(): TrackerConfig =
+        // The builder rather than the constructor on purpose: it is the surface a Java
+        // host has, so the sample exercises it.
+        TrackerConfig.builder()
+            // ── identity and lifecycle ──────────────────────────────────────
+            .license(BuildConfig.TRACKER_LICENSE.takeIf { it.isNotBlank() })
+            // Read only by fieldtrack-sync, and only when SyncConfig carries no absolute
+            // URL of its own. Harmless when that module is absent.
+            .baseUrl(BuildConfig.SYNC_URL.takeIf { it.isNotBlank() })
             // reset = true (the default) during development, so edited config actually
             // takes effect. Flipping it to false is the classic "my config changes do
             // nothing" bug (SDK-COMPARISON §5).
-            tracker.ready(
-                // The builder rather than the constructor here on purpose: it is the
-                // surface a Java host has, so the sample exercises it.
-                TrackerConfig.builder()
-                    .license(BuildConfig.TRACKER_LICENSE.takeIf { it.isNotBlank() })
-                    // Fused by default. Switch to GPS_ONLY on a device with no Play
-                    // Services, or when a Wi-Fi centroid must never reach the record.
-                    .provider(LocationProviderType.FUSED)
-                    // The accuracy meter. BALANCED is the engine's own 30 m moving ceiling;
-                    // STRICT (20 m) trades points for a line that never zigzags.
-                    .accuracyProfile(AccuracyProfile.STRICT)
-                    // Raw fixes are layer 1 of the debug overlay. Off by default in the
-                    // SDK because it is a diagnostic, not production behavior — but the
-                    // sample exists precisely to diagnose (spec §8.4).
-                    .persistRawFixes(PERSIST_RAW_FIXES)
-                    // Layer 3: every judged fix in point form, so a missing point can
-                    // be compared against the ones that made it (v6).
-                    .persistRawPoints(PERSIST_RAW_POINTS)
-                    .build(),
-            )
-        }
-    }
+            .reset(true)
+
+            // ── geolocation ─────────────────────────────────────────────────
+            .trackingMode(TrackingMode.ADAPTIVE)
+            // Fused by default. Switch to GPS_ONLY on a device with no Play Services, or
+            // when a Wi-Fi centroid must never reach the record.
+            .provider(LocationProviderType.FUSED)
+            .desiredAccuracy(DesiredAccuracy.HIGH)
+            // The accuracy meter. BALANCED is the engine's own 30 m moving ceiling;
+            // STRICT (20 m) trades points for a line that never zigzags.
+            .accuracyProfile(AccuracyProfile.STRICT)
+            // The post-gap re-anchor bar. Left to the profile by default; set here because
+            // the first fix after a blackout decides where every later fix is judged from.
+            .recoveryTrustMeters(15f)
+            // 15 s / 5 s rather than the SDK's 60 s / 30 s: the sample is a diagnostic and
+            // a sparse stream makes every other layer harder to read. intervalMs must stay
+            // >= fastestIntervalMs (EC-120).
+            .intervalMs(15_000)
+            .fastestIntervalMs(5_000)
+            .maxUpdateDelayMs(60_000)
+            .maxFixAgeMs(10_000)
+            // The three cadence tiers: base above, vehicular once fixes report vehicle
+            // speed, turn burst across a corner. They must stay ordered — a burst slower
+            // than the tier it accelerates makes turn geometry worse (EC-45).
+            .adaptiveCadence(true)
+            .vehicularIntervalMs(12_000)
+            .turnBurst(true)
+            .turnBurstIntervalMs(4_000)
+            // 1 Hz navigation. Off: it costs battery no diagnostic session needs. Flip it
+            // on to watch the fast path — it requires the foreground service, which is on.
+            .navigationMode(false)
+            .navigationIntervalMs(1_000)
+            .navigationFastestIntervalMs(500)
+            .oneShotTimeoutMs(30_000)
+            // FLAG stores mock fixes with a flag rather than dropping them, so an emulated
+            // route is still visible in the overlay. REJECT is the production choice.
+            .mockLocationPolicy(MockPolicy.FLAG)
+
+            // ── motion ──────────────────────────────────────────────────────
+            .activityRecognition(true)
+            .activityRecognitionIntervalMs(10_000)
+            .activityConfidenceMin(75)
+            .snapshotConfidenceMin(50)
+            .disableStopDetection(false)
+            // false: a stationary stretch suppresses capture but never ends the session.
+            // true hands that decision to the SDK, and the host stops being told why.
+            .stopOnStationary(false)
+            .stopTimeoutMin(5)
+            .stationaryRadiusM(150f)
+            .stationaryGeofenceId(TrackerGeofence.DEFAULT_ID)
+            .stationaryGeofenceOnEnterEvent(TrackerGeofence.DEFAULT_ENTER_EVENT)
+            .stationaryGeofenceOnExitEvent(TrackerGeofence.DEFAULT_EXIT_EVENT)
+            .motionTriggerDelayMs(0)
+            // Must stay >= 5x the sampling interval, or the heartbeat fires on every fix
+            // and defeats stationary suppression entirely (EC-121).
+            .heartbeatIntervalSec(900)
+            .persistHeartbeat(false)
+            // Store a point once the heading has turned this far since the last one, and
+            // let CornerWindow reconsider a rejected fix one fix later (EC-45e).
+            .bearingChangeCaptureDeg(30)
+            .cornerAnchorCapture(true)
+
+            // ── sensors ─────────────────────────────────────────────────────
+            .useSignificantMotion(true)
+            .useStepCorroboration(true)
+            .useAccelerometerVeto(true)
+            // Off by default and left off: pressure adds nothing to a 2-D track and the
+            // barometer is missing on most mid-range hardware.
+            .useBarometer(false)
+            .stepBatchLatencyMs(60_000)
+            .useGyroTurnPrediction(true)
+
+            // ── service ─────────────────────────────────────────────────────
+            .foregroundService(true)
+            // false — a swipe-away must not silently end tracking. See ServiceConfig.
+            .stopOnTerminate(false)
+            .startOnBoot(true)
+            .healthLoopMs(120_000)
+            .watchdogIntervalMs(60_000)
+            .watchdogThrottleMs(900_000)
+            .backstopIntervalMin(15)
+            .deadTrackerMovingMin(30)
+            .deadTrackerStationaryMin(60)
+            .wakeLockMs(20_000)
+            // What the user actually sees for the whole session. All of it is the host's,
+            // the channel included: an SDK-named channel in an app's notification settings
+            // is a support ticket.
+            .notification("FieldTrack sample", "Recording your location")
+            .notificationChannel("fieldtrack_sample_tracking", "Location tracking")
+            // By NAME, not by @DrawableRes id: the config is persisted, and an id does not
+            // survive the next R regeneration. Resolved against this app's resources.
+            .notificationSmallIconResName("ic_stat_tracking")
+
+            // ── persistence ─────────────────────────────────────────────────
+            .maxDaysToPersist(7)
+            // 0 = no row cap; the TTL above is then the only limit.
+            .maxRecords(0)
+            // Raw fixes are layer 1 of the debug overlay. Off by default in the SDK
+            // because it is a diagnostic, not production behavior — but the sample exists
+            // precisely to diagnose (spec §8.4).
+            .persistRawFixes(PERSIST_RAW_FIXES)
+            .rawRingCapacity(5_000)
+            // Layer 3: every judged fix in point form, so a missing point can be compared
+            // against the ones that made it (v6).
+            .persistRawPoints(PERSIST_RAW_POINTS)
+            .rawPointRingCapacity(20_000)
+            // Layer 2: the verdict and reason for every fix — what the Decision Log reads.
+            .persistDecisions(true)
+            .decisionRetentionDays(3)
+            .decisionMaxRows(50_000)
+
+            // ── security / device integrity ─────────────────────────────────
+            //
+            // Every policy below is inert in this build. The sample is installed
+            // debuggable and the integrity layer waives itself there rather than reporting
+            // findings no developer can act on — `IntegrityChange` then says "waived",
+            // which is a different statement from "clean".
+            .securityEnabled(true)
+            .accessibilityPolicy(IntegrityPolicy.WARN)
+            .developerModePolicy(IntegrityPolicy.WARN)
+            .hookingPolicy(IntegrityPolicy.BLOCK)
+            .clockPolicy(IntegrityPolicy.WARN)
+            // BLOCK here and MockPolicy.FLAG above are reconciled by the SDK, not by the
+            // host: outside a debuggable build the stricter of the two wins and the
+            // pipeline rejects mock fixes regardless. See ResolveConfigUseCase.
+            .mockLocationIntegrityPolicy(IntegrityPolicy.BLOCK)
+            // Accessibility services the host vouches for — a screen reader is not an
+            // attacker, and an empty allowlist flags every one of them.
+            .accessibilityAllowlist(emptySet())
+            .maxClockSkewMs(120_000)
+            .integrityRecheckIntervalMs(15 * 60_000)
+            .build()
 
     /**
      * The upload half, if `SYNC_URL` is set in `local.properties`.
@@ -228,6 +387,15 @@ class SampleApplication : Application() {
     }
 
     companion object {
+        /**
+         * The one logcat tag the whole sample writes under, SDK callbacks included.
+         *
+         * `adb logcat -s TRACKER_TAG` is then the complete picture: the config at startup,
+         * every `TrackerEvent`, every `SyncEvent`, and each SDK state flow the sample
+         * observes.
+         */
+        const val TRACKER_TAG: String = "TRACKER_TAG"
+
         /**
          * Layer 1 of the debug overlay: every fix as the OS delivered it, before any gate.
          *

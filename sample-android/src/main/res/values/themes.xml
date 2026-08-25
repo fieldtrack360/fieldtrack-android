@@ -1,5 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Compose supplies the real theme; this only needs to be a valid app theme. -->
-    <style name="Theme.FieldTrackSample" parent="android:Theme.Material.Light.NoActionBar" />
+    <!--
+        Compose supplies the real theme; this one only has to be a valid app theme AND the
+        right colour. A light parent here paints the window white for the frame or two
+        before the first composition lands, which on a black console app reads as a flash.
+    -->
+    <style name="Theme.FieldTrackSample" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF060A06</item>
+        <item name="android:statusBarColor">#FF060A06</item>
+        <item name="android:navigationBarColor">#FF060A06</item>
+    </style>
 </resources>

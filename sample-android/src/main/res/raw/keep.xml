@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The notification icon is named in TrackerConfig, not referenced through R.
+
+    That is the SDK's contract — `notificationSmallIconResName` takes a String because the
+    config is persisted and a resource id does not survive the next R regeneration — but it
+    also means nothing on the classpath points at this drawable. The resource shrinker
+    concludes it is dead and strips it from the release APK, and the first evidence is a
+    foreground notification wearing the platform's fallback icon on a release build only.
+-->
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@drawable/ic_stat_tracking" />

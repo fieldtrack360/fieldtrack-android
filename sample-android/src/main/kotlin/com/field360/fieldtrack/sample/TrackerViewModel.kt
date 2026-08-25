@@ -30,6 +30,7 @@ import com.field360.traker.geo.plot.model.TrackOptions
 import com.field360.traker.sync.SyncEvent
 import com.field360.traker.sync.SyncQueue
 import com.field360.traker.sync.TrackerSync
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -202,6 +203,9 @@ class TrackerViewModel(
 
     /** The session id currently baked into `SyncConfig.extraParams`. */
     private var configuredSessionId: String? = null
+
+    /** The `observePoints()` subscription for the open session. See [observeSessionPoints]. */
+    private var pointsJob: Job? = null
 
     /** Wall clock of the last confirmed upload, for the stalled-queue check. */
     private var lastSyncOkAtMs: Long = System.currentTimeMillis()
@@ -377,10 +381,107 @@ class TrackerViewModel(
                 if (sdk.currentSessionId != configuredSessionId) {
                     configuredSessionId = sdk.currentSessionId
                     onSessionChanged(sdk.currentSessionId)
+                    observeSessionPoints(sdk.currentSessionId)
                 }
             }
         }
         observeSync()
+        observeSdkFlows()
+    }
+
+    /**
+     * The SDK's callback surface, all of it, logged under one tag.
+     *
+     * `events` and `state` are collected in `init` above because the UI is built out of
+     * them. The four below are not — the sample's screens read the same facts from
+     * `TrackerState` or on demand — and they are collected anyway, for two reasons:
+     *
+     *  1. They are part of the public API, and an API nothing calls is an API nothing
+     *     notices the breakage of.
+     *  2. They answer questions `events` cannot. `providerState()` and `batteryState()`
+     *     are live *before* a session opens and keep reporting after it closes;
+     *     `liveTrack()` is the only view of the tail the renderer actually draws.
+     *
+     * Collected with `viewModelScope`, so every one of them dies with the view model.
+     * The SDK's own state is application-scoped and stays the truth (EC-113).
+     */
+    private fun observeSdkFlows() {
+        // GPS switch, permission tier, power-save, airplane mode. The one flow worth
+        // watching before start(): every one of these is a reason capture will produce
+        // nothing, and all of them are knowable without opening a session.
+        viewModelScope.launch {
+            tracker.providerState().collect { provider ->
+                Log.d(
+                    TAG,
+                    "providerState · services=${provider.locationServicesEnabled} " +
+                        "gps=${provider.gpsEnabled} network=${provider.networkEnabled} " +
+                        "fused=${provider.fusedAvailable} tier=${provider.permission} " +
+                        "accuracy=${provider.accuracyAuthorization} " +
+                        "powerSave=${provider.powerSaveMode} airplane=${provider.airplaneMode}",
+                )
+            }
+        }
+
+        // "waived" is the expected reading in this build and is not the same statement as
+        // "clean" — see the IntegrityChange branch in onEvent.
+        viewModelScope.launch {
+            tracker.integrityState().collect { report ->
+                Log.d(
+                    TAG,
+                    "integrity · waived=${report.waived} blocked=${report.blocked} " +
+                        "findings=[${report.findings.joinToString { "${it.signal}@${it.policy}" }}]",
+                )
+            }
+        }
+
+        // Four broadcasts a day, live from ready() onward rather than only during a
+        // session — which is what makes it usable for "did the battery kill the run".
+        viewModelScope.launch {
+            tracker.batteryState().collect { battery ->
+                Log.d(
+                    TAG,
+                    "battery · ${battery.percent ?: "?"}% charging=${battery.isCharging} " +
+                        "source=${battery.powerSource} low=${battery.isLow}",
+                )
+            }
+        }
+
+        // The renderer's own feed: a frozen polyline plus the handful of live head points
+        // and the puck. Logged at the tail's length rather than its contents — the
+        // polyline is thousands of characters and belongs on a map, not in logcat.
+        viewModelScope.launch {
+            tracker.liveTrack().collect { update ->
+                Log.d(
+                    TAG,
+                    "liveTrack · session=${update.sessionId.take(SHORT_ID)} seq=${update.sequence} " +
+                        "tail=${update.frozenTailPolyline.length}ch head=${update.liveHead.size} " +
+                        "puck=${update.puck?.let { "%.5f,%.5f".format(it.latitude, it.longitude) } ?: "-"}",
+                )
+            }
+        }
+    }
+
+    /**
+     * `observePoints()` for the session that is open now, and only that one.
+     *
+     * A Room-backed flow keyed by session id, so it has to be re-subscribed when the
+     * session changes and cancelled when none is open — otherwise the previous session's
+     * query stays live for the rest of the process, emitting a list that can no longer
+     * grow.
+     */
+    private fun observeSessionPoints(sessionId: String?) {
+        pointsJob?.cancel()
+        pointsJob = null
+        if (sessionId == null) return
+        pointsJob = viewModelScope.launch {
+            tracker.observePoints(sessionId).collect { points ->
+                Log.d(
+                    TAG,
+                    "observePoints · session=${sessionId.take(SHORT_ID)} rows=${points.size} " +
+                        "last=${points.lastOrNull()?.let { "%.5f,%.5f".format(it.latitude, it.longitude) } ?: "-"}",
+                )
+            }
+        }
     }
 
     /**
@@ -446,6 +547,8 @@ class TrackerViewModel(
             is SyncEvent.NetworkAvailable ->
                 "network back · ${event.queued} row(s) queued"
         }
+        Log.d(TAG, "sync · $line")
+
         _state.update { current ->
             current.copy(
                 syncLastEvent = line,
@@ -845,6 +948,11 @@ class TrackerViewModel(
                 "LICENCE ${event.info.status}" +
                     if (event.info.fromCache) " (cached)" else ""
         }
+
+        // Every event, one line, one tag. The screen keeps LOG_LIMIT lines and the file
+        // keeps all of them, but neither is greppable from a terminal while a drive is
+        // happening — which is exactly when this is wanted.
+        Log.d(TAG, "event · $line")
 
         licenseAlertFor(event)?.let { alert -> _state.update { it.copy(licenseAlert = alert) } }
 
@@ -1496,8 +1604,12 @@ class TrackerViewModel(
         private const val TEST_GEOFENCE_RING_RADIUS_M = 400.0
         private const val VERDICT_WIDTH = 7
 
-        /** Matches the SDK's own `Tracker/<tag>` logcat convention, so one grep finds both. */
-        private const val TAG = "Tracker/Sample"
+        /**
+         * Every logcat line the sample writes — SDK callbacks included — goes out under
+         * this one tag, so `adb logcat -s TRACKER_TAG` is the whole picture and nothing
+         * interesting is filed under a tag the reader has to guess.
+         */
+        private const val TAG = SampleApplication.TRACKER_TAG
         private const val SHORT_ID = 8
         private const val TOAST_BUFFER = 4
 

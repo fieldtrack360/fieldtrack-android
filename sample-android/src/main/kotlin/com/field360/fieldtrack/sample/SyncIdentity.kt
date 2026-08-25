@@ -1,6 +1,7 @@
 package com.field360.fieldtrack.sample
 
 import android.content.Context
+import androidx.core.content.edit
 import java.util.UUID
 
 /**
@@ -36,7 +37,7 @@ internal class SyncIdentity(context: Context) {
      */
     val deviceId: String by lazy {
         prefs.getString(KEY_DEVICE_ID, null) ?: UUID.randomUUID().toString().also {
-            prefs.edit().putString(KEY_DEVICE_ID, it).commit()
+            prefs.edit(commit = true) { putString(KEY_DEVICE_ID, it) }
         }
     }
 

@@ -61,6 +61,12 @@ public class TrackingService : LifecycleService() {
     /** The supervision coroutines for the session currently being served. */
     private var supervision: Job? = null
 
+    /**
+     * What [buildNotification] was last given, so [startSupervision] can tell whether the
+     * persisted config it just read differs from what is already on screen.
+     */
+    private var postedNotification: ServiceConfig? = null
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
 
@@ -106,6 +112,13 @@ public class TrackingService : LifecycleService() {
         supervision = lifecycleScope.launch {
             val config = configRepository.load() ?: TrackerConfig()
 
+            // The one case [promoteToForeground] cannot get right on its own: after the
+            // process was killed and the sticky restart brought this service back, the
+            // in-memory config was empty and the platform defaults went up. The host's
+            // title, text and icon are on disk, and this is the first point at which
+            // reading them is allowed to suspend.
+            refreshNotification(config.service)
+
             // In-process force-capture. Never startForegroundService() from a receiver:
             // a `running` flag goes stale between an OS kill and onDestroy, and the call
             // then throws with nothing to catch it (SOURCE-AUDIT A13).
@@ -131,6 +144,16 @@ public class TrackingService : LifecycleService() {
         }
     }
 
+    /** Re-posts the ongoing notification when [config] differs from what is on screen. */
+    private fun refreshNotification(config: ServiceConfig) {
+        if (config == postedNotification) return
+        postedNotification = config
+        runCatching {
+            getSystemService(NotificationManager::class.java)
+                .notify(NOTIFICATION_ID, buildNotification(config))
+        }
+    }
+
     private fun teardown() {
         running = false
         supervision?.cancel()
@@ -141,15 +164,22 @@ public class TrackingService : LifecycleService() {
         // `stopSelf`, and on an OEM that defers the destroy the "Tracking active"
         // notification is what the user is left looking at after tapping Stop.
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        postedNotification = null
     }
 
     /** @return false if the OS refused; the service has already stopped itself. */
     @SuppressLint("InlinedApi") // ServiceCompat ignores this inlined type below API 29.
     private fun promoteToForeground(): Boolean = try {
+        // The in-memory config, never a disk read: `startForeground` has to happen inside
+        // `onStartCommand` on the main thread, and `ConfigRepository.load()` suspends.
+        // `ResolveConfigUseCase` saves on every `ready()`, so this is populated for the
+        // whole life of the process that started the session. After a sticky restart
+        // following process death it is null, the defaults are posted, and
+        // [startSupervision] re-posts with the persisted config a moment later.
         ServiceCompat.startForeground(
             this,
             NOTIFICATION_ID,
-            buildNotification(),
+            buildNotification(cachedServiceConfig().also { postedNotification = it }),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
         )
         true
@@ -167,24 +197,69 @@ public class TrackingService : LifecycleService() {
         false
     }
 
-    private fun buildNotification(): Notification {
+    private fun cachedServiceConfig(): ServiceConfig =
+        graph.configStore.cached?.service ?: ServiceConfig()
+
+    private fun buildNotification(config: ServiceConfig): Notification {
         val manager = getSystemService(NotificationManager::class.java)
         // Re-created on every start: a user-deleted channel makes the notification
         // invisible and gets the service killed on some OEMs (EC-76).
         val channel = NotificationChannel(
-            CHANNEL_ID,
-            CHANNEL_NAME,
+            config.notificationChannelId,
+            config.notificationChannelName,
             NotificationManager.IMPORTANCE_LOW,
         )
         manager.createNotificationChannel(channel)
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(DEFAULT_TITLE)
-            .setContentText(DEFAULT_TEXT)
-            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+        return NotificationCompat.Builder(this, config.notificationChannelId)
+            .setContentTitle(config.notificationTitle)
+            .setContentText(config.notificationText)
+            .setSmallIcon(resolveSmallIcon(config.notificationSmallIconResName))
             .setOngoing(true)
             .setSilent(true)
             .build()
+    }
+
+    /**
+     * Resolves `ServiceConfig.notificationSmallIconResName` against the HOST's resources.
+     *
+     * A name rather than an `@DrawableRes Int` because [ServiceConfig] is `@Serializable`
+     * and persisted: a resource id is not stable across builds, so a stored one points at
+     * whatever moved into that slot after the next R regeneration.
+     *
+     * Falls back to the platform icon rather than throwing. An unresolvable name is a
+     * cosmetic mistake in the host's config, and `setSmallIcon(0)` is not — it makes the
+     * post fail, which fails `startForeground`, which stops the service and ends the
+     * session. Said out loud in the log so the mistake is findable.
+     */
+    // getIdentifier is discouraged because a compile-time R constant is faster and
+    // verifiable — and it is unavailable here by construction. The icon belongs to the
+    // HOST's resource table, which this module cannot reference, and the config carrying
+    // it is serialized to disk, where an id would not survive the next R regeneration.
+    // Once per service start, off any hot path.
+    @SuppressLint("DiscouragedApi")
+    private fun resolveSmallIcon(resName: String?): Int {
+        if (resName.isNullOrBlank()) return DEFAULT_SMALL_ICON
+
+        // "ic_stat_track", "drawable/ic_stat_track" and "com.host.app:drawable/ic_stat_track"
+        // are all things a host will reasonably write, so accept all three. Qualified forms
+        // carry their own type, bare ones are looked up as a drawable and then a mipmap.
+        val qualified = '/' in resName || ':' in resName
+        val id = runCatching {
+            if (qualified) {
+                resources.getIdentifier(resName, null, packageName)
+            } else {
+                resources.getIdentifier(resName, "drawable", packageName)
+                    .takeIf { it != 0 }
+                    ?: resources.getIdentifier(resName, "mipmap", packageName)
+            }
+        }.getOrDefault(0)
+
+        if (id == 0) {
+            sdkLog { logger.w(TAG, "notificationSmallIconResName '$resName' not found; using default") }
+            return DEFAULT_SMALL_ICON
+        }
+        return id
     }
 
     public companion object {
@@ -200,10 +275,12 @@ public class TrackingService : LifecycleService() {
 
         internal const val TAG = "TrackingService"
         internal const val NOTIFICATION_ID = 8_301
-        internal const val CHANNEL_ID = "trackit_tracking"
-        internal const val CHANNEL_NAME = "Location tracking"
-        internal const val DEFAULT_TITLE = "Tracking active"
-        internal const val DEFAULT_TEXT = "Recording your location"
+        /**
+         * Used only when the host named an icon that does not resolve, or named none.
+         * The title, text, channel and icon a host DID configure live in [ServiceConfig]
+         * and are read from there — duplicating their defaults here is how the two drift.
+         */
+        internal val DEFAULT_SMALL_ICON = android.R.drawable.ic_menu_mylocation
 
         public const val ACTION_RESUME: String = "com.field360.tracker.RESUME"
         public const val ACTION_STOP: String = "com.field360.tracker.STOP"

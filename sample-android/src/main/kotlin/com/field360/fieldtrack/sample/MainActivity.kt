@@ -11,14 +11,12 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -34,7 +32,12 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.field360.fieldtrack.sample.screen.BackgroundLocationDialog
 import com.field360.fieldtrack.sample.screen.DebugOverlayScreen
 import com.field360.fieldtrack.sample.screen.DecisionLogScreen
+import com.field360.fieldtrack.sample.screen.Hack
+import com.field360.fieldtrack.sample.screen.HackerBottomBar
+import com.field360.fieldtrack.sample.screen.HackerTab
 import com.field360.fieldtrack.sample.screen.HomeScreen
+import com.field360.fieldtrack.sample.screen.hackerColorScheme
+import com.field360.fieldtrack.sample.screen.hackerTypography
 import com.field360.fieldtrack.sample.screen.LicenseAlertDialog
 import com.field360.fieldtrack.sample.screen.PermissionAlertDialog
 import com.field360.fieldtrack.sample.screen.SyncAlertDialog
@@ -52,7 +55,14 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            MaterialTheme {
+            // The terminal theme is applied here rather than per screen so Material's own
+            // surfaces — the four dialogs this app raises, menus, toasts — come out in the
+            // same palette. A proportional white dialog over a green console is how a
+            // theme announces that it is only skin deep.
+            MaterialTheme(
+                colorScheme = hackerColorScheme(),
+                typography = hackerTypography(),
+            ) {
                 SampleApp(
                     onRequestForeground = { callback ->
                         onPermissionResult = callback
@@ -124,11 +134,17 @@ class MainActivity : ComponentActivity() {
         )
 }
 
-private enum class Tab(val label: String) {
-    HOME("Home"),
-    TRACK("Track"),
-    DEBUG("Debug"),
-    DECISIONS("Decisions"),
+/**
+ * The four screens, numbered.
+ *
+ * @property code shown above the label in the bar. A number per slot is what a terminal
+ *   menu offers, and it keeps the four items the same width whatever they are called.
+ */
+private enum class Tab(val code: String, val label: String) {
+    HOME("01", "Home"),
+    TRACK("02", "Track"),
+    DEBUG("03", "Debug"),
+    DECISIONS("04", "Decisions"),
 }
 
 @Composable
@@ -227,30 +243,44 @@ private fun SampleApp(
         )
     }
 
+    // Counts that belong on the bar rather than on a screen: they are the reason to
+    // switch tabs, and they are useless on the tab that is already showing.
+    val tabs = Tab.entries.map { entry ->
+        HackerTab(
+            code = entry.code,
+            label = entry.label,
+            badge = when (entry) {
+                // A queue that is growing while nothing uploads is the fault this app
+                // exists to make visible, and it is visible from every tab.
+                Tab.HOME -> state.syncQueued.takeIf { it > 0 }?.let { "Q$it" }
+                Tab.TRACK -> state.points.size.takeIf { it > 0 }?.toString()
+                Tab.DEBUG -> state.rawFixes.size.takeIf { it > 0 }?.toString()
+                Tab.DECISIONS -> state.decisions.size.takeIf { it > 0 }?.toString()
+            },
+            badgeColor = if (entry == Tab.HOME && state.syncFailing) Hack.Red else Hack.Amber,
+        )
+    }
+
     Scaffold(
+        containerColor = Hack.Bg,
         bottomBar = {
-            NavigationBar {
-                Tab.entries.forEach { entry ->
-                    NavigationBarItem(
-                        selected = tab == entry,
-                        onClick = {
-                            tab = entry
-                            // Every screen but Home reads stored data, so pull it fresh
-                            // on entry rather than holding a permanent query open. The
-                            // session list is loaded either way — Track has its own picker
-                            // and an empty dropdown there is indistinguishable from having
-                            // recorded nothing.
-                            viewModel.loadSessions()
-                            if (entry != Tab.HOME) viewModel.refresh()
-                        },
-                        icon = {},
-                        label = { Text(entry.label) },
-                    )
-                }
-            }
+            HackerBottomBar(
+                tabs = tabs,
+                selected = tabs[tab.ordinal],
+                onSelect = { selected ->
+                    val entry = Tab.entries[tabs.indexOf(selected)]
+                    tab = entry
+                    // Every screen but Home reads stored data, so pull it fresh on entry
+                    // rather than holding a permanent query open. The session list is
+                    // loaded either way — Track has its own picker and an empty dropdown
+                    // there is indistinguishable from having recorded nothing.
+                    viewModel.loadSessions()
+                    if (entry != Tab.HOME) viewModel.refresh()
+                },
+            )
         },
     ) { padding ->
-        Column(Modifier.fillMaxSize().padding(padding)) {
+        Column(Modifier.fillMaxSize().background(Hack.Bg).padding(padding)) {
             when (tab) {
                 Tab.HOME -> HomeScreen(
                     state = state,
