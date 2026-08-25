@@ -14,6 +14,7 @@
 -keep public class com.field360.traker.geo.model.ActivityType { public protected *; }
 -keep public class com.field360.traker.geo.model.Bounds { public protected *; }
 -keep public class com.field360.traker.geo.model.Bounds$Companion { public protected *; }
+-keep public class com.field360.traker.geo.model.Deferred { public protected *; }
 -keep public class com.field360.traker.geo.model.FilterState { public protected *; }
 -keep public class com.field360.traker.geo.model.FilterState$Companion { public protected *; }
 -keep public class com.field360.traker.geo.model.FixDecision { public protected *; }
@@ -68,6 +69,11 @@
 -keep public class com.field360.traker.geo.math.Geodesy { public protected *; }
 -keep public class com.field360.traker.geo.math.Geodesy$Projection { public protected *; }
 -keep public class com.field360.traker.geo.math.Haversine { public protected *; }
+-keep public class com.field360.traker.geo.motion.CornerWindow { public protected *; }
+-keep public class com.field360.traker.geo.motion.GyroTurnGate { public protected *; }
+-keep public class com.field360.traker.geo.motion.GyroTurnGate$Companion { public protected *; }
+-keep public class com.field360.traker.geo.motion.GyroTurnGate$Result { public protected *; }
+-keep public class com.field360.traker.geo.motion.GyroTurnGate$State { public protected *; }
 -keep public class com.field360.traker.geo.motion.MotionEvent { public protected *; }
 -keep public class com.field360.traker.geo.motion.MotionEvent$AcceptedFix { public protected *; }
 -keep public class com.field360.traker.geo.motion.MotionEvent$ActivityEnter { public protected *; }
