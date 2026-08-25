@@ -21,6 +21,7 @@ import com.field360.tracker.domain.model.TrackerEvent
 import com.field360.tracker.domain.repository.ConfigRepository
 import com.field360.traker.geo.port.TrackLogger
 import com.field360.tracker.motion.MotionController
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.isActive
@@ -57,7 +58,8 @@ public class TrackingService : LifecycleService() {
 
     private val configRepository: ConfigRepository get() = graph.config
 
-    private var started = false
+    /** The supervision coroutines for the session currently being served. */
+    private var supervision: Job? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
@@ -74,11 +76,20 @@ public class TrackingService : LifecycleService() {
 
         if (!promoteToForeground()) return START_NOT_STICKY
 
-        if (!started) {
-            started = true
-            running = true
-            startSupervision()
-        }
+        running = true
+        // Unconditional, where this used to run only on the first start command.
+        //
+        // `StartTrackingUseCase` stops this service before opening a new session, but
+        // `stopService` is a request, not a barrier: a start command issued immediately
+        // after can still land on an instance whose `onDestroy` has not run. That instance
+        // used to keep supervising with the config it read when the *previous* session
+        // began — its health-loop cadence, its watchdog thresholds, its force-capture
+        // config — and nothing ever corrected it.
+        //
+        // Re-arming instead is cheap and has no failure mode: [startSupervision] cancels
+        // the previous coroutines before launching, so repeated start commands cannot
+        // stack collectors either.
+        startSupervision()
 
         // START_STICKY, never START_STICKY_COMPATIBILITY — the latter does not guarantee
         // onStartCommand is called again, so the service returns unconfigured (A14).
@@ -91,7 +102,8 @@ public class TrackingService : LifecycleService() {
     }
 
     private fun startSupervision() {
-        lifecycleScope.launch {
+        supervision?.cancel()
+        supervision = lifecycleScope.launch {
             val config = configRepository.load() ?: TrackerConfig()
 
             // In-process force-capture. Never startForegroundService() from a receiver:
@@ -121,8 +133,14 @@ public class TrackingService : LifecycleService() {
 
     private fun teardown() {
         running = false
-        started = false
+        supervision?.cancel()
+        supervision = null
         healthLoop.stop()
+        // Explicit, and with REMOVE. The platform drops a foreground notification when the
+        // service is destroyed, but `teardown` also runs on the ACTION_STOP path *before*
+        // `stopSelf`, and on an OEM that defers the destroy the "Tracking active"
+        // notification is what the user is left looking at after tapping Stop.
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
     }
 
     /** @return false if the OS refused; the service has already stopped itself. */

@@ -133,7 +133,7 @@ val json = trackIt.exportPolylineJson(PointQuery(sessionId = sessionId))
 |---|---|---|
 | `Tracker.getInstance(context)` | Returns the process-wide instance. Idempotent, thread-safe, cheap — the graph is lazy, so this opens no database and touches no disk. Safe to pass an Activity; the application context is what is retained. | Anywhere |
 | `ready(config)` | Resolves the effective config, restores persisted filter state, enqueues the retention worker, and reports a session left open by a crash. | Once, in `Application.onCreate` |
-| `start(tag)` | Opens a session and starts the capture pipeline. Idempotent while already tracking — a double tap returns the existing session rather than splitting a drive in two. | After permissions |
+| `start(tag)` | Opens a session and starts the capture pipeline. **Always a new session, and only one is ever active** — anything still running is stopped first, service and workers included. A double tap therefore produces two session ids; gate your Start control on `state.isTracking`. | After permissions |
 
 Call `ready()` from `Application.onCreate`, not from an Activity: it restores filter state
 and reports an interrupted session, and both should happen before any UI exists to observe
@@ -226,6 +226,31 @@ which is the display-side use it always deserved.
 
 ---
 
+### One session at a time
+
+`start()` enforces this rather than assuming it. Before the new session row is written, and
+only after every gate has passed, the SDK brings down whatever was running:
+
+- the capture stream, the motion controller and the ingest channel
+- every session-scoped sensor — step detector, gyroscope, activity recognition, the
+  significant-motion wake and the stationary fence
+- `BackstopWorker` and `RestoreWorker`
+- the open session row, **then** the foreground service — in that order, because every
+  resurrection path in the SDK gates on "is a session open"
+
+`stop()` runs the identical teardown. It also runs it when no session is open, which is not
+a no-op: a service left alive by a sticky restart, or one the host never stopped, is exactly
+what needs killing there.
+
+A `start()` that fails a gate — `PERMISSION_DENIED`, `COARSE_ONLY`,
+`PLAY_SERVICES_UNAVAILABLE` — tears nothing down. A refused start must not take a healthy
+running session with it.
+
+When a start does supersede a live session you get `TrackerEvent.Diagnostic` naming the old
+session id, followed by `EnabledChange(true)` for the new one.
+
+---
+
 ## 4. Permissions
 
 **The SDK shows no UI.** No dialogs, no activities, no full-screen intents. It answers
@@ -286,13 +311,73 @@ Separately, `permissions.accuracy()` returns `APPROXIMATE` or `PRECISE`. A 1–3
 circle defeats every gate in the pipeline, so `start()` refuses `CONTINUOUS` and `ADAPTIVE`
 under approximate-only with `Error(COARSE_ONLY)`. `MOTION_ONLY` is allowed.
 
-### 4.4 Revocation mid-session
+### 4.4 Check before you start, not after
 
-A permission can be revoked while the foreground service is running. The SDK watches
-`AppOpsManager` and reacts immediately — no polling. On a downgrade the stream stops but
-the **session stays open**: whether to end it is your decision, never a side effect of a
-permission toggle. You get `TrackerEvent.Error(BACKGROUND_PERMISSION_MISSING)` and a
-`ProviderChange`.
+`start()` answers with a typed error and shows nothing. Forwarding `PERMISSION_DENIED` to a
+text field leaves the user holding a code they cannot act on, so ask first — every question
+`start()` will ask is answerable from `Tracker.permissions()` before you call it:
+
+```kotlin
+val permissions = tracker.permissions()
+val missing = buildList {
+    when (permissions.tier()) {
+        PermissionTier.NONE           -> add("Location")            // start() → PERMISSION_DENIED
+        PermissionTier.FOREGROUND_ONLY -> add("Location all the time") // degrades, still starts
+        PermissionTier.FULL           -> Unit
+    }
+    // ADAPTIVE and CONTINUOUS refuse approximate-only; MOTION_ONLY allows it (EC-02).
+    if (permissions.accuracy() == LocationAccuracy.APPROXIMATE) add("Precise location")
+    if (!permissions.hasNotificationPermission()) add("Notifications")
+    if (!permissions.hasActivityRecognition()) add("Physical activity")
+}
+
+if (missing.isEmpty()) tracker.start(tag = "shift") else showYourOwnDialog(missing)
+```
+
+Two of those refuse the session and three only degrade it, so say which is which and offer
+"start anyway" for the second group — a dialog that treats a missing activity-recognition
+grant like a missing location grant trains users to deny both. `hasNotificationPermission()`
+and `hasActivityRecognition()` already answer `true` on the API levels that have no such
+permission, so no version checks are needed around them.
+
+Ask for background location **separately and afterwards**: bundling it into the same
+request array makes Android deny it silently (EC-04), and from Android 11 there is no
+prompt for it at all (EC-05). `sample-android`'s `PermissionAlertDialog` is a working
+version of all of this.
+
+### 4.5 Revocation and recovery mid-session
+
+A permission can be revoked, and the GPS switched off, while the foreground service is
+running. The SDK watches `AppOpsManager` (both the fine and the coarse op) and the
+`PROVIDERS_CHANGED` broadcast, and reacts immediately — no polling.
+
+**The session always stays open.** Whether to end a drive because a user tapped a toggle is
+your decision, never a side effect inside the SDK. What the SDK does instead is suspend
+capture, tell you, and re-arm itself when the device allows it again:
+
+| What the user did | Events you receive | What capture does |
+|---|---|---|
+| Revoked location entirely | `PermissionChange(→ NONE)`, `CaptureSuspended(PERMISSION_DENIED)`, `Error(PERMISSION_DENIED)` | Stops. The request is torn down, not left registered against a provider you may no longer read |
+| Granted it again | `PermissionChange(NONE →)`, `CaptureResumed` | Restarts in the **same session**, plus one immediate fix so the gap has a boundary |
+| Dropped "Allow all the time" to "While using the app" | `PermissionChange(FULL → FOREGROUND_ONLY)`, `Error(BACKGROUND_PERMISSION_MISSING)` | Keeps running. Degrade, never refuse |
+| Turned off precise location | `PermissionChange` with `accuracy = APPROXIMATE`, `Error(COARSE_ONLY)` | Keeps running. The acceptance pipeline judges the error circle |
+| Turned off GPS, network positioning still on | `ProviderChange` only | Keeps running — this is a degradation, not an outage |
+| Turned off every provider, or the master switch | `LocationServicesChange(false)`, `CaptureSuspended(LOCATION_DISABLED)`, `Error(LOCATION_DISABLED)` | Stops |
+| Turned location back on | `LocationServicesChange(true)`, `CaptureResumed` | Restarts in the same session |
+
+`TrackerState.isCapturing` carries the same fact as a value: `isTracking = true` with
+`isCapturing = false` means the session is open and suspended. Show that state — an open
+session with a revoked permission otherwise looks identical to a healthy parked one.
+
+Starting a session while location is switched off is allowed and does **not** return an
+error: the session opens, capture is suspended immediately, and it begins for real when the
+switch comes back. The record should exist with a documented gap in it rather than not
+exist at all.
+
+`Tracker.refreshProviderState()` forces a re-read. The SDK already does this on every
+`start()` and `getCurrentLocation()`; call it from `onResume` if a screen's own decisions
+depend on the GPS switch, since a broadcast that fires while your process is dead is never
+delivered.
 
 ---
 
@@ -461,7 +546,8 @@ SDK (EC-137).
 .vehicularIntervalMs(12_000)     // while vehicular
 .turnBurst(true)
 .turnBurstIntervalMs(4_000)      // while measurably turning
-.bearingChangeCaptureDeg(40)     // store on a heading change this large
+.bearingChangeCaptureDeg(30)     // store on a heading change this large
+.cornerAnchorCapture(true)       // restore a rejected fix the next one shows was at a corner
 ```
 
 **`distanceFilterM` must stay `0`, and `validate()` enforces it.** A non-zero OS distance
@@ -534,6 +620,7 @@ battery drain with nothing to show for it (EC-138).
 .useAccelerometerVeto(true)    // 1 s burst to make the phantom-Doppler correction certain
 .useBarometer(false)           // pressure delta distinguishes an elevator from a teleport
 .stepBatchLatencyMs(60_000)    // sensor-hub batching, so the AP never wakes for step events
+.useGyroTurnPrediction(true)   // arm the turn burst from yaw rate, ahead of GNSS heading
 ```
 
 Probe what the device actually has:
@@ -723,7 +810,7 @@ TrackOptions(
     consolidateStops = true,
     stopRadiusM = 60.0,
     stopMinDwellSec = 600,
-    smoothing = Smoothing.SPLINE,     // NONE | BEZIER | SPLINE
+    smoothing = Smoothing.SPLINE,     // NONE | BEZIER | SPLINE | HEADING_SPLINE
     splineSpacingM = 5.0,
     simplifyEpsilonM = 2.0,           // Douglas-Peucker before smoothing; 0 disables
     snapToRoad = true,                // no-op unless a RoadSnapProvider is installed
@@ -738,6 +825,23 @@ TrackOptions(
 `BEZIER` only rounds vertices sharper than `bezierMinAngleDeg` and cannot do anything about
 a 120 m leg drawn as a chord, which is the usual complaint. `NONE` gives you exactly the
 stored vertices.
+
+`HEADING_SPLINE` is `SPLINE` with one change, and it is the one that matters at corners.
+Catmull-Rom derives the tangent at a vertex from the vertices either side of it; through a
+turn those sit on opposite legs, so the derived tangent is the chord across the corner and
+the curve leaves the vertex pointing somewhere the vehicle never pointed — it cuts the
+inside of the turn. Every stored point already carries the chipset's Doppler heading, which
+is the true tangent, so `HEADING_SPLINE` uses that instead. The corner then appears
+*between* two fixes, from two headings, with neither fix having sampled its apex.
+
+It degrades rather than failing: a vertex with no recorded heading — no bearing from the
+chipset, or a speed below walking pace, where a reported heading is multipath — takes the
+Catmull-Rom tangent, so a track from a chipset that reports no heading draws the shape
+`SPLINE` draws. Road-snapped geometry passes through untouched under both.
+
+```kotlin
+TrackOptions(smoothing = Smoothing.HEADING_SPLINE)
+```
 
 ### Export formats
 
@@ -987,7 +1091,7 @@ breaking change.
 |---|---|
 | Lifecycle | `Init`, `Resume`, `Session Closed`, `Reboot Boundary`, `Out Of Order` |
 | Timing | `Burst`, `Stale Fix`, `15-Min Heartbeat`, `HeartBeat Skipped` |
-| Accept | `Vehicular`, `Moving/Walking`, `Bearing Change`, `Arrival`, `Indoor Arrival`, `Walk Arrival`, `Blackout Arrival`, `Stationary Recovery` |
+| Accept | `Vehicular`, `Moving/Walking`, `Bearing Change`, `Corner Anchor`, `Arrival`, `Indoor Arrival`, `Walk Arrival`, `Blackout Arrival`, `Stationary Recovery` |
 | Reject | `Poor Accuracy`, `Impossible Speed`, `Sigma Gate Outlier`, `Sigma Junk Fail`, `Mock Location`, `Invalid Coordinates`, `Heuristic Gate` |
 | Recovery | `Recovery Confirmed`, `Recovery Reset`, `Recovery Held`, `Sigma Forced Reset` |
 | Stationary | `Origin Set`, `Departure Held`, `Drift Suppressed` |

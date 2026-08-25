@@ -321,6 +321,71 @@ public data class TrackerConstants(
     /** Under a second the rate divides by ~0; over 30 s the two headings are unrelated. */
     val turnBurstMinDtSec: Float = 1.0f,
     val turnBurstMaxDtSec: Float = 30.0f,
+
+    // ── predictive turn burst from the gyroscope (EC-45d) ─────────────────────
+    /**
+     * Yaw rate about the world vertical that arms the fast tier
+     * ([com.field360.traker.geo.motion.GyroTurnGate]).
+     *
+     * Deliberately the *same* number as the 100 m urban corner in
+     * [turnBurstEnterDegPerSec]'s table, and it means something different here.
+     * `TurnDetector` measures the rate GNSS heading changed **across a whole 12 s
+     * interval** — an average, which a corner entered halfway through the interval halves.
+     * A gyroscope reports the instantaneous rate, so the same corner reads far higher:
+     * `v / R` at 7 m/s round a 15 m junction is 26 °/s, and even a 300 m motorway sweep at
+     * 25 m/s is 4.8 °/s.
+     *
+     * 5 °/s therefore sits just under the gentlest curve worth sampling faster and far
+     * above what a vehicle on a straight road produces. It is not a noise floor — gyro
+     * noise is a fraction of a degree per second — it is the curvature below which the
+     * chord error stays under a few metres and the extra samples are not worth the
+     * battery.
+     */
+    val gyroTurnEnterDegPerSec: Float = 5.0f,
+    /**
+     * How long the rate must stay above [gyroTurnEnterDegPerSec] before the burst arms.
+     *
+     * This is the whole difference between predicting a turn and reacting to a pothole.
+     * A vehicle takes the better part of a second to develop steering angle and holds it
+     * for the length of the corner; a phone knocked in its cradle, a speed bump, or a
+     * lane correction is a spike measured in tens of milliseconds. 600 ms discards those
+     * and still arms the burst well before the next scheduled fix at any cadence tier.
+     */
+    val gyroTurnSustainMs: Long = 600,
+    /**
+     * Above this the sample is a phone being handled, not a vehicle turning, and it is
+     * **rejected** rather than clamped — so it also breaks the sustain run and cannot
+     * accumulate into a burst.
+     *
+     * 120 °/s is a three-second full circle. No road vehicle does that; a phone lifted out
+     * of a cradle exceeds it in a tenth of a second.
+     */
+    val gyroTurnMaxDegPerSec: Float = 120.0f,
+    /**
+     * How long a GNSS-measured vehicular speed keeps the gyroscope registered.
+     *
+     * The gate's real defence against a walker swinging a phone is that the gyroscope is
+     * not listening at all unless GNSS has recently seen the device travelling at
+     * [turnBurstMinSpeed]. This window is how long "recently" lasts, and it is set at one
+     * minute for a specific reason: it must comfortably outlive the 12 s vehicular
+     * cadence, so a normal drive keeps re-arming it, while still shutting the sensor down
+     * within a minute of the vehicle stopping.
+     */
+    val gyroTurnVehicularWindowMs: Long = 60_000,
+
+    // ── deferred corner anchors (EC-45e) ──────────────────────────────────────
+    /**
+     * How far a restored corner anchor must sit from the last stored point
+     * ([com.field360.traker.geo.motion.CornerWindow]).
+     *
+     * An anti-duplicate floor and nothing more — two vertices 3 m apart draw the same line
+     * as one and cost an extra row. It is far below [anchorMinDist] and [distMinMove] on
+     * purpose: a fix reaches this stage precisely *because* it moved less than
+     * `distMinMove`, so a floor at the usual 15 m would reject every candidate the stage
+     * can ever be handed. Keeping stationary drift out is a job for the Doppler check and
+     * the turn itself, not for a distance that would also exclude the real case.
+     */
+    val cornerAnchorMinDist: Double = 5.0,
 ) {
     public companion object {
         public val Default: TrackerConstants = TrackerConstants()

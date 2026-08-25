@@ -85,6 +85,7 @@ public object TrackBuilder {
                 activity = point.detectedActivity,
                 // First and last are session bookends and must never be moved (EC-103).
                 isProtected = index == 0 || index == consolidated.lastIndex,
+                bearingDeg = plotBearingOf(point),
             )
         }
 
@@ -94,12 +95,21 @@ public object TrackBuilder {
         // smoother. Cluster boundaries and timeline nodes are anchors: segments and
         // arrows address the drawn path by source index, and a simplifier free to drop
         // those vertices would quietly empty a segment's polyline (EC-102a).
+        //
+        // Corners are anchors too, and for a reason distinct from the other two: they are
+        // shape rather than addressing. Douglas-Peucker's test is perpendicular distance
+        // in metres, which under-weights exactly the geometry a junction produces — a
+        // sharp turn between two short legs — so at any tolerance looser than the 2 m
+        // default the simplifier will delete the corner and keep a gentle kink halfway
+        // down a straight. Anchoring by angle is what stops that, without loosening the
+        // tolerance for the straights ([Simplify.cornerAnchors]).
         val anchors = buildSet {
             addAll(nodeIndices)
             clusters.forEach { cluster ->
                 add(cluster.fromIndex)
                 add(cluster.toIndex)
             }
+            addAll(Simplify.cornerAnchors(plotPath))
         }
         val simplified = Simplify.simplify(plotPath, options.simplifyEpsilonM, anchors)
 
@@ -115,6 +125,7 @@ public object TrackBuilder {
 
         val smoothed = when (options.smoothing) {
             Smoothing.SPLINE -> Spline.smooth(snapped, options.splineSpacingM)
+            Smoothing.HEADING_SPLINE -> HeadingSpline.smooth(snapped, options.splineSpacingM)
             Smoothing.BEZIER ->
                 BezierRounding.round(snapped, options.bezierMinAngleDeg, options.bezierCutbackM)
             Smoothing.NONE -> snapped
@@ -350,6 +361,28 @@ public object TrackBuilder {
         ),
         warnings = warnings,
     )
+
+    /**
+     * The heading [HeadingSpline] may use as a tangent at this vertex, or
+     * [PlotPoint.BEARING_UNSET].
+     *
+     * Two conditions, and the second is the one that is easy to miss. A chipset reports
+     * `hasBearing = false` when it has no heading, which is the obvious case. It also
+     * reports a heading for a phone sitting on a table, derived from a Doppler shift that
+     * is entirely multipath, and that heading swings through the full circle while the
+     * device goes nowhere. Handing those to a smoother as tangents would bend the line
+     * into a knot at every stop — which is precisely where [Consolidation] has already
+     * placed two vertices on the same centroid.
+     *
+     * So a heading counts only while the point was travelling, at the same walking-pace
+     * floor [Consolidation] uses to decide a point cannot belong to a dwell.
+     */
+    private fun plotBearingOf(point: TrackPoint): Float =
+        if (point.hasBearing && point.speedMps >= Consolidation.DEFAULT_MOVING_MPS) {
+            point.bearingDeg
+        } else {
+            PlotPoint.BEARING_UNSET
+        }
 
     private fun jsonPoints(points: List<TrackPoint>): List<TrackJsonPoint> =
         points.mapIndexed { index, point ->

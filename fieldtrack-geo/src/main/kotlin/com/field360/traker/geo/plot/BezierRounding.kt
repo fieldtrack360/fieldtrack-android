@@ -82,6 +82,10 @@ public object BezierRounding {
                     latitude = lat,
                     longitude = lng,
                     tag = RenderTag.ROUNDED_CURVE,
+                    // The corner's own recorded heading belongs to the vertex, not to the
+                    // curve drawn around it: these points sit metres away from where that
+                    // measurement was taken.
+                    bearingDeg = PlotPoint.BEARING_UNSET,
                 )
             }
         }

@@ -31,13 +31,46 @@ import kotlinx.coroutines.launch
  * the turn burst holds for 30 s rather than following each fix: the detector's hold
  * window is what keeps this from thrashing the location request through a bend.
  */
+/**
+ * Who is asking for the turn-burst cadence tier.
+ *
+ * The two see the same corner at different moments and hold it for different spans, which
+ * is the point of having both — see [LocationStreamController.setTurning].
+ */
+internal enum class TurnSource {
+    /** `fieldtrack-geo`'s `TurnDetector`, from the change in GNSS heading between fixes. */
+    GNSS_BEARING,
+
+    /** [com.field360.tracker.motion.GyroTurnMonitor], from yaw rate about the vertical. */
+    GYROSCOPE,
+}
+
+/**
+ * The half of [LocationStreamController] that [CaptureGate] drives.
+ *
+ * A seam rather than the class itself, so the outage state machine can be exercised
+ * without a `LocationSource`, a `FixIngestor` and a database behind it — the matrix of
+ * permission tiers against provider states is the part worth testing exhaustively, and it
+ * is pure given this interface.
+ */
+internal interface CaptureSwitch {
+    /** True while capture is blocked by a provider or permission outage. */
+    val isSuspended: Boolean
+
+    /** Tears the request down and refuses to rebuild it until [resumeCapture]. */
+    fun suspendCapture()
+
+    /** @return true if this call actually re-armed a suspended stream. */
+    fun resumeCapture(): Boolean
+}
+
 internal class LocationStreamController(
     private val locationSource: LocationSource,
     private val fixMapper: FixMapper,
     private val ingestor: FixIngestor,
     private val logger: TrackLogger,
     private val scope: CoroutineScope,
-) : CaptureStream {
+) : CaptureStream, CaptureSwitch {
 
     private var job: Job? = null
     private var config: TrackerConfig? = null
@@ -48,20 +81,90 @@ internal class LocationStreamController(
     @Volatile
     private var turning: Boolean = false
 
+    /** Which detectors currently want the burst. The tier follows their union. */
+    private val turnRequests = java.util.EnumSet.noneOf(TurnSource::class.java)
+
+    /**
+     * A hard block on registering the request at all, owned by [CaptureGate].
+     *
+     * Not merely "stopped": every cadence path here ends in [restart], and two of them —
+     * [onMoving] and [setVehicular] — are driven by `MotionController`, which knows
+     * nothing about permissions or the GPS switch. Without a latch, a motion transition
+     * arriving seconds after a revocation would re-register the request against a provider
+     * the app is no longer allowed to read, and the SDK would sit there holding a callback
+     * that can never fire (EC-06).
+     */
+    @Volatile
+    private var suspended: Boolean = false
+
     val isRunning: Boolean get() = job?.isActive == true
+
+    override val isSuspended: Boolean get() = suspended
 
     fun start(config: TrackerConfig, vehicular: Boolean = false) {
         this.config = config
         this.vehicular = vehicular
+        this.turnRequests.clear()
         this.turning = false
+        // A new session starts unblocked; `CaptureGate.arm` re-evaluates immediately after
+        // and re-latches if the device is still in an outage.
+        this.suspended = false
         restart()
     }
 
     /**
-     * Called by [FixIngestor] as `TurnDetector` arms and disarms. A no-op unless the
-     * cadence tier actually flips, same as [setVehicular] (EC-45).
+     * Tears the request down and refuses to rebuild it until [resumeCapture].
+     *
+     * Idempotent, and safe to call with no session open — the [config] guard in [restart]
+     * already covers that case.
      */
-    fun setTurning(turning: Boolean) {
+    override fun suspendCapture() {
+        if (suspended) return
+        suspended = true
+        sdkLog { logger.d(TAG, "Capture suspended") }
+        stop()
+    }
+
+    override fun resumeCapture(): Boolean {
+        if (!suspended) return false
+        suspended = false
+        if (config == null) return false
+        sdkLog { logger.d(TAG, "Capture resumed") }
+        restart()
+        return true
+    }
+
+    /**
+     * Records what [source] currently thinks and applies the union.
+     *
+     * Two independent detectors ask for the burst — `TurnDetector` from GNSS heading and
+     * [com.field360.tracker.motion.GyroTurnMonitor] from yaw rate — and they are *meant*
+     * to disagree, because they see a corner at different moments. The gyroscope arms as
+     * the wheel turns; GNSS confirms it a fix or two later and holds it through the rest
+     * of the bend. Feeding both into one boolean would have each clear the other's burst:
+     * the gyroscope's hold expires mid-corner, writes `false`, and the fast tier drops
+     * while `TurnDetector` still says the vehicle is turning.
+     *
+     * So the effective state is the union, and a source can only ever speak for itself.
+     */
+    @Synchronized
+    fun setTurning(source: TurnSource, turning: Boolean) {
+        if (turning) turnRequests += source else turnRequests -= source
+        applyTurning(turnRequests.isNotEmpty())
+    }
+
+    /**
+     * Drops every source's request at once — used where the vehicle demonstrably is not
+     * turning, whatever a detector last said.
+     */
+    @Synchronized
+    fun clearTurning() {
+        turnRequests.clear()
+        applyTurning(false)
+    }
+
+    /** A no-op unless the cadence tier actually flips, same as [setVehicular] (EC-45). */
+    private fun applyTurning(turning: Boolean) {
         val active = config ?: return
         if (this.turning == turning) return
 
@@ -113,6 +216,7 @@ internal class LocationStreamController(
     override fun onStationary() {
         val active = config ?: return
         if (active.geolocation.trackingMode == TrackingMode.MOTION_ONLY) {
+            turnRequests.clear()
             turning = false
             sdkLog { logger.d(TAG, "MOTION_ONLY: stopping stream while stationary") }
             stop()
@@ -123,12 +227,16 @@ internal class LocationStreamController(
         // on its own path, because `setVehicular` returns early when the vehicular tier
         // is already off — and a burst left running against a parked phone is the
         // battery complaint this feature would otherwise earn.
-        setTurning(false)
+        clearTurning()
         setVehicular(false)
     }
 
     override fun onMoving() {
         val active = config ?: return
+        // Checked before `start`, because `start` clears the latch — it is the entry point
+        // for a *new* session, and motion is not a new session. A move detected during an
+        // outage must not be able to unblock capture; only `CaptureGate` may.
+        if (suspended) return
         if (!isRunning) start(active, vehicular = false)
     }
 
@@ -141,11 +249,18 @@ internal class LocationStreamController(
         stop()
         config = null
         vehicular = false
+        turnRequests.clear()
         turning = false
+        // Cleared with the rest of the session state: a suspension belongs to the session
+        // that was interrupted, and carrying it into the next `start()` would leave the
+        // new one dead on arrival.
+        suspended = false
     }
 
     private fun restart() {
         val active = config ?: return
+        // The single choke point every cadence path funnels through — see [suspended].
+        if (suspended) return
         job?.cancel()
         job = scope.launch {
             // The tier is stamped per fix, at capture: this collector knows exactly

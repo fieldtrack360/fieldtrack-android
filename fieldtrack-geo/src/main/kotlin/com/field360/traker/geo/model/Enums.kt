@@ -75,6 +75,18 @@ public object Reasons {
      */
     public const val BEARING_CHANGE: String = "Bearing Change"
 
+    /**
+     * Stored on second thoughts: the heuristic gate dropped this fix, and the fix *after*
+     * it showed that a corner had turned across it (EC-45e).
+     *
+     * The only reason in this vocabulary a fix cannot earn on its own evidence.
+     * [BEARING_CHANGE] compares a fix against the last stored point and so can only see a
+     * turn that has already happened; the fix sitting *at* a corner's apex has turned only
+     * halfway and reads as unremarkable against everything before it. It takes the next
+     * fix to show the other half.
+     */
+    public const val CORNER_ANCHOR: String = "Corner Anchor"
+
     public const val ARRIVAL: String = "Arrival"
     public const val STATIONARY_RECOVERY: String = "Stationary Recovery"
     public const val BLACKOUT_ARRIVAL: String = "Blackout Arrival"

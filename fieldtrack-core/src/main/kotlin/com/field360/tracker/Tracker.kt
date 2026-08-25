@@ -58,6 +58,7 @@ import com.field360.tracker.motion.DeviceSensors
 import com.field360.tracker.motion.SensorProbe
 import com.field360.tracker.motion.StationaryFence
 import com.field360.tracker.permission.PermissionManager
+import com.field360.tracker.capture.CaptureGate
 import com.field360.tracker.permission.ProviderStateMonitor
 import com.field360.tracker.work.PruneWorker
 import kotlinx.coroutines.CoroutineScope
@@ -113,6 +114,7 @@ public class Tracker internal constructor(
     private val ingestor: FixIngestor,
     private val oneShotProvider: OneShotProvider,
     private val liveTrackFeed: LiveTrackFeed,
+    private val captureGate: CaptureGate,
     private val clock: Clock,
     private val providerStateMonitor: ProviderStateMonitor,
     private val batteryMonitor: BatteryMonitor,
@@ -266,6 +268,15 @@ public class Tracker internal constructor(
                         is TrackerEvent.ProviderChange ->
                             _state.update { it.copy(providerState = event.state) }
 
+                        // A suspension is not a stop: `isTracking` and the session id are
+                        // left alone on purpose, because the session is still open and the
+                        // host has not been asked to end it. Only `isCapturing` moves.
+                        is TrackerEvent.CaptureSuspended ->
+                            _state.update { it.copy(isCapturing = false) }
+
+                        TrackerEvent.CaptureResumed ->
+                            _state.update { it.copy(isCapturing = true) }
+
                         is TrackerEvent.MotionChange ->
                             _state.update { it.copy(motionState = event.state) }
 
@@ -275,7 +286,13 @@ public class Tracker internal constructor(
                         // that no longer exists.
                         is TrackerEvent.EnabledChange ->
                             if (!event.enabled) {
-                                _state.update { it.copy(isTracking = false, currentSessionId = null) }
+                                _state.update {
+                                    it.copy(
+                                        isTracking = false,
+                                        isCapturing = false,
+                                        currentSessionId = null,
+                                    )
+                                }
                             }
 
                         else -> Unit
@@ -542,7 +559,18 @@ public class Tracker internal constructor(
 
         return when (val result = startTracking(active, tag)) {
             is TrackerResult.Ok -> {
-                _state.update { it.copy(isTracking = true, currentSessionId = result.value.id) }
+                _state.update {
+                    it.copy(
+                        isTracking = true,
+                        // Read from the gate rather than assumed true: `startTracking`
+                        // arms it before returning, so a session opened while location was
+                        // switched off is already reported as suspended here instead of
+                        // claiming a capture that is not running.
+                        isCapturing = captureGate.isCapturing,
+                        currentSessionId = result.value.id,
+                        providerState = providerStateMonitor.state.value,
+                    )
+                }
                 result
             }
             is TrackerResult.Error -> result
@@ -551,8 +579,26 @@ public class Tracker internal constructor(
 
     public suspend fun stop(): TrackerResult<TrackSession?> {
         val result = stopTracking()
-        _state.update { it.copy(isTracking = false, currentSessionId = null) }
+        _state.update { it.copy(isTracking = false, isCapturing = false, currentSessionId = null) }
         return result
+    }
+
+    /**
+     * Re-reads the location subsystem now and publishes the result.
+     *
+     * [providerState] is broadcast-driven and normally needs no prompting, but a
+     * context-registered receiver dies with the process, so a `PROVIDERS_CHANGED` or an
+     * app-op change that lands while the app is not running is never delivered. Call this
+     * from `onResume` if a screen's decisions depend on the GPS switch — the SDK already
+     * does it on every [start] and [getCurrentLocation].
+     *
+     * Cheap and safe from anywhere; a real change emits [TrackerEvent.ProviderChange] and,
+     * where one applies, [TrackerEvent.PermissionChange] or
+     * [TrackerEvent.LocationServicesChange].
+     */
+    public fun refreshProviderState(): ProviderState {
+        providerStateMonitor.refresh()
+        return providerStateMonitor.state.value
     }
 
     /**

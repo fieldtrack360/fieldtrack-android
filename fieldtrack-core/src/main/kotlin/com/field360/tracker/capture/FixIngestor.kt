@@ -7,13 +7,16 @@ import com.field360.tracker.domain.model.TrackSession
 import com.field360.traker.geo.filter.AcceptancePipeline
 import com.field360.traker.geo.filter.ClockGuard
 import com.field360.traker.geo.filter.TrackerConstants
+import com.field360.traker.geo.model.Deferred
 import com.field360.traker.geo.model.FilterState
 import com.field360.traker.geo.model.IngestContext
 import com.field360.traker.geo.model.MockPolicy
+import com.field360.traker.geo.model.PipelineResult
 import com.field360.traker.geo.model.ProviderSnapshot
 import com.field360.traker.geo.model.Reasons
 import com.field360.traker.geo.model.TrackFix
 import com.field360.traker.geo.model.TrackPoint
+import com.field360.traker.geo.motion.CornerWindow
 import com.field360.traker.geo.motion.TurnDetector
 import com.field360.traker.geo.port.Clock
 import com.field360.tracker.integrity.internal.IntegrityFeed
@@ -99,6 +102,31 @@ internal class FixIngestor(
     private var turnState = TurnDetector.State()
     private var bursting = false
 
+    /**
+     * A heuristic-gate rejection whose fate the *next* fix decides (EC-45e).
+     *
+     * At most one, and only ever the immediately preceding fix — see [CornerWindow] for
+     * why an older one can never be a corner's apex. While one is held, `state`, `past`,
+     * the decision log and the live track all still describe the world as of the fix
+     * before it: nothing is written for a fix under consideration, because the two
+     * outcomes disagree about the filter state and writing either would commit to it.
+     */
+    private var heldAnchor: HeldAnchor? = null
+
+    /**
+     * @property rejected what the pipeline actually returned. Committed verbatim when the
+     *   next fix shows no corner, so a drive with no turns is byte-identical to one
+     *   recorded before this stage existed.
+     * @property context the context the fix was *judged under* — kept because
+     *   [RoomPointStore.recordRawPoint] writes the odometer and calendar from it, and both stop
+     *   being true the moment `past` advances.
+     */
+    private data class HeldAnchor(
+        val rejected: PipelineResult,
+        val deferred: Deferred,
+        val context: IngestContext,
+    )
+
     var mockPolicy: MockPolicy = MockPolicy.FLAG
     var persistRawFixes: Boolean = false
     var rawRingCapacity: Int = 5_000
@@ -108,6 +136,24 @@ internal class FixIngestor(
 
     /** `MotionConfig.bearingChangeCaptureDeg`; `0` disables turn capture (EC-45). */
     var bearingChangeCaptureDeg: Int = IngestContext.DEFAULT_BEARING_CHANGE_CAPTURE_DEG
+
+    /** `MotionConfig.cornerAnchorCapture`; `false` restores pre-EC-45e behaviour exactly. */
+    var cornerAnchorCapture: Boolean = true
+
+    /**
+     * Whether the gyroscope currently says the vehicle is turning, pushed by
+     * [com.field360.tracker.motion.GyroTurnMonitor] (EC-45d).
+     *
+     * A pushed flag rather than a read of the monitor, so this class keeps depending on
+     * nothing in the motion layer, and `false` on a device with no gyroscope leaves the
+     * corner window on its geometric test alone.
+     *
+     * `@Volatile` because it is written from the sensor's thread and read on the ingest
+     * coroutine. A stale read costs one fix's worth of hint on a decision that has a
+     * geometric fallback, so the two do not need to be ordered against each other.
+     */
+    @Volatile
+    var gyroTurning: Boolean = false
 
     /**
      * Set by the motion layer. A callback rather than a direct dependency so the
@@ -125,6 +171,19 @@ internal class FixIngestor(
      * would be a cycle.
      */
     var onTurnBurst: ((Boolean) -> Unit)? = null
+
+    /**
+     * Every raw fix's observed speed, m/s — `TurnDetector`'s reconciliation of Doppler
+     * against displacement, before the pipeline has judged anything.
+     *
+     * Fires on **every** fix, unlike [onTurnBurst], because its consumer
+     * ([com.field360.tracker.motion.GyroTurnMonitor]) is deciding whether a gyroscope
+     * should be registered at all, and a device that stops producing qualifying speeds is
+     * exactly the case it must notice. Raw rather than accepted for the same reason turn
+     * detection is: a junction can produce a run of rejects, and closing the sensor there
+     * would close it in the one place it earns its power budget.
+     */
+    var onObservedSpeed: ((Float) -> Unit)? = null
 
     /**
      * True while a consumer is live, i.e. points are actively being written.
@@ -190,6 +249,9 @@ internal class FixIngestor(
         // would otherwise inherit it and read the first straight as a turn.
         turnState = turnDetector.reset()
         bursting = false
+        // A hold belongs to the session it was taken in. Carrying one across would judge
+        // it against a `past` from a different drive (EC-45e).
+        heldAnchor = null
         // Seeded before the consumer launches, so the engine exists before the first
         // fix and is only ever touched from the single consumer afterwards.
         liveTrack.start(session.id)
@@ -245,6 +307,11 @@ internal class FixIngestor(
             // timeline that no longer exists. Start over rather than feed it a huge
             // negative delta.
             ClockGuard.Step.REBOOT -> {
+                // Dropped, not resolved. The held fix and this one sit on two different
+                // monotonic timelines, so the geometry between them is meaningless and the
+                // filter state it carries describes a timeline that no longer exists. It
+                // reverts to the rejection the gate already gave it.
+                heldAnchor = null
                 state = FilterState()
                 // The stored anchor is DROPPED, not reloaded (EC-92c). Its
                 // `elapsedRealtimeNanos` was written on a clock that no longer exists, so
@@ -279,8 +346,33 @@ internal class FixIngestor(
         // burst exists to take are the ones that decide whether to take them (EC-45).
         updateTurnBurst(fix)
 
+        // Settle the previous fix before judging this one. Order is the whole safety
+        // argument: the held fix's two possible filter states diverge from the moment it
+        // was judged, so the choice between them has to be made before anything is
+        // measured against either (EC-45e).
+        resolveHeldAnchor(fix)
+
         val context = contextFor(active, queued.cadenceTierMs, integrity)
         val result = pipeline.accept(fix, past, state, context)
+
+        val deferred = result.deferred
+        if (deferred != null) {
+            heldAnchor = HeldAnchor(rejected = result, deferred = deferred, context = context)
+            return
+        }
+        commit(result, context)
+    }
+
+    /**
+     * Commits one pipeline outcome: filter state, decision log, raw-point row, live track,
+     * and — on an accept — the stored point and the events that announce it.
+     *
+     * Extracted so the deferred branch commits through exactly the same path as an
+     * ordinary accept. A second, parallel write path is how the two would drift apart, and
+     * the contract this stage rests on is that adopting the deferred branch is
+     * indistinguishable from the gate having accepted the fix outright.
+     */
+    private suspend fun commit(result: PipelineResult, context: IngestContext) {
         state = result.state
 
         store.saveFilterState(state)
@@ -305,9 +397,58 @@ internal class FixIngestor(
         }
     }
 
+    /**
+     * Decides the held fix's fate now that [next] exists, and commits one outcome or the
+     * other (EC-45e).
+     *
+     * [next] is used as evidence only — it is not judged here, and it is judged normally
+     * by the caller immediately afterwards against whatever `past` this leaves behind.
+     *
+     * A session that stops with a fix still held simply drops it, which is the rejection
+     * the heuristic gate had already given it. The only thing lost is that fix's row in
+     * the decision log, at most once per session, for a fix that stored nothing.
+     */
+    private suspend fun resolveHeldAnchor(next: TrackFix) {
+        val held = heldAnchor ?: return
+        heldAnchor = null
+
+        val anchor = past?.let { previous ->
+            CornerWindow.isCornerAnchor(
+                past = previous,
+                held = held.deferred.point,
+                current = next,
+                // Either detector saying so is enough: both measure the turn itself —
+                // one from heading between fixes, one from yaw rate — rather than
+                // inferring it from three positions the way the geometric test must.
+                turnActive = bursting || gyroTurning,
+                minTurnDeg = bearingChangeCaptureDeg,
+                c = constants,
+            )
+        } ?: false
+
+        if (anchor) {
+            commit(
+                PipelineResult(
+                    decision = held.deferred.decision,
+                    state = held.deferred.state,
+                    point = held.deferred.point,
+                ),
+                held.context,
+            )
+        } else {
+            commit(held.rejected, held.context)
+        }
+    }
+
     private fun updateTurnBurst(fix: TrackFix) {
         val result = turnDetector.onFix(turnState, fix)
         turnState = result.state
+
+        // Unconditional, and ahead of the change guard below: the gyroscope's registration
+        // window is refreshed by speed, not by a turn, and a drive down a straight road
+        // produces no turn events at all.
+        onObservedSpeed?.invoke(result.speedMps)
+
         if (result.isBursting == bursting) return
 
         bursting = result.isBursting
@@ -333,6 +474,7 @@ internal class FixIngestor(
             odometerMeters = past?.odometerMeters ?: odometerBaseMeters,
             stepsSinceLastPoint = stepsSinceLastPoint?.invoke(),
             bearingChangeCaptureDeg = bearingChangeCaptureDeg,
+            cornerAnchorCapture = cornerAnchorCapture,
             cadenceTierMs = cadenceTierMs,
             batteryPct = power.percent,
             isCharging = power.isCharging,

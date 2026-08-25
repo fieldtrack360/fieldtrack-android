@@ -220,6 +220,25 @@ public enum class Smoothing {
 
     /** Centripetal Catmull-Rom through every vertex, resampled (EC-45b). */
     SPLINE,
+
+    /**
+     * As [SPLINE], but each vertex's *recorded heading* is the curve's tangent there
+     * rather than a direction inferred from its neighbours.
+     *
+     * The difference only shows at corners, and there it is the whole thing. Catmull-Rom
+     * builds the tangent at a vertex from the vertices either side of it; through a turn
+     * those two sit on opposite legs, so the inferred tangent is the chord across the
+     * corner and the curve leaves the vertex pointing somewhere the vehicle never
+     * pointed. A GNSS bearing is the Doppler heading at that instant, so using it puts
+     * the curve on the vehicle's actual heading in and out of every fix — and the corner
+     * appears *between* two fixes without either of them having recorded its apex.
+     *
+     * Falls back to the Catmull-Rom tangent *direction* wherever no bearing was recorded,
+     * so a track from a chipset that reports no heading draws the shape [SPLINE] draws —
+     * close to it, not identical, since the tangent magnitudes are scaled per span rather
+     * than by a centripetal parameterisation.
+     */
+    HEADING_SPLINE,
     ;
 
     public companion object {
@@ -248,4 +267,22 @@ public data class PlotPoint(
     val tag: RenderTag = RenderTag.RAW,
     /** Session bookends and host markers are never moved by rounding (EC-103). */
     val isProtected: Boolean = false,
-)
+    /**
+     * Recorded heading at this vertex, degrees clockwise from north, or [BEARING_UNSET].
+     *
+     * Carried through the plotting stages for [Smoothing.HEADING_SPLINE], which uses it
+     * as the curve's tangent. Set only on vertices that came from a fix whose chipset
+     * reported a bearing: a heading derived from the displacement between two plotted
+     * vertices is the chord direction, which is what the smoother is trying to improve
+     * on, so inventing one here would quietly turn the stage back into Catmull-Rom while
+     * claiming otherwise. Interpolated vertices leave it unset for the same reason.
+     */
+    val bearingDeg: Float = BEARING_UNSET,
+) {
+    public val hasBearing: Boolean get() = bearingDeg >= 0f
+
+    public companion object {
+        /** No heading recorded. Negative, so it cannot collide with `[0, 360)`. */
+        public const val BEARING_UNSET: Float = -1f
+    }
+}

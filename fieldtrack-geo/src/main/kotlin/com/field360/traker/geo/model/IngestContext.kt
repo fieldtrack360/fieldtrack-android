@@ -42,6 +42,18 @@ public data class IngestContext(
      */
     val bearingChangeCaptureDeg: Int = DEFAULT_BEARING_CHANGE_CAPTURE_DEG,
     /**
+     * Offer a [PipelineResult.deferred] alongside a heuristic-gate rejection, so the
+     * caller can restore the fix once the next one shows a corner turned across it
+     * (EC-45e).
+     *
+     * Host config (`MotionConfig.cornerAnchorCapture`) for the same reason
+     * [bearingChangeCaptureDeg] is: it changes how many points a drive stores, which is
+     * the host's budget to spend. It costs one extra pass through the filter's final
+     * stage per rejected fix — arithmetic, no I/O — and nothing at all when off, because
+     * the pipeline does not compute the branch it was not asked for.
+     */
+    val cornerAnchorCapture: Boolean = true,
+    /**
      * The request interval of the stream that captured this fix, in ms — `null` when
      * the fix did not come from the stream (one-shot, backstop, host insert). Stamped
      * at capture time by the stream's own collector, never sampled later: a fix keeps
@@ -79,7 +91,29 @@ public data class IngestContext(
     val providerFlags: Int = ProviderSnapshot.NOT_RECORDED,
 ) {
     public companion object {
-        /** Matches `MotionConfig.bearingChangeCaptureDeg`; a normal road junction is ~90°. */
-        public const val DEFAULT_BEARING_CHANGE_CAPTURE_DEG: Int = 40
+        /**
+         * Matches `MotionConfig.bearingChangeCaptureDeg`.
+         *
+         * A road junction turns through ~90°, and for a long time this sat at 40° on the
+         * reasoning that anything smaller was noise. That reasoning was measuring the
+         * wrong thing. The comparison is against the heading at the last *stored* point,
+         * not the last fix, so on a motorway slip road or a long bend the vehicle can
+         * turn through 35° between stored points, over and over, and never once cross the
+         * threshold — the track keeps the straight legs and drops every curve between
+         * them. Bearing-change capture exists to put a vertex where the path bends, and
+         * 40° declined to do that for the whole class of bends that are not junctions.
+         *
+         * 30° instead, which is below a motorway interchange and above what the engine's
+         * own floors can produce as noise: the comparison already requires 15 m of
+         * displacement, 1.5 m/s of speed and an accuracy circle under 50 m
+         * ([com.field360.traker.geo.filter.TrackerConstants.bearingCaptureMinDist] and
+         * neighbours), and a heading derived under those conditions does not wander 30°
+         * while travelling in a straight line.
+         *
+         * The cost is vertices, and it is bounded: a fix can only be force-stored once it
+         * has moved 15 m, so the worst case is a tighter spiral storing more of a corner
+         * that a host asked to see. Set `0` to disable the stage entirely.
+         */
+        public const val DEFAULT_BEARING_CHANGE_CAPTURE_DEG: Int = 30
     }
 }

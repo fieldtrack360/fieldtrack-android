@@ -188,6 +188,67 @@ public sealed interface TrackerEvent {
     public data class PowerSaveChange(val enabled: Boolean) : TrackerEvent
 
     /**
+     * The location permission grant changed while the SDK was running — a revoke, a
+     * re-grant, a downgrade from "Allow all the time" to "While using the app", or a
+     * precise/approximate flip.
+     *
+     * Emitted for **every** transition in either direction, including the recoveries.
+     * [ProviderChange] carries the same facts inside a whole-state snapshot, which makes
+     * a host wanting to react to *the permission specifically* diff two snapshots to find
+     * out what moved. This says it directly, which is what a re-prompt decision needs.
+     *
+     * A revoke does not close the session. It suspends capture and arrives here plus as
+     * an [Error]; the session stays open and capture resumes on its own once the grant
+     * comes back — see [CaptureSuspended] (EC-06, EC-07).
+     *
+     * @property previous the tier before this change.
+     * @property current the tier now in force.
+     * @property accuracy the granularity now in force. Orthogonal to the tier: a grant can
+     *   stay `FULL` and still drop to [LocationAccuracy.APPROXIMATE].
+     */
+    public data class PermissionChange(
+        val previous: PermissionTier,
+        val current: PermissionTier,
+        val accuracy: LocationAccuracy,
+    ) : TrackerEvent
+
+    /**
+     * The device location master switch, or the selected provider behind it, was toggled.
+     *
+     * Both directions, unlike the one-way `LOCATION_DISABLED` error that preceded it: "GPS
+     * came back" is the transition a host waiting to re-enable a UI actually needs, and it
+     * was previously unobservable except by diffing [ProviderChange] snapshots.
+     */
+    public data class LocationServicesChange(
+        val enabled: Boolean,
+        val state: ProviderState,
+    ) : TrackerEvent
+
+    /**
+     * Capture stopped feeding the pipeline, but the session is still open.
+     *
+     * Raised when the SDK can no longer produce fixes through no fault of the host's:
+     * location permission revoked mid-session ([ErrorCode.PERMISSION_DENIED]) or every
+     * provider switched off ([ErrorCode.LOCATION_DISABLED]). The location request is torn
+     * down rather than left registered against a dead provider, and re-armed by
+     * [CaptureResumed] the moment the condition clears.
+     *
+     * Deliberately **not** a stop: whether a permission toggle should end a session is the
+     * host's decision, never a side effect inside the SDK (EC-07).
+     */
+    public data class CaptureSuspended(
+        val reason: ErrorCode,
+        val message: String,
+    ) : TrackerEvent
+
+    /**
+     * Capture re-armed after a [CaptureSuspended], in the same session and against the
+     * same session id. A one-shot fix is requested immediately so the gap has a boundary
+     * on both sides rather than waiting out a full interval.
+     */
+    public data object CaptureResumed : TrackerEvent
+
+    /**
      * Charge level or power source changed.
      *
      * Emitted on transitions, not on a timer: plug, unplug, low, okay, and whatever drift
@@ -275,6 +336,18 @@ public enum class GeofenceTransition { ENTER, EXIT }
 public data class TrackerState(
     val isReady: Boolean = false,
     val isTracking: Boolean = false,
+    /**
+     * Whether the location stream is actually registered right now.
+     *
+     * Not the same question as [isTracking], and the difference is the whole point: a
+     * session with a revoked permission or a switched-off GPS stays open and keeps
+     * `isTracking = true`, because ending it is the host's call — but nothing is being
+     * captured. Before this field the two states were indistinguishable from outside, so
+     * a host UI reported "tracking" through an outage it could have prompted the user to
+     * fix. `false` while `isTracking` is `true` means suspended; see
+     * [TrackerEvent.CaptureSuspended].
+     */
+    val isCapturing: Boolean = false,
     val motionState: MotionState = MotionState.STOPPED,
     val providerState: ProviderState = ProviderState(),
     val currentSessionId: String? = null,

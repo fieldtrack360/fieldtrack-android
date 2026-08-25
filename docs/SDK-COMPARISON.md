@@ -29,7 +29,7 @@ They solve **capture**: get location in the background, cheaply, without the OS 
 | `reset` flag on `ready()` | ✅ | ✅ | §5 — **our default matches theirs (`true`)** |
 | `setConfig()` at runtime | ✅ | ✅ | Applied atomically, provider restart debounced (EC-122) |
 | `reset()` to factory defaults | ✅ | ✅ | |
-| `start()` / `stop()` | ✅ | ✅ | Idempotent (EC-72, EC-74) |
+| `start()` / `stop()` | ✅ | ✅ | `start()` always opens a NEW session and stops any previous service first — one session at a time. `stop()` is safe to repeat and sweeps a stale service (EC-72, EC-74) |
 | `changePace(moving)` | ✅ | ✅ | |
 | `getState()` | ✅ | 🔁 | `StateFlow<TrackerState>` — reactive, not a one-shot getter |
 | Scheduling (`schedule`, `startSchedule`) | ✅ | ⛔ | Host owns scheduling; `WorkManager` in the app is a one-liner |
@@ -48,7 +48,9 @@ They solve **capture**: get location in the background, cheaply, without the OS 
 | Current location snapshot | `getCurrentPosition()` | `getCurrentLocation()` | Android returns a raw `TrackFix` snapshot without persisting it |
 | `watchPosition()` | ✅ | 🔁 | `observePoints()` as a `Flow` |
 | Adaptive cadence at speed | ⛔ | ⭐ | 12 s while vehicular — the biggest turn-fidelity win available without a routing API |
-| Bearing-change force capture | ⛔ | ⭐ | A fix whose heading turned > 40° since the last **stored** point is stored whatever the speed and distance gates decided; at a corner the geometry lives entirely in that angle |
+| Predictive turn burst (gyroscope) | ⛔ | ⭐ | Yaw rate about the world vertical arms the fast sampling tier as the wheel turns — before GNSS heading has moved. Every other SDK's turn handling, this one's included until now, can only react to a corner already taken |
+| Deferred corner anchors | ⛔ | ⭐ | A fix the heuristic gate dropped is held for one fix and restored when the next one shows a corner turned across it — the apex vertex no backward-looking gate can recognise at the time |
+| Bearing-change force capture | ⛔ | ⭐ | A fix whose heading turned > 30° since the last **stored** point is stored whatever the speed and distance gates decided; at a corner the geometry lives entirely in that angle |
 | Turn-burst cadence tier | ⛔ | ⭐ | 4 s while measurably turning (≥ 3 °/s), 30 s hold. Adaptive cadence is a guess about the whole drive; this spends battery only where the geometry is |
 | Nine-gate acceptance pipeline | ⛔ | ⭐ | Burst · NLP · phantom-Doppler · sanity · recovery · sigma · persistence · heartbeat · mock |
 | Per-fix decision log with reason strings | ⛔ | ⭐ | Queryable table, not a log file |
@@ -179,7 +181,7 @@ data class MotionConfig(
     val stationaryRadiusM: Float = 150f,
     val heartbeatIntervalSec: Int = 900,                   // DATA-plane
     val persistHeartbeat: Boolean = false,
-    val bearingChangeCaptureDeg: Int = 40,
+    val bearingChangeCaptureDeg: Int = 30,
     val useSignificantMotion: Boolean = true,              // §6
     val useStepCorroboration: Boolean = true,              // §6
 )

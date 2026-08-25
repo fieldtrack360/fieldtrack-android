@@ -519,13 +519,14 @@ Builder: `.trackingMode()`, `.provider()`, `.desiredAccuracy()`, `.accuracy()`,
 | `motionTriggerDelayMs` | `Long` | `0` | Delay before acting on a motion trigger |
 | `heartbeatIntervalSec` | `Int` | `900` | **Data-plane** heartbeat: warms the filter, stores nothing. This is what makes a two-hour steady user produce exactly one point. Must be ≥ 5 × the sampling interval |
 | `persistHeartbeat` | `Boolean` | `false` | Also store the heartbeat point |
-| `bearingChangeCaptureDeg` | `Int` | `40` | Store a point whenever heading turned this far since the last stored one, regardless of speed/distance gates. `0` disables. 40° sits below a junction (~90°) and above lane-change/GPS heading noise |
+| `bearingChangeCaptureDeg` | `Int` | `30` | Store a point whenever heading turned this far since the last stored one, regardless of speed/distance gates. `0` disables. 30° sits below a motorway interchange and above lane-change/GPS heading noise. It was `40`, which is a junction threshold rather than a bend threshold — a long curve turning 35° between stored points never crossed it, so the track kept the straight legs and dropped the curve |
+| `cornerAnchorCapture` | `Boolean` | `true` | Restore a rejected fix once the *next* fix shows a corner turned across it. Bearing-change capture compares against the last **stored** point, so at a corner's apex only half the turn is behind you and the apex is dropped; this holds the rejection for one fix and keeps it if the path bent across it (`Reasons.CORNER_ANCHOR`). Only the heuristic gate's rejections are reconsidered — never impossible speed, poor accuracy or the sigma gate. One fix of latency, and only for fixes that were being discarded |
 
 Builder: `.activityRecognition()`, `.activityRecognitionIntervalMs()`, `.activityConfidenceMin()`,
 `.snapshotConfidenceMin()`, `.disableStopDetection()`, `.stopOnStationary()`, `.stopTimeoutMin()`,
 `.stationaryRadiusM()`, `.stationaryGeofenceId()`, `.stationaryGeofenceOnEnterEvent()`,
 `.stationaryGeofenceOnExitEvent()`, `.motionTriggerDelayMs()`, `.heartbeatIntervalSec()`,
-`.persistHeartbeat()`, `.bearingChangeCaptureDeg()`.
+`.persistHeartbeat()`, `.bearingChangeCaptureDeg()`, `.cornerAnchorCapture()`.
 
 ### 5.4 `SensorConfig`
 
@@ -536,8 +537,10 @@ Builder: `.activityRecognition()`, `.activityRecognitionIntervalMs()`, `.activit
 | `useAccelerometerVeto` | `Boolean` | `true` | Reject "movement" with no accelerometer support |
 | `useBarometer` | `Boolean` | `false` | Use pressure sensor when present |
 | `stepBatchLatencyMs` | `Long` | `60_000` | Step-counter batching latency |
+| `useGyroTurnPrediction` | `Boolean` | `true` | Arm the turn burst from gyroscope yaw rate, ahead of GNSS heading. Needs no permission. The gyroscope is opened only while fixes report vehicular speed and released within a minute of them stopping, so a walking or parked session never touches it. No-op when `geolocation.turnBurst` is off or the device has no gyroscope |
 
 Builder: `.useSignificantMotion()`, `.useStepCorroboration()`, `.useAccelerometerVeto()`,
+`.useGyroTurnPrediction()`,
 `.useBarometer()`, `.stepBatchLatencyMs()`.
 
 ### 5.5 `ServiceConfig`
@@ -756,6 +759,10 @@ lifecycleScope.launch {
 | `ActivityChange` | `activity: ActivityType`, `confidence: Int` | Activity recognition transition |
 | `EnabledChange` | `enabled: Boolean` | Location services toggled |
 | `ProviderChange` | `state: ProviderState` | GPS toggle, permission change, granularity change, battery saver |
+| `PermissionChange` | `previous: PermissionTier`, `current: PermissionTier`, `accuracy: LocationAccuracy` | The location grant moved, in either direction — revoke, re-grant, all-the-time→while-using, precise→approximate |
+| `LocationServicesChange` | `enabled: Boolean`, `state: ProviderState` | The GPS/location master switch was toggled. Both directions, including the recovery |
+| `CaptureSuspended` | `reason: ErrorCode`, `message: String` | Capture stopped but the session is **still open**: permission revoked, or every provider off |
+| `CaptureResumed` | — | Capture re-armed in the same session after a `CaptureSuspended` |
 | `Heartbeat` | `atMs: Long` | **Control-plane** liveness tick (distinct from the data-plane heartbeat) |
 | `PowerSaveChange` | `enabled: Boolean` | Battery saver on/off |
 | `BatteryChange` | `battery: BatteryInfo` | Plug, unplug, low, okay — and drift the capture path notices |
@@ -1008,7 +1015,7 @@ val track = tracker.buildTrack(
 | `consolidateStops` | `Boolean` | `true` | Collapse dwell clusters into stop nodes |
 | `stopRadiusM` | `Double` | `60.0` | Cluster radius for a stop |
 | `stopMinDwellSec` | `Long` | `600` | Minimum dwell to count as a stop |
-| `smoothing` | `Smoothing` | `SPLINE` | `NONE`, `BEZIER`, `SPLINE` |
+| `smoothing` | `Smoothing` | `SPLINE` | `NONE`, `BEZIER`, `SPLINE`, `HEADING_SPLINE` |
 | `splineSpacingM` | `Double` | `5.0` | Resample spacing for `SPLINE` |
 | `bezierMinAngleDeg` | `Double` | `30.0` | Only rounds vertices sharper than this (BEZIER) |
 | `bezierCutbackM` | `Double` | `25.0` | Corner cutback distance (BEZIER) |
@@ -1026,6 +1033,7 @@ val track = tracker.buildTrack(
 | `NONE` | Chords between stored vertices, exactly as captured |
 | `BEZIER` | Round vertices sharper than `bezierMinAngleDeg`; every leg stays a chord |
 | `SPLINE` | Centripetal Catmull-Rom through every vertex, resampled. **Default** — a 120 m leg becomes a curve, not a chord |
+| `HEADING_SPLINE` | As `SPLINE`, but each vertex's recorded GNSS heading is the curve's tangent there instead of a direction inferred from its neighbours. Turns are the only place it differs, and there it is the difference between drawing the corner and cutting it. Falls back per vertex to the `SPLINE` tangent where no heading was recorded |
 
 ### 9.2 `Track` — the output
 
@@ -1873,6 +1881,7 @@ These exact strings appear on `TrackPoint.acceptReason`, `RawPoint.reason` and
 | `MOVING_WALKING` | `Moving/Walking` |
 | `INDOOR_ARRIVAL` | `Indoor Arrival` |
 | `BEARING_CHANGE` | `Bearing Change` |
+| `CORNER_ANCHOR` | `Corner Anchor` |
 | `ARRIVAL` | `Arrival` |
 | `STATIONARY_RECOVERY` | `Stationary Recovery` |
 | `BLACKOUT_ARRIVAL` | `Blackout Arrival` |
@@ -2122,7 +2131,7 @@ fire and the runtime waiver already applies.
 | Config changes do nothing | `reset = false` with a persisted config | Set `reset = true` (the default) during development |
 | Very few points while stationary | Working as designed — the data-plane heartbeat warms the filter without storing | Set `persistHeartbeat = true` if you want them stored |
 | Zigzag / drift while stationary | Accuracy ceiling too loose | `AccuracyProfile.STRICT`, or a `CUSTOM` ceiling |
-| Corners drawn as straight chords | Turn fidelity settings off | Keep `turnBurst = true`, `bearingChangeCaptureDeg = 40`, `smoothing = SPLINE` |
+| Corners drawn as straight chords | Turn fidelity settings off | Keep `turnBurst = true`, `useGyroTurnPrediction = true`, `cornerAnchorCapture = true`, `bearingChangeCaptureDeg = 30`; use `smoothing = HEADING_SPLINE` where the fixes carry a GNSS bearing |
 | Navigation "randomly stops" | 1 Hz stream with no foreground service | `navigationMode` requires `service.foregroundService` — `validate()` enforces it |
 | Tracking ends when the user swipes the app away | `stopOnTerminate = true` | Leave it `false` (the default) |
 | Uploads retry forever | `http://` URL blocked by Android's default network security policy | Use `https://`, or `allowCleartext = true` for a local dev server |

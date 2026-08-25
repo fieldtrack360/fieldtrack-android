@@ -358,6 +358,9 @@ public data class TrackerConfig(
         public fun bearingChangeCaptureDeg(value: Int): Builder =
             apply { motion = motion.copy(bearingChangeCaptureDeg = value) }
 
+        public fun cornerAnchorCapture(value: Boolean): Builder =
+            apply { motion = motion.copy(cornerAnchorCapture = value) }
+
         // ── sensors ──────────────────────────────────────────────────────────
 
         public fun useSignificantMotion(value: Boolean): Builder =
@@ -374,6 +377,9 @@ public data class TrackerConfig(
 
         public fun stepBatchLatencyMs(value: Long): Builder =
             apply { sensors = sensors.copy(stepBatchLatencyMs = value) }
+
+        public fun useGyroTurnPrediction(value: Boolean): Builder =
+            apply { sensors = sensors.copy(useGyroTurnPrediction = value) }
 
         // ── service ──────────────────────────────────────────────────────────
 
@@ -596,9 +602,40 @@ public data class MotionConfig(
      * draws the chord across the corner. Comparing headings is what makes the *angle*
      * itself a reason to keep a point (EC-45).
      *
-     * 40° is below a road junction (~90°) and above lane-change and GPS heading noise.
+     * 30° is below a motorway interchange and above lane-change and GPS heading noise.
+     * It was 40°, which is a junction threshold rather than a bend threshold: because the
+     * comparison runs against the last *stored* heading, a long curve turning 35° between
+     * stored points never crossed it and the drawn line kept only the straight legs
+     * either side. The engine's own floors — 15 m moved, 1.5 m/s, accuracy under 50 m —
+     * are what keep the lower value from firing on noise.
      */
-    val bearingChangeCaptureDeg: Int = 40,
+    val bearingChangeCaptureDeg: Int = 30,
+    /**
+     * Restore a rejected fix once the *next* fix shows a corner turned across it (EC-45e).
+     *
+     * The half [bearingChangeCaptureDeg] structurally cannot reach. That gate compares a
+     * fix against the last **stored** point, so it looks backwards — and at a corner's
+     * apex only half the turn is behind you. A 90° junction sampled on approach, at the
+     * apex and on the exit offers the apex fix as a 45° change, under any threshold set to
+     * recognise a junction; it is dropped, the exit fix is stored on the full 90°, and the
+     * line runs straight from approach to exit. The vertex that would have described the
+     * corner was discarded one fix earlier.
+     *
+     * So the rejection is held for one fix. If the path bent across it — by geometry, or
+     * because the gyroscope or `TurnDetector` says the vehicle was turning — the fix is
+     * stored after all, as `Reasons.CORNER_ANCHOR`.
+     *
+     * **Only the heuristic gate's rejections are ever reconsidered.** Every harder gate —
+     * impossible speed, poor accuracy, the three-sigma outlier test — is untouched: a
+     * corner is a reason to keep an unremarkable fix, never a reason to admit a bad one.
+     *
+     * The latency is one fix, and only for fixes that were being discarded. Accepted
+     * points still reach `TrackerEvent.Location`, the live tail and the puck the instant
+     * the pipeline accepts them.
+     *
+     * Set `false` for the pre-EC-45e behaviour exactly.
+     */
+    val cornerAnchorCapture: Boolean = true,
 )
 
 @Serializable
@@ -610,6 +647,25 @@ public data class SensorConfig(
     val useAccelerometerVeto: Boolean = true,
     val useBarometer: Boolean = false,
     val stepBatchLatencyMs: Long = 60_000,
+    /**
+     * Arm the turn burst from the **gyroscope**, ahead of GNSS heading (EC-45d).
+     *
+     * `TurnDetector` can only see a turn in the difference between two fixes, so at a 12 s
+     * cadence it learns about a corner at best 12 s after it began — by which time the
+     * corner is behind the vehicle and the extra samples land on the straight after it.
+     * Yaw rate rises as the wheel turns, a second or more before heading has moved enough
+     * for GNSS to resolve it, so the burst runs *into* the corner instead of out of it.
+     *
+     * On by default, and cheaper than it sounds: the gyroscope is registered only while
+     * fixes report vehicular speed and released within a minute of them stopping, so a
+     * session spent walking or parked never opens it. Set `false` for GNSS-only turn
+     * detection — the behaviour of every release before this one — on a fleet where the
+     * power budget is tight enough to prefer the corners over the milliamps.
+     *
+     * A no-op when `geolocation.turnBurst` is off, and on a device with no gyroscope or no
+     * gravity source.
+     */
+    val useGyroTurnPrediction: Boolean = true,
 )
 
 /**

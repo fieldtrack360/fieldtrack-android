@@ -5,6 +5,7 @@ import androidx.annotation.VisibleForTesting
 import android.content.Context
 import com.field360.tracker.Tracker
 import com.field360.tracker.TrackerConfig
+import com.field360.tracker.capture.CaptureGate
 import com.field360.tracker.capture.FixIngestor
 import com.field360.tracker.capture.LiveTrackFeed
 import com.field360.tracker.capture.LocationStreamController
@@ -41,6 +42,7 @@ import com.field360.tracker.domain.repository.PendingUploadStore
 import com.field360.tracker.domain.repository.SessionRepository
 import com.field360.tracker.domain.repository.TrackPointRepository
 import com.field360.tracker.domain.usecase.ResolveConfigUseCase
+import com.field360.tracker.domain.usecase.SessionTeardown
 import com.field360.tracker.domain.usecase.StartTrackingUseCase
 import com.field360.tracker.domain.usecase.StopTrackingUseCase
 import com.field360.traker.geo.filter.AcceptancePipeline
@@ -74,12 +76,15 @@ import com.field360.tracker.integrity.probes.MockLocationProbe
 import com.field360.tracker.motion.ActivityRecognizer
 import com.field360.tracker.motion.CaptureStream
 import com.field360.tracker.motion.GeofenceRegistrar
+import com.field360.tracker.motion.GyroTurnMonitor
+import com.field360.tracker.motion.GyroscopeYawSource
 import com.field360.tracker.motion.MotionController
 import com.field360.tracker.motion.MotionWakeSource
 import com.field360.tracker.motion.SensorProbe
 import com.field360.tracker.motion.SignificantMotionWake
 import com.field360.tracker.motion.StationaryFence
 import com.field360.tracker.motion.StepCorroborator
+import com.field360.tracker.motion.YawRateSource
 import com.field360.tracker.permission.PermissionManager
 import com.field360.tracker.permission.ProviderStateMonitor
 import com.field360.tracker.service.HealthLoop
@@ -240,6 +245,10 @@ internal class TrackerGraph private constructor(
     val stationaryFence: StationaryFence by lazy { StationaryFence(context, events, logger) }
     val geofenceRegistrar: GeofenceRegistrar by lazy { stationaryFence }
     val stepCorroborator: StepCorroborator by lazy { StepCorroborator(context) }
+    val yawRateSource: YawRateSource by lazy { GyroscopeYawSource(context) }
+    val gyroTurnMonitor: GyroTurnMonitor by lazy {
+        GyroTurnMonitor(yawRateSource, clock, logger, constants)
+    }
     val activityRecognizer: ActivityRecognizer by lazy {
         ActivityRecognizer(context, permissions, events, logger, scope)
     }
@@ -355,6 +364,27 @@ internal class TrackerGraph private constructor(
         OneShotProvider(locationSource, fixMapper, ingestor, events, logger, providerStateMonitor)
     }
 
+    /**
+     * The consumer `ProviderStateMonitor` never had: suspends and re-arms capture as the
+     * permission grant and the location providers move under an open session.
+     */
+    val captureGate: CaptureGate by lazy {
+        CaptureGate(
+            providerState = providerStateMonitor.state,
+            captureSwitch = streamController,
+            events = events,
+            logger = logger,
+            scope = scope,
+            onResumed = { config ->
+                // The retry cap is per-outage by contract, and the outage just ended —
+                // without this, three timeouts logged while the GPS was off would suppress
+                // the very one-shot that proves it came back (EC-17).
+                oneShotProvider.resetFailures()
+                oneShotProvider.capture(config)
+            },
+        )
+    }
+
     val motionController: MotionController by lazy {
         MotionController(
             machine = motionStateMachine,
@@ -377,12 +407,35 @@ internal class TrackerGraph private constructor(
 
     // ── use cases ───────────────────────────────────────────────────────────
 
+    /**
+     * The one teardown, shared by `stop()` and by the start path's "only one session at a
+     * time" rule.
+     */
+    val sessionTeardown: SessionTeardown by lazy {
+        SessionTeardown(
+            sessions = sessions,
+            ingestor = ingestor,
+            streamController = streamController,
+            captureGate = captureGate,
+            motionController = motionController,
+            stepCorroborator = stepCorroborator,
+            activityRecognizer = activityRecognizer,
+            significantMotion = significantMotion,
+            gyroTurnMonitor = gyroTurnMonitor,
+            watchdog = watchdog,
+            context = context,
+        )
+    }
+
     val startTracking: StartTrackingUseCase by lazy {
         StartTrackingUseCase(
             sessions = sessions,
             ingestor = ingestor,
             locationSource = locationSource,
             streamController = streamController,
+            captureGate = captureGate,
+            teardown = sessionTeardown,
+            providerStateMonitor = providerStateMonitor,
             motionController = motionController,
             oneShotProvider = oneShotProvider,
             configStore = configStore,
@@ -394,6 +447,7 @@ internal class TrackerGraph private constructor(
             context = context,
             events = events,
             scope = scope,
+            gyroTurnMonitor = gyroTurnMonitor,
             applyConfig = ::applyConfig,
         )
     }
@@ -413,16 +467,8 @@ internal class TrackerGraph private constructor(
 
     val stopTracking: StopTrackingUseCase by lazy {
         StopTrackingUseCase(
-            sessions = sessions,
-            ingestor = ingestor,
-            streamController = streamController,
-            motionController = motionController,
-            stepCorroborator = stepCorroborator,
-            activityRecognizer = activityRecognizer,
-            significantMotion = significantMotion,
-            watchdog = watchdog,
+            teardown = sessionTeardown,
             syncScheduler = syncScheduler,
-            context = context,
             events = events,
         )
     }
@@ -451,6 +497,7 @@ internal class TrackerGraph private constructor(
             ingestor = ingestor,
             oneShotProvider = oneShotProvider,
             liveTrackFeed = liveTrackFeed,
+            captureGate = captureGate,
             clock = clock,
             providerStateMonitor = providerStateMonitor,
             batteryMonitor = batteryMonitor,

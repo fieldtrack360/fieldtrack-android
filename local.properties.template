@@ -23,6 +23,20 @@
 # unreliable and somebody else's bill.
 #OSRM_BASE_URL=https://osrm.internal.example.com
 
+# Upload endpoint for TrackerSync — the FULL URL the batch is POSTed to, not a base.
+#
+# Unset is a working configuration and the default: the sample configures no upload half,
+# points accumulate in Room, and nothing opens a socket. That is the offline-first
+# behaviour the SDK is built around, so the sample has to keep demonstrating it.
+#
+# Set it and the sample turns on autoSync — points upload as they are accepted, a backlog
+# recorded offline drains when connectivity returns, and the Home screen shows how many
+# rows are still queued.
+#
+# Not a credential, so the usual warning does not apply — but it is per-developer. A dev
+# tunnel URL is ephemeral and points at one laptop, which is why there is no default.
+#SYNC_URL=https://api.example.com/locations
+
 # FieldTrack licence API root, for the SDK's revocation check. Include the version
 # segment — the transport appends `/verify` and nothing else, so `/api/v2` later is a
 # configuration change rather than an SDK release.

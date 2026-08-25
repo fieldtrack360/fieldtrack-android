@@ -1,5 +1,6 @@
 package com.field360.traker.geo.plot
 
+import com.field360.traker.geo.math.Bearing
 import com.field360.traker.geo.math.Geodesy
 import com.field360.traker.geo.math.Haversine
 import com.field360.traker.geo.model.GeoPoint
@@ -86,6 +87,55 @@ public object Simplify {
         simplify(path, epsilonM) { it.tag != RenderTag.ROUNDED_CURVE }
 
     /**
+     * The `sourceIndex` values where the path turns hard enough that deleting the vertex
+     * would change the shape a reader can see — corners, to be passed to [simplify] as
+     * anchors.
+     *
+     * Douglas-Peucker keeps whatever deviates *from a chord*, and that is not the same
+     * test as "keeps corners", however often the two coincide. Deviation is measured in
+     * metres, so a 90° turn between two 6 m legs deviates about 4 m and dies under any
+     * tolerance above that, while a 3° kink in the middle of a 400 m straight deviates
+     * 10 m and survives. At the default 2 m tolerance the difference rarely shows; at the
+     * tolerance [epsilonForZoom] returns for a zoomed-out redraw — tens of metres — the
+     * simplifier reaches the point of deleting junctions and leaving the noise, and the
+     * track flattens into the straight-legs-and-jumps shape that corners disappearing
+     * always produces.
+     *
+     * Angle is the right test for a corner, so this measures the angle and hands the
+     * result to the simplifier as something it may not touch. Cost is a handful of
+     * retained vertices; the tolerance elsewhere stays as loose as the caller set it,
+     * which is the point of anchoring rather than lowering epsilon globally.
+     *
+     * @param minTurnDeg the turn, in degrees, at which a vertex becomes a corner. Legs
+     *   shorter than [minLegM] are ignored on both sides: the angle between two 2 m legs
+     *   is GPS scatter, and anchoring on it would pin the noise this stage exists to
+     *   remove.
+     */
+    public fun cornerAnchors(
+        path: List<PlotPoint>,
+        minTurnDeg: Double = DEFAULT_CORNER_TURN_DEG,
+        minLegM: Double = DEFAULT_CORNER_MIN_LEG_M,
+    ): Set<Int> {
+        if (path.size < 3) return emptySet()
+
+        val anchors = mutableSetOf<Int>()
+        for (i in 1 until path.lastIndex) {
+            val previous = path[i - 1]
+            val vertex = path[i]
+            val next = path[i + 1]
+
+            val legIn = Haversine.metres(previous.latitude, previous.longitude, vertex.latitude, vertex.longitude)
+            val legOut = Haversine.metres(vertex.latitude, vertex.longitude, next.latitude, next.longitude)
+            if (legIn < minLegM || legOut < minLegM) continue
+
+            val inbound = Bearing.degrees(previous.latitude, previous.longitude, vertex.latitude, vertex.longitude)
+            val outbound = Bearing.degrees(vertex.latitude, vertex.longitude, next.latitude, next.longitude)
+            if (Bearing.difference(inbound, outbound) >= minTurnDeg) anchors += vertex.sourceIndex
+        }
+        return anchors
+    }
+
+    /**
      * Classic Douglas-Peucker over one run. Endpoints always survive.
      *
      * Iterative, not recursive: a day of dense walking is tens of thousands of points,
@@ -157,4 +207,17 @@ public object Simplify {
 
     /** Sub-pixel deviation is invisible; 1.5 px keeps a comfortable margin. */
     public const val DEFAULT_TOLERANCE_PX: Double = 1.5
+
+    /**
+     * 20° — below a slip road, above the heading spread two consecutive fixes produce on
+     * a straight road once [DEFAULT_CORNER_MIN_LEG_M] has been cleared.
+     */
+    public const val DEFAULT_CORNER_TURN_DEG: Double = 20.0
+
+    /**
+     * Matches `TrackerConstants.bearingCaptureMinDist`, and for the same reason: the
+     * bearing between two points 15 m apart is a direction, and below that it is a
+     * function of the accuracy circle.
+     */
+    public const val DEFAULT_CORNER_MIN_LEG_M: Double = 15.0
 }

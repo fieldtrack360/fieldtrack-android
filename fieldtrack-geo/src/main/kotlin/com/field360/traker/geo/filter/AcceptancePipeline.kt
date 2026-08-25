@@ -2,6 +2,7 @@ package com.field360.traker.geo.filter
 
 import com.field360.traker.geo.math.Bearing
 import com.field360.traker.geo.math.Haversine
+import com.field360.traker.geo.model.Deferred
 import com.field360.traker.geo.model.FilterState
 import com.field360.traker.geo.model.FixDecision
 import com.field360.traker.geo.model.GeoPoint
@@ -200,7 +201,9 @@ public class AcceptancePipeline(
         // enough to read as neither vehicular nor a walk (EC-45).
         val reason = heuristicReason(fix, past, s, eval, distanceMoved, dtSec, looksLikeNlp)
             ?: bearingChangeReason(fix, s, eval, heading, context)
-            ?: return reject(fix, s, Reasons.HEURISTIC_GATE, eval, sigma, threshold)
+            ?: return heuristicRejection(
+                fix, past, s, eval, context, qTrack, sigma, threshold, predictedDelta, distanceMoved, heading,
+            )
 
         // ── Stage 7 — Q/R tuning, persistence, routing ───────────────────────
         return finalise(
@@ -216,6 +219,67 @@ public class AcceptancePipeline(
             predictedDelta = predictedDelta,
             distanceMoved = distanceMoved,
             heading = heading,
+        )
+    }
+
+    /**
+     * The heuristic gate's rejection, plus — when the host asked for it — the accept this
+     * fix would have had (EC-45e).
+     *
+     * **This is the only soft rejection in the pipeline, and that is what makes the seam
+     * safe.** Every gate above it says the fix is wrong: invalid, a duplicate, a network
+     * fallback, physically impossible, too imprecise to place, or outside the filter's
+     * three-sigma gate. This one says only that the fix is *unremarkable* — it moved too
+     * little, too slowly, and turned too gently to be worth a vertex on its own. Offering
+     * a second opinion on any of the others would be an amnesty for junk, which is exactly
+     * what this file's header forbids. Offering one here is a second opinion on
+     * significance, and significance is the one thing a later fix can genuinely change.
+     *
+     * The counterfactual is computed by running the real stage 7, not by approximating it.
+     * Anything less would hand the caller a point and a filter state the pipeline would
+     * never itself have produced, and the whole value of the seam is that adopting the
+     * deferred branch is indistinguishable from the gate having accepted the fix outright.
+     *
+     * A [finalise] that ends in a *skip* — the departure ladder holding a fix back, or
+     * drift suppression re-anchoring on it — yields no point and therefore nothing to
+     * defer. That is the correct answer: those stages exist to stop stationary drift
+     * becoming geometry, and a corner is not a reason to overrule them.
+     */
+    @Suppress("LongParameterList")
+    private fun heuristicRejection(
+        fix: TrackFix,
+        past: TrackPoint,
+        state: FilterState,
+        eval: Eval,
+        context: IngestContext,
+        qTrack: Float,
+        sigma: Float,
+        threshold: Float,
+        predictedDelta: Double,
+        distanceMoved: Double,
+        heading: Float?,
+    ): PipelineResult {
+        val rejected = reject(fix, state, Reasons.HEURISTIC_GATE, eval, sigma, threshold)
+        if (!context.cornerAnchorCapture) return rejected
+
+        val kept = finalise(
+            fix = fix,
+            past = past,
+            state = state,
+            eval = eval,
+            context = context,
+            reason = Reasons.CORNER_ANCHOR,
+            qTrack = qTrack,
+            sigma = sigma,
+            threshold = threshold,
+            predictedDelta = predictedDelta,
+            distanceMoved = distanceMoved,
+            heading = heading,
+        )
+        val point = kept.point ?: return rejected
+
+        return rejected.copy(
+            deferred = Deferred(decision = kept.decision, state = kept.state, point = point),
         )
     }
 

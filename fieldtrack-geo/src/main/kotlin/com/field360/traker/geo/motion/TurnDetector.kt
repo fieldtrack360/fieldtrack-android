@@ -22,8 +22,15 @@ private const val NANOS_PER_MILLI = 1_000_000L
  * out.** A turn is detected from fixes taken during it, so the burst arms partway
  * through. What it buys is everything *after* that instant: the second half of a long
  * bend, corners 2..n of a roundabout or an interchange, the next junction in a grid. A
- * single isolated 90° turn taken at speed is still under-sampled at its apex — the
- * honest fix for that one is a routing API, which is why `RoadSnapProvider` exists.
+ * single isolated 90° turn taken at speed is still under-sampled at its apex by this
+ * detector alone.
+ *
+ * Two things address that, and neither replaces this one. [GyroTurnGate] arms the same
+ * burst from yaw rate, which rises as the wheel turns rather than after the heading has
+ * changed — so on a device with a gyroscope the burst is already running when the corner
+ * arrives, and this detector's job becomes holding it through the rest of the bend. Where
+ * the road's real shape matters more than the sampling, the answer is still a routing API,
+ * which is why `RoadSnapProvider` exists.
  *
  * Pure, in the same discipline as [MotionStateMachine] and `FilterState`: takes a state
  * and a fix, returns a new state. No timers, no coroutines, no clock of its own — the
@@ -66,6 +73,19 @@ public class TurnDetector(
         val isBursting: Boolean,
         /** Observed rate of heading change, deg/s. Zero when nothing was measurable. */
         val turnRateDegPerSec: Float,
+        /**
+         * How fast the device was travelling by this fix's reckoning, m/s — the greater of
+         * the chip's Doppler speed and the displacement since the previous fix.
+         *
+         * Exposed because the detector already has to compute it to decide whether a
+         * heading change is a turn or a phone rotating on a desk, and because it is the
+         * best speed available on **every raw fix**, accepted or rejected. Consumers that
+         * need to know the device is in a vehicle — [GyroTurnGate]'s caller, which opens
+         * and closes a gyroscope on the answer — would otherwise have to recompute it or
+         * settle for the accepted-point stream, which goes quiet through exactly the
+         * junction they care about.
+         */
+        val speedMps: Float,
     )
 
     public fun onFix(state: State, fix: TrackFix): Result {
@@ -73,7 +93,8 @@ public class TurnDetector(
             ?.let { (fix.elapsedRealtimeNanos - it).toFloat() / NANOS_PER_SECOND }
             ?: 0f
         val heading = headingOf(state, fix)
-        val rate = turnRate(state, fix, heading, dtSec)
+        val speed = observedSpeed(state, fix, dtSec)
+        val rate = turnRate(state, fix, heading, dtSec, speed)
 
         // Each qualifying fix re-arms the hold rather than extending a running total, so
         // a twisty road stays fast for as long as it stays twisty and a straight road
@@ -100,6 +121,7 @@ public class TurnDetector(
             state = next,
             isBursting = fix.elapsedRealtimeNanos < burstUntil,
             turnRateDegPerSec = rate,
+            speedMps = speed,
         )
     }
 
@@ -137,18 +159,35 @@ public class TurnDetector(
      *  - **poor accuracy** — a displacement heading from a 60 m error circle is noise,
      *    and noise sampled every 12 s looks exactly like a turn.
      */
-    private fun turnRate(state: State, fix: TrackFix, heading: Float?, dtSec: Float): Float {
+    private fun turnRate(state: State, fix: TrackFix, heading: Float?, dtSec: Float, speed: Float): Float {
         if (heading == null || !state.hasHeading) return 0f
         if (dtSec < c.turnBurstMinDtSec || dtSec > c.turnBurstMaxDtSec) return 0f
         if (fix.accuracy >= c.bearingCaptureMaxAccuracy) return 0f
-
-        val hwSpeed = if (fix.hasSpeed) fix.speedMps else 0f
-        val moved = Haversine.metres(state.lastLat, state.lastLng, fix.latitude, fix.longitude)
-        val speed = max(hwSpeed, (moved / dtSec).toFloat())
         if (speed < c.turnBurstMinSpeed) return 0f
 
         val turned = Bearing.difference(state.lastHeadingDeg.toDouble(), heading.toDouble())
         return (turned / dtSec).toFloat()
+    }
+
+    /**
+     * The greater of the chip's Doppler speed and the speed implied by displacement.
+     *
+     * `max`, not a preference, and not an average: a fix carrying no Doppler speed can
+     * still qualify on displacement, and a chip reporting a stale zero while the device
+     * moves must not be able to veto what two positions plainly show.
+     *
+     * Outside the Δt window this falls back to hardware speed alone. A displacement speed
+     * across a signal gap divides a real distance by a gap length and means nothing, and
+     * under a second it divides by ~0 — the same two reasons [turnRate] refuses to measure
+     * a heading change there.
+     */
+    private fun observedSpeed(state: State, fix: TrackFix, dtSec: Float): Float {
+        val hwSpeed = if (fix.hasSpeed) fix.speedMps else 0f
+        if (!state.hasPrevious) return hwSpeed
+        if (dtSec < c.turnBurstMinDtSec || dtSec > c.turnBurstMaxDtSec) return hwSpeed
+
+        val moved = Haversine.metres(state.lastLat, state.lastLng, fix.latitude, fix.longitude)
+        return max(hwSpeed, (moved / dtSec).toFloat())
     }
 
     public companion object {

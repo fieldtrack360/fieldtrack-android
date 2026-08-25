@@ -36,6 +36,7 @@ import com.field360.fieldtrack.sample.screen.DebugOverlayScreen
 import com.field360.fieldtrack.sample.screen.DecisionLogScreen
 import com.field360.fieldtrack.sample.screen.HomeScreen
 import com.field360.fieldtrack.sample.screen.LicenseAlertDialog
+import com.field360.fieldtrack.sample.screen.PermissionAlertDialog
 import com.field360.fieldtrack.sample.screen.SyncAlertDialog
 import com.field360.fieldtrack.sample.screen.TrackScreen
 import java.io.File
@@ -175,6 +176,34 @@ private fun SampleApp(
                 viewModel.syncNow()
             },
             onDismiss = viewModel::dismissSyncAlert,
+        )
+    }
+
+    // Above the background dialog on purpose: this is the one raised by Start, and it can
+    // itself hand off to that ladder. Two dialogs stacked would leave the user answering
+    // the second question first.
+    state.permissionAlert?.let { alert ->
+        PermissionAlertDialog(
+            alert = alert,
+            onGrant = {
+                viewModel.dismissPermissionAlert()
+                when (alert.action) {
+                    // The runtime array covers notifications, fine, coarse and activity
+                    // recognition in one pass. Background is never in it — bundling it is a
+                    // silent denial (EC-04) — so the background rung is offered on the way
+                    // back, exactly as the Grant location button does.
+                    PermissionAction.REQUEST_RUNTIME ->
+                        // Back into start() once the OS has answered, not into a dead end:
+                        // the preflight runs again on the new grants and either starts or
+                        // says what is still missing. A denial therefore re-states the cost
+                        // rather than silently doing nothing.
+                        onRequestForeground { viewModel.start() }
+
+                    PermissionAction.BACKGROUND_LADDER -> viewModel.showBackgroundRationale()
+                }
+            },
+            onStartAnyway = viewModel::startAnyway,
+            onDismiss = viewModel::dismissPermissionAlert,
         )
     }
 

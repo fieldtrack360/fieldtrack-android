@@ -56,9 +56,24 @@ fun HomeScreen(
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     Text(
-                        text = if (state.isTracking) "Tracking" else "Idle",
+                        text = when {
+                            state.isTracking && !state.isCapturing -> "Tracking (suspended)"
+                            state.isTracking -> "Tracking"
+                            else -> "Idle"
+                        },
                         style = MaterialTheme.typography.titleLarge,
+                        // The whole reason `isCapturing` exists: an open session with a
+                        // revoked permission or a switched-off GPS used to read exactly
+                        // like a healthy one, so a stalled drive looked fine on screen.
+                        color = if (state.isTracking && !state.isCapturing) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            Color.Unspecified
+                        },
                     )
+                    state.captureSuspendedReason?.let {
+                        Text(it, color = MaterialTheme.colorScheme.error)
+                    }
                     Text("Motion: ${state.motionState}")
                     Text(
                         "Provider: gps=${state.providerState.gpsEnabled} " +

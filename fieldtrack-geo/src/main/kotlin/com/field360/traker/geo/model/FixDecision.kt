@@ -36,4 +36,37 @@ public data class PipelineResult(
     val decision: FixDecision,
     val state: FilterState,
     val point: TrackPoint? = null,
+    /**
+     * The outcome this fix would have had if the pipeline had kept it — non-null only on
+     * a [Reasons.HEURISTIC_GATE] rejection, and only when the caller asked for it via
+     * [IngestContext.cornerAnchorCapture] (EC-45e).
+     *
+     * **This is an alternative, not an addition.** The caller adopts either the fields
+     * above or every field of [Deferred], never a mixture: the two describe the same fix
+     * taking two different routes through the filter, and their [FilterState]s diverge
+     * from that instant on. Adopting one after having already fed a later fix through the
+     * other is the one way to corrupt this, which is why the seam sits in the caller's
+     * per-fix loop rather than behind a timer.
+     *
+     * The pipeline offers it and expresses no opinion about it: whether a corner turned
+     * across this fix is a question about the fix that comes *next*, and the pipeline has
+     * a strict contract of judging one fix against what precedes it. [CornerWindow] is
+     * where the question is answered.
+     */
+    val deferred: Deferred? = null,
+)
+
+/**
+ * A rejected fix's counterfactual: what the filter would hold, and what point would have
+ * been stored, had the heuristic gate kept it (EC-45e).
+ *
+ * Carries a whole [FilterState] rather than a delta because the two routes are not a
+ * delta apart — an accepted fix runs a Kalman correction, advances the burst clock and
+ * the captured heading, and clears the reject counter, while a rejected one runs settle
+ * detection instead.
+ */
+public data class Deferred(
+    val decision: FixDecision,
+    val state: FilterState,
+    val point: TrackPoint,
 )

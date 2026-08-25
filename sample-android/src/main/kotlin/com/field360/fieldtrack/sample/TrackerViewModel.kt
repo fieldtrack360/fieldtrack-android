@@ -10,6 +10,7 @@ import com.field360.tracker.RawFix
 import com.field360.tracker.Tracker
 import com.field360.tracker.domain.model.ErrorCode
 import com.field360.tracker.domain.model.LicenseStatus
+import com.field360.tracker.domain.model.LocationAccuracy
 import com.field360.tracker.domain.model.PermissionTier
 import com.field360.tracker.domain.model.PointQuery
 import com.field360.tracker.domain.model.ProviderState
@@ -23,6 +24,7 @@ import com.field360.traker.geo.model.FixDecision
 import com.field360.traker.geo.model.GeoPoint
 import com.field360.traker.geo.model.MotionState
 import com.field360.traker.geo.model.TrackPoint
+import com.field360.traker.geo.plot.model.Smoothing
 import com.field360.traker.geo.plot.model.Track
 import com.field360.traker.geo.plot.model.TrackOptions
 import com.field360.traker.sync.SyncEvent
@@ -85,6 +87,91 @@ data class SyncAlert(
     val terminal: Boolean,
     val queued: Int,
 )
+
+/**
+ * A grant the SDK wants that the app does not hold, at the moment `start()` was tapped.
+ *
+ * Ordered by how much a session loses without it, which is also the order the dialog
+ * lists them in: the first two stop `start()` outright, the rest degrade it.
+ *
+ * @property label what to call it in front of a user — never the `Manifest.permission`
+ *   constant, which names a thing no Settings screen contains.
+ * @property consequence what the *session* loses. Deliberately concrete: "activity
+ *   recognition is missing" tells a tester nothing they can weigh, and a permission
+ *   prompt with no stated cost is the one users deny out of hand.
+ * @property blocking whether `start()` will refuse. See [TrackerViewModel.preflight].
+ */
+enum class MissingPermission(
+    val label: String,
+    val consequence: String,
+    val blocking: Boolean,
+) {
+    LOCATION(
+        label = "Location",
+        consequence = "Nothing can be recorded at all — start() returns PERMISSION_DENIED.",
+        blocking = true,
+    ),
+
+    /**
+     * Blocking here because this sample runs `ADAPTIVE`. A 1–3 km error circle defeats
+     * every gate in the pipeline, so the SDK refuses `ADAPTIVE` and `CONTINUOUS` under an
+     * approximate-only grant and returns `COARSE_ONLY` (EC-02). Only `MOTION_ONLY` is
+     * allowed on it, and a host configured that way should flip this to `false`.
+     */
+    PRECISE_LOCATION(
+        label = "Precise location",
+        consequence = "start() returns COARSE_ONLY: approximate location cannot support " +
+            "ADAPTIVE or CONTINUOUS tracking.",
+        blocking = true,
+    ),
+    BACKGROUND_LOCATION(
+        label = "Location all the time",
+        consequence = "The session records only while the app is on screen. Everything " +
+            "after you leave the app is lost.",
+        blocking = false,
+    ),
+    NOTIFICATIONS(
+        label = "Notifications",
+        consequence = "The foreground-service notification is invisible. Tracking still " +
+            "runs, but some manufacturers kill a service whose notification cannot be seen.",
+        blocking = false,
+    ),
+    ACTIVITY_RECOGNITION(
+        label = "Physical activity",
+        consequence = "Motion detection falls back to speed and displacement alone — " +
+            "coarser stop/start decisions and no activity label on stored points.",
+        blocking = false,
+    ),
+}
+
+/** What the alert's primary button should do about [PermissionAlert.missing]. */
+enum class PermissionAction {
+    /** Everything outstanding is grantable by a normal runtime request. */
+    REQUEST_RUNTIME,
+
+    /**
+     * Only background location is left, and it has its own ladder: from Android 11 the OS
+     * shows no prompt for it and Settings is the only route (EC-05).
+     */
+    BACKGROUND_LADDER,
+}
+
+/**
+ * What `start()` found missing, raised before the SDK is called at all.
+ *
+ * The SDK returns typed errors rather than prompting — it shows no UI by design
+ * (PERMISSIONS.md §5) — so a host that simply forwards `PERMISSION_DENIED` to a text field
+ * leaves the user with a code and no way to act on it. This is the host doing its half.
+ *
+ * @property blocking true when at least one [MissingPermission] would make `start()` fail.
+ *   With it false the session is merely degraded, and "Start anyway" is a real choice.
+ */
+data class PermissionAlert(
+    val missing: List<MissingPermission>,
+    val action: PermissionAction,
+) {
+    val blocking: Boolean = missing.any { it.blocking }
+}
 
 /**
  * One view model over the whole SDK surface.
@@ -150,6 +237,16 @@ class TrackerViewModel(
 
     data class UiState(
         val isTracking: Boolean = false,
+        /**
+         * Whether the SDK is actually registered for fixes right now.
+         *
+         * Separate from [isTracking] because a revoked permission or a switched-off GPS
+         * suspends capture without closing the session — the state that used to be
+         * invisible, and that made a stalled drive look identical to a healthy parked one.
+         */
+        val isCapturing: Boolean = false,
+        /** Why capture is suspended, straight from `TrackerEvent.CaptureSuspended`. */
+        val captureSuspendedReason: String? = null,
         val sessionId: String? = null,
         val motionState: MotionState = MotionState.STOPPED,
         val providerState: ProviderState = ProviderState(),
@@ -180,6 +277,8 @@ class TrackerViewModel(
         val licenseStatus: String = "",
         /** Non-null while a licence problem is worth interrupting the user for. */
         val licenseAlert: LicenseAlert? = null,
+        /** Non-null while `start()` is held back on a missing grant. See [PermissionAlert]. */
+        val permissionAlert: PermissionAlert? = null,
         val logPath: String = "",
         val logSizeBytes: Long = 0,
         /** Newest first. Every session ever recorded, for the Home list. */
@@ -264,6 +363,7 @@ class TrackerViewModel(
                 _state.update {
                     it.copy(
                         isTracking = sdk.isTracking,
+                        isCapturing = sdk.isCapturing,
                         sessionId = sdk.currentSessionId,
                         motionState = sdk.motionState,
                         providerState = sdk.providerState,
@@ -721,6 +821,12 @@ class TrackerViewModel(
             is TrackerEvent.GeofenceEntered -> "GEOFENCE enter ${event.geofence.id}"
             is TrackerEvent.GeofenceExited -> "GEOFENCE exit ${event.geofence.id}"
             is TrackerEvent.Heartbeat -> "HEARTBEAT ${event.atMs}"
+            is TrackerEvent.PermissionChange ->
+                "PERMISSION ${event.previous} -> ${event.current} (${event.accuracy})"
+            is TrackerEvent.LocationServicesChange ->
+                "LOCSERVICES ${if (event.enabled) "on" else "off"} gps=${event.state.gpsEnabled}"
+            is TrackerEvent.CaptureSuspended -> "SUSPEND ${event.reason}: ${event.message}"
+            TrackerEvent.CaptureResumed -> "RESUME  capture re-armed"
             is TrackerEvent.BatteryChange ->
                 "BATTERY ${event.battery.percent}% charging=${event.battery.isCharging}"
             // Waived is the normal reading here: the sample is installed debuggable, so the
@@ -768,6 +874,40 @@ class TrackerViewModel(
         if (event is TrackerEvent.Error && event.code == ErrorCode.BACKGROUND_PERMISSION_MISSING) {
             showBackgroundRationale()
         }
+
+        // What a host is expected to do with the new callbacks.
+        when (event) {
+            // Re-read the ladder rather than trusting the payload: the tier moved, so the
+            // *next step* almost certainly moved with it, and the background dialog's
+            // "which route is even available" question can only be answered by asking.
+            is TrackerEvent.PermissionChange -> {
+                refreshPermissions()
+                // A total revocation is the one case worth interrupting for. Anything
+                // still holding foreground location keeps recording, so a dialog there
+                // would be nagging about a session that is working.
+                if (event.current == PermissionTier.NONE) {
+                    _state.update {
+                        it.copy(
+                            error = "PERMISSION_DENIED: location permission revoked — " +
+                                "grant it again and capture resumes on its own",
+                        )
+                    }
+                }
+            }
+
+            is TrackerEvent.CaptureSuspended ->
+                _state.update {
+                    it.copy(isCapturing = false, captureSuspendedReason = event.message)
+                }
+
+            // Cleared here rather than left to the next state emission: the banner is the
+            // only thing on screen saying the drive has a hole in it, and it must not
+            // outlive the hole.
+            TrackerEvent.CaptureResumed ->
+                _state.update { it.copy(isCapturing = true, captureSuspendedReason = null) }
+
+            else -> Unit
+        }
     }
 
     /**
@@ -798,7 +938,86 @@ class TrackerViewModel(
         )
     }
 
-    fun start() = viewModelScope.launch {
+    /**
+     * The Start button. Checks the grants first, and only then calls the SDK.
+     *
+     * The SDK deliberately shows no UI and answers in typed errors, so `PERMISSION_DENIED`
+     * arriving in a text field is where a user's path used to end. Asking here means the
+     * dialog can name what is missing, what the session loses without it, and which button
+     * fixes it — before a session id has been burned on a run that records nothing.
+     *
+     * Degraded grants are surfaced too, and those the user may overrule: see
+     * [startAnyway].
+     */
+    fun start() {
+        val alert = preflight()
+        if (alert != null) {
+            captureLog.note(
+                "START",
+                "held: missing=${alert.missing.joinToString { it.name }} blocking=${alert.blocking}",
+            )
+            _state.update { it.copy(permissionAlert = alert) }
+            return
+        }
+        launchStart()
+    }
+
+    /**
+     * Start regardless, after the user has read what the session will lose.
+     *
+     * Offered only for a non-blocking alert. Overriding a blocking one would call `start()`
+     * to be told what the dialog already said, and the SDK's error would then overwrite a
+     * message the user has already acted on.
+     */
+    fun startAnyway() {
+        val alert = _state.value.permissionAlert ?: return
+        _state.update { it.copy(permissionAlert = null) }
+        if (alert.blocking) return
+        captureLog.note("START", "user overrode: ${alert.missing.joinToString { it.name }}")
+        launchStart()
+    }
+
+    fun dismissPermissionAlert() {
+        _state.update { it.copy(permissionAlert = null) }
+    }
+
+    /**
+     * Everything the SDK wants that this app does not hold, or `null` when nothing is.
+     *
+     * Read from `PermissionManager` rather than from Android directly: it is the SDK's own
+     * answer, so the dialog and `start()` can never disagree about what is granted.
+     */
+    private fun preflight(): PermissionAlert? {
+        val permissions = tracker.permissions()
+        val missing = buildList {
+            when (permissions.tier()) {
+                // Background is missing too, but it is not grantable until fine is —
+                // asking for both at once is a silent denial (EC-04). One rung at a time.
+                PermissionTier.NONE -> add(MissingPermission.LOCATION)
+                PermissionTier.FOREGROUND_ONLY -> add(MissingPermission.BACKGROUND_LOCATION)
+                PermissionTier.FULL -> Unit
+            }
+            if (permissions.accuracy() == LocationAccuracy.APPROXIMATE) {
+                add(MissingPermission.PRECISE_LOCATION)
+            }
+            // Both answer `true` on the API levels that have no such permission, so no
+            // version check is needed here.
+            if (!permissions.hasNotificationPermission()) add(MissingPermission.NOTIFICATIONS)
+            if (!permissions.hasActivityRecognition()) add(MissingPermission.ACTIVITY_RECOGNITION)
+        }
+        if (missing.isEmpty()) return null
+
+        // Background alone means the ladder, not a request array: from Android 11 a runtime
+        // request for it does nothing at all and Settings is the only route (EC-05).
+        val action = if (missing == listOf(MissingPermission.BACKGROUND_LOCATION)) {
+            PermissionAction.BACKGROUND_LADDER
+        } else {
+            PermissionAction.REQUEST_RUNTIME
+        }
+        return PermissionAlert(missing.sortedBy { it.ordinal }, action)
+    }
+
+    private fun launchStart() = viewModelScope.launch {
         captureLog.note("START", "requested tag=sample tier=${tracker.permissionTier()}")
         when (val result = tracker.start(tag = "sample")) {
             is TrackerResult.Ok -> {
@@ -1088,7 +1307,16 @@ class TrackerViewModel(
         }
     }
 
-    private fun trackOptions() = TrackOptions(zoom = 15f, snapToRoad = _state.value.snapToRoad)
+    /**
+     * [Smoothing.HEADING_SPLINE] rather than the default, because the sample exists to
+     * show what the SDK can do with a real drive and corners are where the default's
+     * inferred tangents visibly cut the turn.
+     */
+    private fun trackOptions() = TrackOptions(
+        zoom = 15f,
+        snapToRoad = _state.value.snapToRoad,
+        smoothing = Smoothing.HEADING_SPLINE,
+    )
 
     /**
      * Toggle map-matching and rebuild.

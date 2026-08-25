@@ -135,6 +135,12 @@ public object Spline {
                     sourceIndex = start.sourceIndex,
                     tag = RenderTag.ROUNDED_CURVE,
                     isProtected = false,
+                    // `end.copy` would otherwise hand every interpolated vertex the
+                    // heading recorded at the span's endpoint, which was measured tens of
+                    // metres further along. Nothing downstream reads it today; leaving it
+                    // set would be a measurement claimed for a point that is an
+                    // interpolation.
+                    bearingDeg = PlotPoint.BEARING_UNSET,
                 )
             }
             // The span's own endpoint verbatim, never a sample at u = 1: rounding there

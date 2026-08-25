@@ -40,6 +40,32 @@ internal interface GeofenceRegistrar {
 }
 
 /**
+ * Yaw rate about the world vertical, in degrees per second.
+ *
+ * Implemented by [GyroscopeYawSource]. A port rather than a direct `SensorManager` call
+ * because the interesting logic — when to listen at all, and what counts as a turn — is
+ * what needs testing, and none of it needs a gyroscope to test
+ * ([com.field360.traker.geo.motion.GyroTurnGate], [GyroTurnMonitor]).
+ *
+ * Sign is preserved (positive and negative are the two directions of turn) and callers are
+ * free to ignore it. Devices without a gyroscope report `isAvailable = false` and every
+ * other method is a no-op, so the caller needs no capability branch of its own.
+ */
+internal interface YawRateSource {
+    val isAvailable: Boolean
+
+    /**
+     * @param onYawRate called on whatever thread the sensor stack delivers on — the main
+     *   looper, in the Android implementation. Implementations must not stamp a time onto
+     *   the sample: the caller owns the clock, so that a replayed fixture and a live drive
+     *   run through identical arithmetic.
+     */
+    fun start(onYawRate: (Float) -> Unit)
+
+    fun stop()
+}
+
+/**
  * The location stream, as the motion layer sees it.
  *
  * Implemented by [com.field360.tracker.capture.LocationStreamController]. Narrow on

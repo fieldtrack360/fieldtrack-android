@@ -152,6 +152,23 @@ class CaptureLog(context: Context) {
             )
             is TrackerEvent.Heartbeat -> line(now, "HEARTBEAT", "atMs=${event.atMs} at=${stamp(event.atMs)}")
             is TrackerEvent.PowerSaveChange -> line(now, "POWERSAVE", "enabled=${event.enabled}")
+            // The three that explain a hole in the polyline. Read together with the
+            // PROVIDER line either side of them: SUSPEND says capture stopped and why,
+            // RESUME bounds the gap, and PERMISSION says what the user did to cause it.
+            is TrackerEvent.PermissionChange -> line(
+                now,
+                "PERMISSION",
+                "previous=${event.previous} current=${event.current} accuracy=${event.accuracy}",
+            )
+            is TrackerEvent.LocationServicesChange -> line(
+                now,
+                "LOCSERVICES",
+                "enabled=${event.enabled} gps=${event.state.gpsEnabled} " +
+                    "network=${event.state.networkEnabled} master=${event.state.locationServicesEnabled}",
+            )
+            is TrackerEvent.CaptureSuspended ->
+                line(now, "SUSPEND", "reason=${event.reason} message=${event.message}")
+            TrackerEvent.CaptureResumed -> line(now, "RESUME", "capture re-armed")
             is TrackerEvent.GeofenceAdded ->
                 line(now, "GEOFENCE", "added id=${event.geofence.id} radius=${event.geofence.radiusM}")
             is TrackerEvent.GeofenceRemoved ->

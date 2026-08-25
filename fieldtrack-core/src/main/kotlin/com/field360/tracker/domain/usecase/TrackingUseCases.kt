@@ -4,9 +4,11 @@ import android.content.Context
 import com.field360.tracker.LocationProviderType
 import com.field360.tracker.TrackerConfig
 import com.field360.tracker.TrackingMode
+import com.field360.tracker.capture.CaptureGate
 import com.field360.tracker.capture.FixIngestor
 import com.field360.tracker.capture.LocationStreamController
 import com.field360.tracker.capture.OneShotProvider
+import com.field360.tracker.capture.TurnSource
 import com.field360.tracker.data.location.LocationSource
 import com.field360.tracker.data.repository.ConfigStore
 import com.field360.tracker.domain.model.ErrorCode
@@ -23,12 +25,15 @@ import com.field360.tracker.motion.DeviceSensors
 import com.field360.tracker.motion.MotionQuality
 import com.field360.tracker.motion.SensorProbe
 import com.field360.tracker.motion.ActivityRecognizer
+import com.field360.tracker.motion.GyroTurnMonitor
 import com.field360.tracker.motion.MotionController
 import com.field360.tracker.motion.SignificantMotionWake
 import com.field360.tracker.motion.StepCorroborator
 import com.field360.tracker.permission.PermissionManager
+import com.field360.tracker.permission.ProviderStateMonitor
 import com.field360.tracker.service.TrackingService
 import com.field360.tracker.work.BackstopWorker
+import com.field360.tracker.work.RestoreWorker
 import com.field360.tracker.work.SyncScheduler
 import com.field360.tracker.work.Watchdog
 import kotlinx.coroutines.CoroutineScope
@@ -39,17 +44,31 @@ import kotlinx.coroutines.launch
 /**
  * Opens a session and starts the capture pipeline.
  *
- * **Every start is a new session.** A session left open by process death is closed
- * first, so two separate runs never share an id.
+ * **Every start is a new session, and only one session is ever active.** Whatever was
+ * running before this call — a live pipeline, a session left open by process death, a
+ * foreground service the host never stopped, the previous run's workers and registered
+ * sensors — is torn down through [SessionTeardown] before the new session row is written.
+ * Two runs therefore never share an id, and there is never a second service.
  *
- * Still idempotent while tracking: calling it twice with the pipeline live returns the
- * existing session rather than starting a second service and a second stream (EC-72).
+ * That replaces the earlier idempotent behaviour, where a `start()` with the pipeline live
+ * returned the session already being written to (EC-72). The trade is deliberate and was
+ * chosen explicitly: a double tap on Start now produces two session ids. Hosts that care
+ * should gate the control on `TrackerState.isTracking`, as `sample-android` does — the
+ * previous design bought double-tap safety at the price of a new session silently
+ * inheriting the old one's service, supervision loop and config.
+ *
+ * The teardown runs **after** every gate has passed, never before: a `start()` that is
+ * about to fail on a missing permission must not take a healthy running session down
+ * with it.
  */
 public class StartTrackingUseCase internal constructor(
     private val sessions: SessionRepository,
     private val ingestor: FixIngestor,
     private val locationSource: LocationSource,
     private val streamController: LocationStreamController,
+    private val captureGate: CaptureGate,
+    private val teardown: SessionTeardown,
+    private val providerStateMonitor: ProviderStateMonitor,
     private val motionController: MotionController,
     private val oneShotProvider: OneShotProvider,
     private val configStore: ConfigStore,
@@ -61,6 +80,7 @@ public class StartTrackingUseCase internal constructor(
     private val context: Context,
     private val events: MutableSharedFlow<TrackerEvent>,
     private val scope: CoroutineScope,
+    private val gyroTurnMonitor: GyroTurnMonitor,
     /**
      * Applies the parts of the config that are wired rather than passed: the provider
      * selection [LocationSource] routes on, and the engine constants the accuracy meter
@@ -79,6 +99,17 @@ public class StartTrackingUseCase internal constructor(
         tag: String? = null,
     ): TrackerResult<TrackSession> {
         applyConfig(config)
+
+        // Re-read the device before any gate consults it. `ProviderStateMonitor` is
+        // broadcast-driven, and a broadcast can be missed: a context-registered receiver
+        // is unregistered when the process dies, and `PROVIDERS_CHANGED` fired in that
+        // window is simply never seen. The cached state then still says the GPS is off
+        // long after the user switched it back on, and every gate reading it — plus the
+        // `providerFlags` stamped on each stored point — inherits the stale answer. Cheap:
+        // three binder reads, once per session. `getCurrentLocation()` already did this;
+        // `start()` did not, which is the asymmetry that made "it works for a one-shot but
+        // not for a session" reproducible.
+        providerStateMonitor.refresh()
 
         // EC-01: no permission means a typed error, never a SecurityException and never
         // a service that starts and silently produces nothing.
@@ -127,17 +158,29 @@ public class StartTrackingUseCase internal constructor(
             return TrackerResult.Error(ErrorCode.PLAY_SERVICES_UNAVAILABLE, message)
         }
 
-        // A start() while the pipeline is already live is idempotent — `sessions.open()`
-        // hands back the session being written to, so a double tap cannot split a drive
-        // in two (EC-72).
+        // One session at a time, enforced here rather than assumed.
         //
-        // A start() while it is NOT live is a genuinely new run. Any session still marked
-        // open at this point is a crash leftover the host was already told about via
-        // `SessionInterrupted` (EC-66); closing it first means today's drive gets its own
-        // session id instead of being appended to one from days ago.
-        if (!ingestor.isRunning) {
-            sessions.current()?.let { sessions.close(it.id) }
+        // This is the only place that can guarantee it: the previous run may have been a
+        // live pipeline, a crash leftover the host was already told about via
+        // `SessionInterrupted` (EC-66), or a service that outlived its session entirely
+        // after a sticky restart. All three end the same way, and all three end *now* —
+        // before the new row exists, so no window has two open sessions in it.
+        //
+        // Tearing down the service matters as much as closing the row. A surviving
+        // instance answers the `startForegroundService` below on its existing
+        // `onStartCommand`, and every value it supervises with — the health-loop cadence,
+        // the force-capture config, the watchdog thresholds — was read when *that* session
+        // started. A new session would silently run on the old session's configuration.
+        val superseded = teardown()
+        if (superseded != null) {
+            events.tryEmit(
+                TrackerEvent.Diagnostic(
+                    "session ${superseded.id} superseded by a new start(); its service and " +
+                        "workers were stopped",
+                ),
+            )
         }
+
         val session = sessions.open(tag, configStore.encode(config))
         ingestor.mockPolicy = config.geolocation.mockLocationPolicy
         ingestor.persistRawFixes = config.persistence.persistRawFixes
@@ -145,6 +188,7 @@ public class StartTrackingUseCase internal constructor(
         ingestor.persistRawPoints = config.persistence.persistRawPoints
         ingestor.rawPointCapacity = config.persistence.rawPointRingCapacity
         ingestor.bearingChangeCaptureDeg = config.motion.bearingChangeCaptureDeg
+        ingestor.cornerAnchorCapture = config.motion.cornerAnchorCapture
 
         // Session-scoped sensor registration. Started here, torn down in stop() — a
         // pedometer left registered after a session is battery drain with nothing to
@@ -165,13 +209,25 @@ public class StartTrackingUseCase internal constructor(
         // The third cadence tier: raw fixes feed turn detection, turn detection feeds the
         // sampling rate. A callback rather than an injected dependency because the stream
         // controller already depends on the ingestor (EC-45).
-        ingestor.onTurnBurst = streamController::setTurning
+        ingestor.onTurnBurst = { streamController.setTurning(TurnSource.GNSS_BEARING, it) }
+        armGyroTurnPrediction(config)
         ingestor.start(session, scope)
         watchdog.reset()
         oneShotProvider.resetFailures()
 
         motionController.start(config)
         streamController.start(config, vehicular = false)
+
+        // Armed **after** the stream, so its first evaluation judges a stream that exists.
+        // A session opened with location switched off is therefore suspended immediately
+        // and resumes on its own when the switch comes back, rather than holding a
+        // registration against a dead provider for the rest of the drive (EC-06, EC-07).
+        //
+        // Deliberately not a start() gate: refusing to open a session because the GPS is
+        // off would strand a host that starts tracking from a background trigger — the
+        // session is the record, and the record should exist with a documented gap in it
+        // rather than not exist at all.
+        captureGate.arm(config)
 
         // Enrichment only: a label on the point and one extra fix at a motion change.
         // Denial degrades to speed + displacement rather than failing start() (EC-09).
@@ -186,43 +242,141 @@ public class StartTrackingUseCase internal constructor(
         events.tryEmit(TrackerEvent.EnabledChange(enabled = true))
         return TrackerResult.Ok(session)
     }
+
+    /**
+     * Wires the predictive half of turn-burst sampling, when the device and the config
+     * both allow it (EC-45d).
+     *
+     * Three conditions, and the order they are checked in says what each means.
+     * `turnBurst` off means the host does not want the fast tier at all, so a predictor
+     * for it is moot. `useGyroTurnPrediction` off means the host wants the tier but only
+     * from GNSS — the conservative setting, and the one to reach for if a fleet's battery
+     * budget is tight. A missing gyroscope or gravity source means the device cannot do
+     * it, and that is not an error: `TurnDetector` alone is the behaviour every release
+     * before this one shipped.
+     *
+     * Nothing here registers a sensor. [GyroTurnMonitor] opens the gyroscope on the first
+     * fix reporting vehicular speed and closes it a minute after the last, so a session
+     * spent walking or parked never touches it.
+     */
+    private fun armGyroTurnPrediction(config: TrackerConfig) {
+        if (!config.geolocation.turnBurst) return
+        if (!config.sensors.useGyroTurnPrediction) return
+        if (!gyroTurnMonitor.isAvailable) return
+
+        gyroTurnMonitor.onTurning = { turning ->
+            streamController.setTurning(TurnSource.GYROSCOPE, turning)
+            // The same signal, for a different decision: the stream uses it to sample
+            // faster, the corner window uses it as direct evidence that a turn spans the
+            // fix it is holding (EC-45d, EC-45e).
+            ingestor.gyroTurning = turning
+        }
+        ingestor.onObservedSpeed = gyroTurnMonitor::onSpeed
+        gyroTurnMonitor.start()
+    }
 }
 
-/** Closes the session and tears the pipeline down. No-op when never started (EC-74). */
-public class StopTrackingUseCase internal constructor(
+/**
+ * Everything that has to come down when a session ends, in the order it has to come down in.
+ *
+ * Extracted because **two** callers need it, not one. `stop()` is the obvious caller;
+ * `start()` is the other, because only one session may be active at a time and a new one
+ * must not inherit the previous run's service instance, its supervision loop, its workers
+ * or its registered sensors. Before this existed, `start()` closed a leftover session row
+ * and left everything attached to it running.
+ *
+ * A single definition rather than two similar ones on purpose: a teardown that is nearly
+ * the same in two places is a teardown that will differ in one of them after the next edit,
+ * and the thing that leaks is a foreground service the user can see.
+ */
+internal class SessionTeardown(
     private val sessions: SessionRepository,
     private val ingestor: FixIngestor,
     private val streamController: LocationStreamController,
+    private val captureGate: CaptureGate,
     private val motionController: MotionController,
     private val stepCorroborator: StepCorroborator,
     private val activityRecognizer: ActivityRecognizer,
     private val significantMotion: SignificantMotionWake,
+    private val gyroTurnMonitor: GyroTurnMonitor,
     private val watchdog: Watchdog,
-    private val syncScheduler: SyncScheduler,
     private val context: Context,
-    private val events: MutableSharedFlow<TrackerEvent>,
 ) {
-    public suspend operator fun invoke(): TrackerResult<TrackSession?> {
-        val current = sessions.current() ?: return TrackerResult.Ok(null)
+
+    /**
+     * Brings down whatever is running and closes any open session.
+     *
+     * Safe with nothing running, and that case is not a no-op: a service left alive with no
+     * session — a sticky restart, an FGS the host never stopped — is exactly what this has
+     * to be able to kill.
+     *
+     * @return the session that was closed, or `null` if none was open.
+     */
+    suspend operator fun invoke(): TrackSession? {
+        val current = sessions.current()
 
         // Order matters: stop feeding the channel, then close the session, so no point
         // is written after the session it belongs to has ended (EC-73).
+        //
+        // The gate comes down first of all: it is the one component that can *restart* the
+        // stream, and a provider recovery landing between `release()` and `ingestor.stop()`
+        // would re-register a request for a session about to close.
+        captureGate.disarm()
         streamController.release()
         motionController.stop()
         ingestor.onAcceptedPoint = null
         ingestor.onTurnBurst = null
+        ingestor.onObservedSpeed = null
         ingestor.stop()
 
         // Sensors and system-registered wakes come down in the SAME teardown as the
         // location stream. Anything left armed here is silent battery drain (EC-138).
         stepCorroborator.stop()
+        // Unconditional, unlike the arming side: a config that disabled prediction *this*
+        // session says nothing about whether the previous one left a gyroscope open.
+        gyroTurnMonitor.stop()
+        gyroTurnMonitor.onTurning = null
+        ingestor.gyroTurning = false
         activityRecognizer.unregister()
         significantMotion.disarm()
         watchdog.reset()
-        BackstopWorker.cancel(context)
-        TrackingService.stop(context)
 
-        val closed = sessions.close(current.id)
+        // Both workers, and both before the session row is closed.
+        //
+        // `RestoreWorker` is the one that used to bite: it re-promotes the service whenever
+        // it finds an open session, so an expedited request already in flight would restart
+        // the service on its way out and leave the notification up until the next health
+        // tick — up to `healthLoopMs` later — noticed there was nothing to supervise.
+        BackstopWorker.cancel(context)
+        RestoreWorker.cancel(context)
+
+        // Closed BEFORE the service is told to stop, which is the reverse of the original
+        // order and the reason a stopped session could come back. Every resurrection path
+        // in the SDK — `RestoreWorker`, `BootReceiver`, the health loop — gates on
+        // `sessions.current()`, so closing first means none of them can act on the window
+        // between the two calls. The ingest path is already stopped above, so EC-73 still
+        // holds.
+        val closed = current?.let { sessions.close(it.id) }
+
+        TrackingService.stop(context)
+        return closed
+    }
+}
+
+/**
+ * Closes the session and tears the pipeline down.
+ *
+ * `Ok(null)` when no session was open — but the teardown still runs, because "no session"
+ * and "nothing running" are different states and the second is not implied by the first
+ * (EC-74).
+ */
+public class StopTrackingUseCase internal constructor(
+    private val teardown: SessionTeardown,
+    private val syncScheduler: SyncScheduler,
+    private val events: MutableSharedFlow<TrackerEvent>,
+) {
+    public suspend operator fun invoke(): TrackerResult<TrackSession?> {
+        val closed = teardown()
 
         // After the close, and after the backstop is already cancelled: every supervision
         // path in core has now stopped, so this is the last chance to leave a
@@ -231,7 +385,10 @@ public class StopTrackingUseCase internal constructor(
         // connectivity returns (G-4).
         syncScheduler.onSessionClosed()
 
-        events.tryEmit(TrackerEvent.EnabledChange(enabled = false))
+        // Only when something actually ended. A stop() called against an already-stopped
+        // SDK still sweeps up a stale service, but announcing a transition that did not
+        // happen would have hosts mirroring `isTracking` react to nothing.
+        if (closed != null) events.tryEmit(TrackerEvent.EnabledChange(enabled = false))
         return TrackerResult.Ok(closed)
     }
 }

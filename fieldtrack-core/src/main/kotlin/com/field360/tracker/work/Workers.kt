@@ -132,6 +132,21 @@ internal class RestoreWorker(
             WorkManager.getInstance(context)
                 .enqueueUniqueWork(NAME, ExistingWorkPolicy.REPLACE, request)
         }
+
+        /**
+         * Cancels a pending re-promotion.
+         *
+         * Part of every session teardown, and not optional. This worker exists to restart
+         * a service that died with a session still open, and it decides that from
+         * `sessions.current()` at the moment it runs. An expedited request enqueued moments
+         * before a stop would therefore find the session still open — the close and the
+         * service stop cannot be one atomic act — and put the foreground notification back
+         * up for a session that had just ended, where it sat until the next health tick
+         * noticed, up to two minutes later.
+         */
+        fun cancel(context: Context) {
+            WorkManager.getInstance(context).cancelUniqueWork(NAME)
+        }
     }
 }
 
