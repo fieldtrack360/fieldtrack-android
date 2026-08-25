@@ -172,7 +172,7 @@ fun TrackScreen(
         }
 
         if (track != null && track.points.isNotEmpty()) {
-            TrackSummary(track, state.rawFixes.size)
+            TrackSummary(track, state.rawFixes.size, state.rawFixesEnabled, state.rawFixesError)
         } else {
             Text(
                 text = "Showing ${state.geofences.size} registered geofence(s); no track selected.",
@@ -534,7 +534,7 @@ private fun mapBounds(track: Track?, geofences: List<TrackerGeofence>): LatLngBo
 }
 
 @Composable
-private fun TrackSummary(track: Track, rawFixCount: Int) {
+private fun TrackSummary(track: Track, rawFixCount: Int, enabled: Boolean, error: String?) {
     Column(Modifier.fillMaxWidth().padding(16.dp)) {
         Text(
             text = "Track · session ${track.sessionId?.take(8) ?: "—"}",
@@ -553,9 +553,21 @@ private fun TrackSummary(track: Track, rawFixCount: Int) {
             )
         } else {
             // Says why the chip above is greyed out. Without this the disabled control is
-            // a dead end.
+            // a dead end — but the wrong reason is worse than none, and this used to give
+            // one: it told you to enable a flag that the sample already sets, which sends
+            // you to re-read config instead of at the session you are looking at.
             Text(
-                text = "Raw layer empty — set persistence.persistRawFixes = true to record it.",
+                text = when {
+                    error != null ->
+                        "Raw layer could not be read: $error"
+                    !enabled ->
+                        "Raw layer off — set persistence.persistRawFixes = true to record it."
+                    else ->
+                        "Raw layer empty for this session. persistRawFixes IS on, so this " +
+                            "session was recorded before it was enabled — raw fixes are " +
+                            "written during capture and cannot be backfilled. Record a new " +
+                            "session to populate it."
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error,
             )

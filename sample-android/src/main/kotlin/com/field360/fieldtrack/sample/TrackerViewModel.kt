@@ -102,6 +102,8 @@ class TrackerViewModel(
     private val transportAvailable: Boolean = true,
     /** The `device_id` going out in every request envelope, for display. */
     private val deviceId: String = "",
+    /** What the host passed to `persistRawFixes()`. The SDK exposes no way to read it back. */
+    private val persistRawFixes: Boolean = false,
     /**
      * Re-runs `configure()` with the given session id in `extraParams`.
      *
@@ -157,6 +159,17 @@ class TrackerViewModel(
         val error: String? = null,
         val points: List<TrackPoint> = emptyList(),
         val rawFixes: List<RawFix> = emptyList(),
+        /**
+         * Whether `persistence.persistRawFixes` was actually configured, and why the last
+         * read of the layer came back empty.
+         *
+         * Both exist because "no raw fixes" has three causes that look identical on
+         * screen: the flag is off, the flag is on but this session was recorded before it
+         * was, or the query threw. Telling a developer to enable a setting that is already
+         * enabled is the failure mode worth designing out.
+         */
+        val rawFixesEnabled: Boolean = false,
+        val rawFixesError: String? = null,
         val decisions: List<FixDecision> = emptyList(),
         val track: Track? = null,
         val log: List<String> = emptyList(),
@@ -996,8 +1009,7 @@ class TrackerViewModel(
      */
     private suspend fun dumpSession(sessionId: String?) {
         val query = PointQuery(sessionId = sessionId, limit = MAX_POINTS)
-        val raw = sessionId?.let { runCatching { tracker.getRawFixes(it) }.getOrDefault(emptyList()) }
-            ?: emptyList()
+        val raw = loadRawFixes(sessionId)
         captureLog.sessionDump(
             sessionId = sessionId,
             rawFixes = raw,
@@ -1005,6 +1017,34 @@ class TrackerViewModel(
             points = tracker.getPoints(query),
         )
         refreshLogStats()
+    }
+
+    /**
+     * Layer 1, with the reason it is empty kept rather than thrown away.
+     *
+     * `runCatching { … }.getOrDefault(emptyList())` was silently turning a failed query
+     * into "no raw fixes recorded", which is the one answer that sends you to check a
+     * setting instead of the exception. Empty and broken are now different states.
+     */
+    private suspend fun loadRawFixes(sessionId: String?): List<RawFix> {
+        if (sessionId == null) {
+            _state.update { it.copy(rawFixesEnabled = persistRawFixes, rawFixesError = null) }
+            return emptyList()
+        }
+        return runCatching { tracker.getRawFixes(sessionId) }
+            .onSuccess {
+                _state.update { s -> s.copy(rawFixesEnabled = persistRawFixes, rawFixesError = null) }
+            }
+            .getOrElse { failure ->
+                _state.update { s ->
+                    s.copy(
+                        rawFixesEnabled = persistRawFixes,
+                        rawFixesError = "${failure::class.simpleName}: ${failure.message}",
+                        log = (listOf("getRawFixes failed: ${failure.message}") + s.log).take(LOG_LIMIT),
+                    )
+                }
+                emptyList()
+            }
     }
 
     /** Every session ever recorded, newest first. */
@@ -1025,7 +1065,7 @@ class TrackerViewModel(
         val points = tracker.getPoints(query)
         val track = tracker.buildTrack(query, trackOptions())
         val decisions = tracker.getDecisions(sessionId, limit = MAX_DECISIONS)
-        val raw = runCatching { tracker.getRawFixes(sessionId) }.getOrDefault(emptyList())
+        val raw = loadRawFixes(sessionId)
 
         captureLog.note("OPEN", "session=$sessionId points=${points.size} segments=${track.segments.size}")
         // Dump on open, not only on stop. Diagnosing a drive means looking at it *after*
@@ -1074,8 +1114,7 @@ class TrackerViewModel(
 
         val points = tracker.getPoints(query)
         val decisions = tracker.getDecisions(sessionId, limit = MAX_DECISIONS)
-        val raw = sessionId?.let { runCatching { tracker.getRawFixes(it) }.getOrDefault(emptyList()) }
-            ?: emptyList()
+        val raw = loadRawFixes(sessionId)
         val track = tracker.buildTrack(query, trackOptions())
         val geofences = tracker.getGeofences()
 
@@ -1183,6 +1222,7 @@ class TrackerViewModel(
                     syncConfigError = app.syncConfigError,
                     transportAvailable = app.syncTransportAvailable,
                     deviceId = app.deviceId,
+                    persistRawFixes = SampleApplication.PERSIST_RAW_FIXES,
                     onSessionChanged = app::installSync,
                 )
             }

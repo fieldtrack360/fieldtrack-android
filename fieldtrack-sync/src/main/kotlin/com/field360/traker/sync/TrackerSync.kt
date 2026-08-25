@@ -22,14 +22,10 @@ import com.field360.traker.sync.internal.SyncService
 import com.field360.traker.sync.internal.jsonParamOrNull
 import java.net.URI
 import java.util.concurrent.TimeUnit
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
-import kotlinx.coroutines.launch
 
 /**
  * @property autoSync upload as points arrive. With it off, the host calls [TrackerSync.syncNow].
@@ -362,20 +358,24 @@ public class TrackerSync internal constructor(
     private var haltedReason: String? = null
 
     /**
-     * Where the connectivity callback's work lands. Its own scope rather than the
-     * caller's: the callback arrives on a platform thread with no scope of its own, and
-     * the queue lookup it needs is a database read that must not run there.
-     *
-     * `SupervisorJob` so a failed lookup cannot cancel the scope and silently retire the
-     * connectivity path for the rest of the process.
-     */
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
-    /**
      * The prompt half of "upload when the network comes back" — see [NetworkMonitor] for
      * why the durable half ([SyncWorker]'s network constraint) is not sufficient alone.
+     *
+     * The queue check and the coroutine it needs live inside the monitor rather than here,
+     * for a release-build reason its KDoc spells out: a suspend lambda written in this
+     * class reads this class's private fields, and R8 then cannot repackage the class it
+     * compiles to out of the published API package.
      */
-    private val networkMonitor = NetworkMonitor(context, logger) { onNetworkUsable() }
+    private val networkMonitor = NetworkMonitor(
+        context = context,
+        logger = logger,
+        queue = queue,
+        isUploadable = { config != null && haltedReason == null },
+        onQueued = { queued ->
+            eventSink.tryEmit(SyncEvent.NetworkAvailable(queued))
+            requestSync()
+        },
+    )
 
     /**
      * What the server said, one event per exchange — including the exchanges the host did
@@ -441,27 +441,9 @@ public class TrackerSync internal constructor(
             // while already online is itself a rising edge and drains any backlog left
             // over from a previous run. When the platform refuses to watch at all, that
             // one check still has to happen — so make it by hand.
-            if (!networkMonitor.start(resolved.requiresUnmeteredNetwork)) onNetworkUsable()
-        }
-    }
-
-    /**
-     * A usable network appeared. Ask for a drain, but only if there is anything to drain.
-     *
-     * The queue lookup is what keeps this from being a wake-up call: a reconnection with
-     * an empty queue is the overwhelmingly common case on a device that is mostly online,
-     * and enqueueing a worker to discover that costs a process start for nothing.
-     */
-    private fun onNetworkUsable() {
-        scope.launch {
-            if (config == null || haltedReason != null) return@launch
-
-            val queued = runCatching { queue.pendingCount() }.getOrDefault(0)
-            if (queued == 0) return@launch
-
-            sdkLog { logger.d(TAG, "Network back with $queued row(s) queued; requesting a drain") }
-            eventSink.tryEmit(SyncEvent.NetworkAvailable(queued))
-            requestSync()
+            if (!networkMonitor.start(resolved.requiresUnmeteredNetwork)) {
+                networkMonitor.drainIfQueued()
+            }
         }
     }
 

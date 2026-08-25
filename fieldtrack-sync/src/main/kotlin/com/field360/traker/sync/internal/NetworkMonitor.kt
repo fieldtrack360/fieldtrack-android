@@ -6,7 +6,12 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.SystemClock
 import com.field360.traker.geo.port.TrackLogger
+import com.field360.traker.sync.SyncQueue
 import com.field360.traker.sync.sdkLog
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 /**
  * Drains the queue the moment the device is back on a usable network.
@@ -44,10 +49,32 @@ import com.field360.traker.sync.sdkLog
 internal class NetworkMonitor(
     private val context: Context,
     private val logger: TrackLogger,
-    private val onUsable: () -> Unit,
+    private val queue: SyncQueue,
+    /** False once a 401/403 has torn the configuration down; nothing should be drained then. */
+    private val isUploadable: () -> Boolean,
+    /** Rows are waiting and the network is usable — ask for a drain. */
+    private val onQueued: (Int) -> Unit,
 ) {
 
     private val edge = RisingEdge()
+
+    /**
+     * Where the queue lookup runs.
+     *
+     * **The coroutine lives here rather than in `TrackerSync`, and that is load-bearing
+     * rather than tidiness.** A suspend lambda compiles to a real class named after its
+     * enclosing declaration, and one written inside `TrackerSync` would read that class's
+     * private fields — which makes Kotlin emit package-private `access$` bridges on it.
+     * `TrackerSync` is pinned to the published API package by a `-keep` rule, and without
+     * `-allowaccessmodification` R8 cannot widen those bridges, so it cannot repackage the
+     * lambda either: the shrunken class stays behind as `com.field360.traker.sync.a`, and
+     * `verifyReleaseObfuscation` fails the release for leaking an implementation class into
+     * an API package. Born in this package, the same lambda repackages with everything else.
+     *
+     * `SupervisorJob` so a failed lookup cannot cancel the scope and silently retire the
+     * connectivity path for the rest of the process.
+     */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private var manager: ConnectivityManager? = null
     private var callback: ConnectivityManager.NetworkCallback? = null
@@ -127,8 +154,29 @@ internal class NetworkMonitor(
         // entirely capable of arriving together, and a throttle measured against a clock
         // that just jumped backwards would latch for as long as the jump.
         if (!edge.rose(usable, SystemClock.elapsedRealtime())) return
-        sdkLog { logger.d(TAG, "Network usable again; asking for a drain") }
-        onUsable()
+        drainIfQueued()
+    }
+
+    /**
+     * Ask for a drain, but only if there is anything to drain.
+     *
+     * The queue lookup is what keeps this from being a wake-up call: a reconnection with an
+     * empty queue is the overwhelmingly common case on a device that is mostly online, and
+     * enqueueing a worker to discover that costs a process start for nothing.
+     *
+     * Also called directly by the host when the platform refused to report connectivity at
+     * all — that one check still has to happen, so it is made by hand.
+     */
+    fun drainIfQueued() {
+        scope.launch {
+            if (!isUploadable()) return@launch
+
+            val queued = runCatching { queue.pendingCount() }.getOrDefault(0)
+            if (queued == 0) return@launch
+
+            sdkLog { logger.d(TAG, "Network back with $queued row(s) queued; requesting a drain") }
+            onQueued(queued)
+        }
     }
 
     private companion object {

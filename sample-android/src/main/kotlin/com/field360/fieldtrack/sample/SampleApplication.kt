@@ -1,6 +1,7 @@
 package com.field360.fieldtrack.sample
 
 import android.app.Application
+import android.os.Build
 import com.field360.tracker.AccuracyProfile
 import com.field360.tracker.LocationProviderType
 import com.field360.tracker.Tracker
@@ -88,14 +89,14 @@ class SampleApplication : Application() {
                     .provider(LocationProviderType.FUSED)
                     // The accuracy meter. BALANCED is the engine's own 30 m moving ceiling;
                     // STRICT (20 m) trades points for a line that never zigzags.
-                    .accuracyProfile(AccuracyProfile.BALANCED)
+                    .accuracyProfile(AccuracyProfile.STRICT)
                     // Raw fixes are layer 1 of the debug overlay. Off by default in the
                     // SDK because it is a diagnostic, not production behavior — but the
                     // sample exists precisely to diagnose (spec §8.4).
-                    .persistRawFixes(true)
+                    .persistRawFixes(PERSIST_RAW_FIXES)
                     // Layer 3: every judged fix in point form, so a missing point can
                     // be compared against the ones that made it (v6).
-                    .persistRawPoints(true)
+                    .persistRawPoints(PERSIST_RAW_POINTS)
                     .build(),
             )
         }
@@ -184,7 +185,7 @@ class SampleApplication : Application() {
                     // not guaranteed to belong to one session.
                     .extraParams(
                         buildMap {
-                            put("device_id", identity.deviceId)
+                            put("device_id", "Google pixel 4A")
                             // Omitted rather than sent null while no session is open:
                             // `null` is not a supported extraParams value, and a literal
                             // "none" would be a session id the server could index on.
@@ -224,5 +225,20 @@ class SampleApplication : Application() {
                     .build(),
             ),
         )
+    }
+
+    companion object {
+        /**
+         * Layer 1 of the debug overlay: every fix as the OS delivered it, before any gate.
+         *
+         * A named constant rather than a literal in the builder because the UI has to
+         * state the same fact and there is no way to read it back — `Tracker` exposes no
+         * resolved config. Two places asserting "raw fixes are on" from two sources is how
+         * a screen ends up telling you to enable something that is already enabled.
+         */
+        const val PERSIST_RAW_FIXES: Boolean = true
+
+        /** Layer 3: every judged fix in point form, accepted or not. */
+        const val PERSIST_RAW_POINTS: Boolean = true
     }
 }

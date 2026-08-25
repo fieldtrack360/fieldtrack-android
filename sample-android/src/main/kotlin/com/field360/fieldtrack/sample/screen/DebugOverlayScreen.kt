@@ -69,7 +69,11 @@ fun DebugOverlayScreen(
         if (state.points.isEmpty() && state.rawFixes.isEmpty()) {
             Centered(
                 "Nothing captured in this session.\n\n" +
-                        "Raw fixes need persistence.persistRawFixes = true.",
+                    if (state.rawFixesEnabled) {
+                        "persistRawFixes is on, so a session recorded now will have a raw layer."
+                    } else {
+                        "Raw fixes need persistence.persistRawFixes = true."
+                    },
             )
             return@Column
         }
@@ -95,8 +99,19 @@ fun DebugOverlayScreen(
                 )
             }
             if (state.rawFixes.isEmpty()) {
+                // The reason matters more than the fact. Naming a flag that is already
+                // set sends the reader to re-read config instead of at this session.
                 Text(
-                    "Raw layer empty — enable persistence.persistRawFixes to record it.",
+                    when {
+                        state.rawFixesError != null ->
+                            "Raw layer could not be read: ${state.rawFixesError}"
+                        !state.rawFixesEnabled ->
+                            "Raw layer off — enable persistence.persistRawFixes to record it."
+                        else ->
+                            "Raw layer empty for this session. persistRawFixes IS on, so " +
+                                "this session predates it — raw fixes are written during " +
+                                "capture and cannot be backfilled."
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )
