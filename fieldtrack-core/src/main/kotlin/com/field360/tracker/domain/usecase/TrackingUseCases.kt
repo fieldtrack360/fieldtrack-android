@@ -198,6 +198,7 @@ public class StopTrackingUseCase internal constructor(
     private val activityRecognizer: ActivityRecognizer,
     private val significantMotion: SignificantMotionWake,
     private val watchdog: Watchdog,
+    private val syncScheduler: SyncScheduler,
     private val context: Context,
     private val events: MutableSharedFlow<TrackerEvent>,
 ) {
@@ -222,6 +223,13 @@ public class StopTrackingUseCase internal constructor(
         TrackingService.stop(context)
 
         val closed = sessions.close(current.id)
+
+        // After the close, and after the backstop is already cancelled: every supervision
+        // path in core has now stopped, so this is the last chance to leave a
+        // network-constrained drain enqueued for anything the session recorded offline.
+        // WorkManager persists it, so it survives the process being killed and fires when
+        // connectivity returns (G-4).
+        syncScheduler.onSessionClosed()
 
         events.tryEmit(TrackerEvent.EnabledChange(enabled = false))
         return TrackerResult.Ok(closed)

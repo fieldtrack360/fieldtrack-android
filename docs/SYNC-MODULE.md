@@ -88,15 +88,20 @@ sync.configure(
 
 ### 3.2 Triggering
 
-Three paths lead to an upload:
+Four paths lead to an upload:
 
 1. **autoSync (default on).** `configure()` registers a `SyncTrigger` with core. Core fires
-   it when a point is accepted and from its supervision loops when rows are queued or the
-   last upload has gone stale. Each firing calls `requestSync()`.
-2. **`requestSync()`.** Enqueues a network-constrained one-shot `SyncWorker`. Safe to call
+   it when a point is accepted, from its supervision loops when rows are queued or the last
+   upload has gone stale, and once more when a session closes. Each firing calls
+   `requestSync()`.
+2. **Connectivity (autoSync only).** `configure()` also registers a
+   `ConnectivityManager.registerDefaultNetworkCallback`. When the device returns to a
+   *usable* network with rows queued, a drain is requested. See §3.5 — this is the path
+   that empties a queue recorded in a tunnel, a basement or on a plane.
+3. **`requestSync()`.** Enqueues a network-constrained one-shot `SyncWorker`. Safe to call
    often: unique work with `ExistingWorkPolicy.KEEP`, so a burst of accepted points cannot
    reset the backoff clock and hammer a struggling server. A no-op while halted by a 403.
-3. **`syncNow()`.** Drains inline in the caller's coroutine scope and returns the result.
+4. **`syncNow()`.** Drains inline in the caller's coroutine scope and returns the result.
    For user-initiated refresh; an upload started from a `viewModelScope` is cancelled with
    it. Prefer `requestSync()` for anything not user-initiated.
 
@@ -130,6 +135,49 @@ the result to **1 second – 6 hours**. Unparseable, negative or already-past va
 
 Network constraint: `CONNECTED` by default, `UNMETERED` when
 `requiresUnmeteredNetwork(true)`.
+
+### 3.5 Coming back online
+
+Offline capture is the normal case, not the exception, so recovering from it has two
+halves. They are not redundant — neither covers the other's failure.
+
+**The durable half — `SyncWorker`'s network constraint.** WorkManager persists the request
+in its own database and releases it when the constraint is met, so an enqueued drain
+survives process death and reboot. What it cannot do is resurrect itself: the constraint
+only holds back work that is *already enqueued*, and a drain that has already finished
+leaves nothing for connectivity to release. Three places therefore make sure something is
+always left waiting when it matters — the 15-minute `BackstopWorker` and the health loop
+both run their supervision tick whether or not a session is open, and `stopTracking()`
+leaves a final network-constrained drain enqueued if any rows are still queued.
+
+**The prompt half — `NetworkMonitor`.** While the process is alive, a network transition
+asks for a drain directly rather than waiting for the next accepted point (up to a minute)
+or the next supervision tick (up to fifteen). Details that matter:
+
+- **`registerDefaultNetworkCallback`, not `CONNECTIVITY_ACTION`.** That broadcast is
+  deprecated since API 28 and has been unavailable to manifest-declared receivers since
+  API 24 — a background app never sees it. The default-network callback also reports only
+  the network the process would actually use, so a Wi-Fi/cellular handover is one
+  transition rather than an interleaved pair across two networks.
+- **Validated, not merely connected.** A captive portal answers with
+  `NET_CAPABILITY_INTERNET` and then intercepts the upload. `NET_CAPABILITY_VALIDATED` is
+  what distinguishes "attached to a network" from "packets reach the internet".
+- **Metered-aware.** Under `requiresUnmeteredNetwork(true)`, losing Wi-Fi is a falling
+  edge, so re-joining it later is a rising one.
+- **Rising edges, throttled 15 s.** `onCapabilitiesChanged` fires for signal strength and
+  link speed — many times a minute in a moving vehicle. Only unusable → usable counts, and
+  a flapping validation on a weak network produces one request rather than a burst.
+- **Queue-gated.** The queue depth is read before anything is enqueued: a reconnection
+  with an empty queue is the common case and is not worth a worker.
+- **autoSync only.** With `autoSync(false)` the host owns the schedule, and a drain it did
+  not ask for is a surprise request against its own credential.
+- **Stopped by 401 and 403.** A halted uploader that still drains on every reconnection is
+  the same retry loop by a different door.
+- **Never fatal.** No `ConnectivityManager`, a vendor that throws, or the platform's
+  100-callback-per-process limit all degrade to "durable half only" — which is exactly the
+  behaviour that shipped before this existed.
+
+Requires `ACCESS_NETWORK_STATE`, declared by the AAR and merged into the host manifest.
 
 ---
 
@@ -185,6 +233,33 @@ Values may be a string, boolean, number, or a map/list of those; types are prese
 than stringified. `SyncConfig.validate()` rejects anything unserializable at `configure()`
 time, so a drain never discovers a config problem. With no extra params the encoder takes
 its original path and the body is byte-identical to earlier releases.
+
+#### What an envelope field can and cannot say
+
+`extraParams` is fixed when `configure()` runs and describes the **whole batch**. Both
+facts constrain what belongs there.
+
+A value that changes needs `configure()` to run again — there is no per-drain hook. The
+sample does exactly this for `session_id`, re-configuring on every session change.
+
+More importantly, a batch is `pending(batchSize)`: oldest rows first, **across every unsent
+session**. So a per-batch field is only truthful if it is genuinely true of every row in it:
+
+| Field | Envelope-safe? | Why |
+|---|---|---|
+| `user_id`, `device_id`, an auth token | ✅ | Constant for the install. Every row in every batch shares it. |
+| `app_version`, `platform` | ⚠️ | True of the *uploader*, not necessarily of the row — an old queued row may predate an upgrade. |
+| `session_id` | ❌ for a backlog | A device that recorded three sessions offline uploads all three under whichever session was current at the last `configure()`. |
+
+`SyncPoint` carries no session id of its own, so nothing downstream can correct a
+mislabelled envelope. A top-level `session_id` is right when the queue drains before each
+session ends — which for a mostly-online device it effectively does — and wrong for exactly
+the offline backlog this SDK exists to survive.
+
+If per-row session attribution matters, do not solve it here. Either drain and confirm
+before closing a session, or carry the id on each point: `TrackPoint.sessionId` is already
+stored on every row, and a custom `SyncTransport` can rewrite the body to hoist it per
+point without changing the SDK.
 
 One point:
 
@@ -302,7 +377,13 @@ val result = sync.syncNow()   // Uploaded(n) | Empty | Retry | AuthExpired | For
 // nobody is watching:
 scope.launch {
     sync.events.collect { event ->            // SharedFlow, replay = 1
-        // SyncEvent.HttpResponse(statusCode: Int?, count: Int)
+        when (event) {
+            // One per completed exchange — a three-batch drain emits three.
+            is SyncEvent.HttpResponse -> log(event.statusCode, event.count)
+            // The device came back online with rows queued and a drain was requested.
+            // Rising edge only, never with an empty queue, process-lifetime only (§3.5).
+            is SyncEvent.NetworkAvailable -> showSyncing(event.queued)
+        }
     }
 }
 
@@ -383,15 +464,25 @@ read 30 s, write 20 s — override per-config via `SyncConfig.timeouts`.
 1. **Payload shape** — point at a local server (`10.0.2.2` from the emulator; cleartext
    exempt) and inspect the JSON.
 2. **Offline resilience** — kill the network mid-drain: rows stay queued, WorkManager
-   retries on reconnect.
-3. **401** — return it once: tracking stops, queue clears, `isConfigured == false`.
-4. **403** — return it once: uploads halt, rows kept, `requestSync()` no-ops until
+   retries on reconnect. Batches that already succeeded stay marked synced.
+3. **Reconnect while running** — airplane mode on, drive/simulate until rows accumulate,
+   airplane mode off. A `SyncEvent.NetworkAvailable` arrives within seconds and the queue
+   drains without waiting for the next accepted point.
+4. **Reconnect after the process is gone** — airplane mode on, capture, `stop()`,
+   force-stop the app, airplane mode off. `NetworkMonitor` cannot help here; the drain
+   `stopTracking()` left enqueued is what runs (§3.5). Confirm the rows arrive.
+5. **Captive portal** — join a Wi-Fi network with a sign-in page. Nothing should be
+   attempted until it is validated: an unvalidated network is not a rising edge.
+6. **Handover** — drive out of Wi-Fi range onto cellular with `requiresUnmeteredNetwork`
+   both `false` (uploads continue) and `true` (queue parks until Wi-Fi returns).
+7. **401** — return it once: tracking stops, queue clears, `isConfigured == false`.
+8. **403** — return it once: uploads halt, rows kept, `requestSync()` no-ops until
    re-`configure()`.
-5. **429 + `Retry-After: 120`** — next drain arrives ~120 s later, not 30 s.
-6. **Duplicate delivery** — force a 500 after the server stored the batch: the retry
+9. **429 + `Retry-After: 120`** — next drain arrives ~120 s later, not 30 s.
+10. **Duplicate delivery** — force a 500 after the server stored the batch: the retry
    re-sends it; confirm the server dedupes on `uuid`.
-7. **Provider snapshot** — revoke background location mid-session, or toggle airplane mode:
+11. **Provider snapshot** — revoke background location mid-session, or toggle airplane mode:
    points captured after the change carry the new `provider.status` / `provider.airplane`
    while earlier points in the same batch keep the old one.
-8. **Mock fixes** — push a fake route from a mock-location app on a debug build: points
+12. **Mock fixes** — push a fake route from a mock-location app on a debug build: points
    arrive with `is_mock: true`. The same build in release drops them.

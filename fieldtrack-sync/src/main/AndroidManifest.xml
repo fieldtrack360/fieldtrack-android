@@ -1,4 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+      Read by NetworkMonitor, so the queue drains the moment the device is back on a
+      usable network rather than waiting for the next accepted point.
+
+      Also declared by fieldtrack-core, which this module depends on, so the merge is a
+      no-op in practice. Declared here anyway: the permission is used by code in THIS
+      artifact, and a manifest that relies on a dependency to request what its own classes
+      call is one refactor away from a SecurityException.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 </manifest>

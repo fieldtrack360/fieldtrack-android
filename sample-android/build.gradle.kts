@@ -43,6 +43,24 @@ val mapsApiKey: String = localProperties.getProperty("MAPS_API_KEY", "")
 val osrmBaseUrl: String = localProperties.getProperty("OSRM_BASE_URL", "")
 
 /**
+ * Upload endpoint for `TrackerSync`, from `local.properties` — e.g.
+ * `SYNC_URL=https://api.example.com/locations`.
+ *
+ * The **full** endpoint, not a base: `SyncConfig.url` is what the batch is POSTed to.
+ *
+ * Blank by default and blank is a working configuration — the sample configures no
+ * upload half, points accumulate in Room, and nothing opens a socket. That is the
+ * offline-first default the SDK is built around, so it has to keep working with this
+ * unset.
+ *
+ * In `local.properties` rather than committed here for the same reason the Maps key is:
+ * an upload endpoint is per-developer, and a dev tunnel URL in particular is ephemeral
+ * and personal. Unlike the Maps key it is not a credential — but a committed default that
+ * points at somebody's laptop is a default that silently 404s for everyone else.
+ */
+val syncUrl: String = localProperties.getProperty("SYNC_URL", "")
+
+/**
  * Optional Tracker release license token, from `local.properties` — e.g.
  * `TRACKER_LICENSE=TRACKIT-...`.
  *
@@ -67,6 +85,7 @@ android {
         manifestPlaceholders["TRACKER_LICENSE"] = trackerLicense
         buildConfigField("String", "MAPS_API_KEY", "\"$mapsApiKey\"")
         buildConfigField("String", "OSRM_BASE_URL", "\"$osrmBaseUrl\"")
+        buildConfigField("String", "SYNC_URL", "\"$syncUrl\"")
         buildConfigField("String", "TRACKER_LICENSE", "\"$trackerLicense\"")
     }
 
@@ -125,6 +144,13 @@ dependencies {
     // provider supplies the client — that is the artifact's whole bargain: no host
     // inherits an HTTP stack it did not ask for.
     implementation(libs.okhttp)
+
+    // The same bargain in fieldtrack-sync: OkHttpSyncTransport runs Retrofit over the
+    // client above, and both are compileOnly there. Stated explicitly rather than left to
+    // fieldtrack-core's transitive `implementation` of them — that puts Retrofit on the
+    // runtime classpath by accident, and the failure when it stops doing so is
+    // `defaultTransport()` silently degrading to NoOpTransport at configure() time.
+    implementation(libs.retrofit)
 
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.material3)

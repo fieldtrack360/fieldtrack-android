@@ -114,6 +114,35 @@ internal class SyncScheduler(
         active.requestSync()
     }
 
+    /**
+     * The session just closed — the last moment anything in core is still watching.
+     *
+     * **Bypasses the throttle, deliberately.** [onAcceptedPoint] fires at most once a
+     * minute, so a session that ends within a minute of its last stored point leaves
+     * nothing scheduled. That would be survivable if some later tick noticed, and none
+     * does: `StopTrackingUseCase` cancels the backstop and stops the service the health
+     * loop runs in, so both supervision paths die with the session.
+     *
+     * What this actually buys is not the request but its residue. `requestSync()`
+     * enqueues network-constrained work that WorkManager persists in its own database, so
+     * a queue recorded offline drains when connectivity returns *even if the process is
+     * killed first* — which is the case `NetworkMonitor` in `fieldtrack-sync` cannot
+     * cover, because a dead process has no callbacks.
+     *
+     * Still asks the queue first: a session that ended with everything uploaded should
+     * leave no work behind at all.
+     */
+    suspend fun onSessionClosed() {
+        val active = trigger ?: return
+
+        val pending = runCatching { queue.pendingCount() }.getOrDefault(0)
+        if (pending == 0) return
+
+        lastRequestMs = clock.wallTimeMs()
+        sdkLog { logger.d(TAG, "Session closed with $pending row(s) queued; leaving a drain scheduled") }
+        active.requestSync()
+    }
+
     private companion object {
         const val TAG = "SyncScheduler"
         const val MIN_REQUEST_INTERVAL_MS = 60_000L

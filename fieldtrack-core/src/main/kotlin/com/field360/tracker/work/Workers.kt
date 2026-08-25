@@ -52,13 +52,17 @@ internal class BackstopWorker(
 
     override suspend fun doWork(): Result {
         val deps = applicationContext.trackItGraph()
+
+        // Runs whether or not a fix arrives, and — the part that was wrong — whether or
+        // not a session is open. This is the only supervision that survives a dead
+        // service, so it is the one thing that can notice a backlog left behind by a
+        // drain that failed while the process was gone (spec §12.2 check 3). Below the
+        // session check it could never do that: a closed session is exactly the state a
+        // stranded queue is left in.
+        deps.syncScheduler.onSupervisionTick()
+
         val session = deps.sessions.current() ?: return Result.success()
         val config = deps.config.load() ?: TrackerConfig()
-
-        // Runs whether or not a fix arrives. This is the only supervision that survives a
-        // dead service, so it is the one thing that can notice a backlog left behind by a
-        // drain that failed while the process was gone (spec §12.2 check 3).
-        deps.syncScheduler.onSupervisionTick()
 
         // Through OneShotProvider, not the raw source: it carries the timeout, the
         // retry cap and the mutex that stops a coincident activity-transition capture

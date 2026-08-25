@@ -25,7 +25,11 @@ import com.field360.traker.geo.model.MotionState
 import com.field360.traker.geo.model.TrackPoint
 import com.field360.traker.geo.plot.model.Track
 import com.field360.traker.geo.plot.model.TrackOptions
+import com.field360.traker.sync.SyncEvent
+import com.field360.traker.sync.SyncQueue
+import com.field360.traker.sync.TrackerSync
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -63,6 +67,26 @@ data class LicenseAlert(
 )
 
 /**
+ * Why uploads are not happening, in the sample's own words.
+ *
+ * A developer's alert, like [LicenseAlert] — it names the HTTP status and the SDK's own
+ * behaviour rather than translating either into something a customer would read.
+ *
+ * @property terminal nothing will upload until something *changes* — a credential, a URL,
+ *   a dependency. Distinguished from a transient failure because the two deserve opposite
+ *   reactions: a 500 or a dead network is the retry loop working as designed and needs no
+ *   one's attention, while a 403 means the loop has stopped and will not restart on its
+ *   own. Collapsing them trains you to ignore the ones that matter.
+ * @property queued rows waiting when the alert was raised.
+ */
+data class SyncAlert(
+    val headline: String,
+    val detail: String,
+    val terminal: Boolean,
+    val queued: Int,
+)
+
+/**
  * One view model over the whole SDK surface.
  *
  * Deliberately thin: the sample exists to exercise `Tracker`, not to demonstrate app
@@ -70,8 +94,40 @@ data class LicenseAlert(
  */
 class TrackerViewModel(
     private val tracker: Tracker,
+    private val sync: TrackerSync,
     private val captureLog: CaptureLog,
+    /** Why `configure()` was rejected at startup, or null. See `SampleApplication`. */
+    private val syncConfigError: String? = null,
+    /** Whether Retrofit and OkHttp are actually linked. See `SampleApplication`. */
+    private val transportAvailable: Boolean = true,
+    /** The `device_id` going out in every request envelope, for display. */
+    private val deviceId: String = "",
+    /**
+     * Re-runs `configure()` with the given session id in `extraParams`.
+     *
+     * A lambda rather than the `Application` itself: a view model holding a Context is how
+     * one outlives the process it came from, and this needs exactly one capability from it.
+     */
+    private val onSessionChanged: (String?) -> Unit = {},
 ) : ViewModel() {
+
+    /** The session id currently baked into `SyncConfig.extraParams`. */
+    private var configuredSessionId: String? = null
+
+    /** Wall clock of the last confirmed upload, for the stalled-queue check. */
+    private var lastSyncOkAtMs: Long = System.currentTimeMillis()
+
+    /** Reset by any 2xx. A run of these is what promotes a transient failure to an alert. */
+    private var consecutiveSyncFailures: Int = 0
+
+    /**
+     * A fault that will not clear on its own is standing. Survives dismissing the dialog,
+     * because the dialog is the notification and this is the condition.
+     */
+    private var syncTerminal: Boolean = false
+
+    /** One stall, one dialog. Cleared by an empty queue or any successful upload. */
+    private var stallAlerted: Boolean = false
 
     /**
      * [PermissionManager.BackgroundRequest] flattened for the UI. The SDK's version
@@ -130,6 +186,30 @@ class TrackerViewModel(
         /** Result of the latest manually triggered SDK API check. */
         val apiCheckResult: String = "No API check run yet",
         val apiCheckRunning: Boolean = false,
+        /**
+         * The upload half, as a line the Home screen can print.
+         *
+         * `queued` is the diagnostic that matters offline: it should climb while the
+         * device has no network and fall to zero shortly after one returns. Watching it
+         * is how you tell "sync is working" from "sync has been silently failing", which
+         * an event log alone cannot — a queue that never drains produces no events at all.
+         */
+        val syncEndpoint: String? = null,
+        /** Sent as `device_id` in the request envelope. A generated per-install UUID. */
+        val syncDeviceId: String = "",
+        val syncQueued: Int = 0,
+        val syncLastEvent: String = "",
+        /**
+         * One line naming the current upload state, healthy or not. Always populated once
+         * sync is configured, so the Home card never has to guess between "fine" and
+         * "nothing has happened yet".
+         */
+        val syncHealth: String = "",
+        /** Paints the sync block red. True for transient failures as well as terminal ones. */
+        val syncFailing: Boolean = false,
+        /** Non-null while an upload problem is worth interrupting the user for. */
+        val syncAlert: SyncAlert? = null,
+        val syncRunning: Boolean = false,
         val registeredGeofenceCount: Int = 0,
         val geofenceEventCount: Int = 0,
         val geofences: List<TrackerGeofence> = emptyList(),
@@ -176,8 +256,330 @@ class TrackerViewModel(
                         providerState = sdk.providerState,
                     )
                 }
+                // `extraParams` is frozen when configure() runs, so a session_id that is
+                // meant to track the live session has to re-run it. Guarded on an actual
+                // change: configure() re-registers the trigger and restarts the
+                // connectivity watcher, and doing that on every state emission would
+                // thrash both.
+                if (sdk.currentSessionId != configuredSessionId) {
+                    configuredSessionId = sdk.currentSessionId
+                    onSessionChanged(sdk.currentSessionId)
+                }
             }
         }
+        observeSync()
+    }
+
+    /**
+     * The upload half, for the Home screen.
+     *
+     * Two sources, because neither is enough alone. `TrackerSync.events` reports the
+     * exchanges — including the ones WorkManager ran in the background — but says nothing
+     * while the device is offline and nothing is being attempted. The poll covers exactly
+     * that gap: a queue that is growing produces no events at all, and "240 queued" is the
+     * only thing on screen that distinguishes working-offline from broken.
+     *
+     * Five seconds because `pendingCount()` is one indexed `COUNT(*)` and this screen is
+     * a diagnostic. A production host would show the count on a refresh, not a timer.
+     */
+    private fun observeSync() {
+        _state.update { it.copy(syncEndpoint = sync.endpoint, syncDeviceId = deviceId) }
+
+        // Two states that are already wrong before a single request is made, so they are
+        // raised at startup rather than inferred from a failure minutes away. Neither
+        // returns early: the queue keeps growing in Room whether or not anything can
+        // upload it, and the backlog is exactly the number worth showing while it does.
+        when {
+            syncConfigError != null -> raiseSyncAlert(
+                headline = "Upload endpoint rejected",
+                detail = "SyncConfig.validate() failed: $syncConfigError\n\nFix SYNC_URL " +
+                    "in local.properties and reinstall. Nothing will ever upload until " +
+                    "it validates — configure() throws rather than accepting a config " +
+                    "that would fail on every request.",
+                terminal = true,
+            )
+            // Checked only once sync is meant to be running: with no endpoint there is
+            // no transport to be missing, and saying otherwise sends the reader after a
+            // dependency they do not need.
+            sync.isConfigured && !transportAvailable -> raiseSyncAlert(
+                headline = "No HTTP transport on the classpath",
+                detail = "OkHttpSyncTransport needs Retrofit and OkHttp, and both are " +
+                    "compileOnly inside fieldtrack-sync. TrackerSync fell back to " +
+                    "NoOpTransport, so every upload fails with no HTTP status — which on " +
+                    "screen is indistinguishable from a dead network.\n\nAdd " +
+                    "implementation(libs.retrofit) and implementation(libs.okhttp), or " +
+                    "pass your own SyncTransport to configure().",
+                terminal = true,
+            )
+        }
+
+        // No endpoint and no config error is the offline-first default, not a fault.
+        // Poll anyway so the card can still report what is accumulating.
+        if (sync.isConfigured) {
+            viewModelScope.launch { sync.events.collect(::onSyncEvent) }
+        }
+        viewModelScope.launch {
+            while (true) {
+                pollSyncQueue()
+                delay(SYNC_POLL_MS)
+            }
+        }
+    }
+
+    private fun onSyncEvent(event: SyncEvent) {
+        val line = when (event) {
+            is SyncEvent.HttpResponse ->
+                "HTTP ${event.statusCode ?: "no response"} · ${event.count} row(s)"
+            is SyncEvent.NetworkAvailable ->
+                "network back · ${event.queued} row(s) queued"
+        }
+        _state.update { current ->
+            current.copy(
+                syncLastEvent = line,
+                log = (listOf("sync · $line") + current.log).take(LOG_LIMIT),
+            )
+        }
+
+        val response = event as? SyncEvent.HttpResponse ?: return
+        val code = response.statusCode
+        if (code != null && code in HTTP_OK_RANGE) {
+            onSyncSucceeded("uploading · last batch $code")
+            return
+        }
+
+        consecutiveSyncFailures++
+        classifySyncFailure(code, consecutiveSyncFailures)
+    }
+
+    /**
+     * One failed exchange, turned into something a developer can act on.
+     *
+     * The split that matters is terminal vs transient, and it is not the same split as
+     * 4xx vs 5xx. A 401 and a 403 stop the retry loop inside the SDK; a 404 does not, but
+     * it will fail identically forever, so treating it as transient means watching a
+     * queue grow against a URL that does not exist. A 429 or a 500 is the loop working.
+     */
+    private fun classifySyncFailure(code: Int?, failures: Int) {
+        val queued = _state.value.syncQueued
+        val (headline, detail, terminal) = when {
+            code == HTTP_UNAUTHORIZED -> Triple(
+                "401 — auth expired, tracking stopped",
+                "The SDK tore the configuration down and CLEARED the upload queue: a 401 " +
+                    "means the credential these rows were recorded under is gone, and " +
+                    "keeping them would leak one user's positions into the next login.\n\n" +
+                    "Tracking has stopped. Call configure() again with a fresh credential.",
+                true,
+            )
+            code == HTTP_FORBIDDEN -> Triple(
+                "403 — credential rejected, uploads halted",
+                "Uploads have stopped and every row is KEPT — unlike a 401, a 403 says " +
+                    "this credential may not write this resource, and the data is still " +
+                    "valid. requestSync() is a no-op until configure() is called again.\n\n" +
+                    "Usually a scope, a rotated key, or a server-side permission rule.",
+                true,
+            )
+            code == null -> Triple(
+                "No response from the server",
+                "No HTTP exchange completed at all — a dead network, DNS failure, or " +
+                    "timeout. This is a device-side problem, not a server one.\n\n" +
+                    "Rows stay queued and WorkManager retries on a 30 s linear backoff, " +
+                    "and again as soon as connectivity returns. If SYNC_URL is a dev " +
+                    "tunnel, check the tunnel is still up.",
+                false,
+            )
+            code == HTTP_NOT_FOUND -> Triple(
+                "404 — endpoint does not exist",
+                "The server answered, so the network is fine and the URL is wrong. The " +
+                    "SDK will retry this forever with the same result.\n\n" +
+                    "Check SYNC_URL is the full endpoint the batch is POSTed to, not a " +
+                    "base path.",
+                true,
+            )
+            code in HTTP_CLIENT_ERRORS && code != HTTP_TOO_MANY_REQUESTS -> Triple(
+                "HTTP $code — the server rejected the request",
+                "A 4xx that is not 401, 403 or 429 usually means the body is not what " +
+                    "the server expects. Rows stay queued and are retried unchanged, so " +
+                    "this will not clear on its own.\n\n" +
+                    "Compare the payload against SYNC-MODULE.md §5.",
+                true,
+            )
+            else -> Triple(
+                "HTTP ${code ?: "?"} — upload failed",
+                "Rows stay queued and are retried: linear 30 s backoff, or the server's " +
+                    "own Retry-After when it sent one.\n\n" +
+                    "$failures consecutive failure(s). A handful is the retry loop " +
+                    "working; a rising queue that never falls is not.",
+                false,
+            )
+        }
+
+        _state.update {
+            it.copy(syncFailing = true, syncHealth = headline)
+        }
+
+        // A transient failure alerts only once it has stopped looking transient. The
+        // first 500 is the retry loop doing its job and interrupting for it would train
+        // the reader to dismiss this dialog without reading it — which is exactly what
+        // must not happen when the 403 arrives.
+        if (terminal || failures >= TRANSIENT_FAILURES_BEFORE_ALERT) {
+            raiseSyncAlert(headline, detail, terminal, queued)
+        }
+    }
+
+    /**
+     * The case no event can report: rows queued, nothing being attempted, silence.
+     *
+     * An upload that is never triggered emits nothing at all, so a queue that only grows
+     * looks identical to a queue that is healthy and empty unless something counts it.
+     * This is the check that catches a trigger path that stopped firing.
+     */
+    private suspend fun pollSyncQueue() {
+        val queued = runCatching { sync.pendingCount() }.getOrDefault(0)
+        // Endpoint re-read every tick, not cached: a 401 clears the configuration with no
+        // host involvement, so a remembered value goes stale at exactly the moment it
+        // matters.
+        val endpoint = sync.endpoint
+        _state.update { it.copy(syncQueued = queued, syncEndpoint = endpoint) }
+
+        // A standing terminal fault already explains everything below it, and overwriting
+        // its headline with a queue depth would replace the cause with a symptom.
+        if (syncTerminal) return
+
+        if (queued == 0) {
+            stallAlerted = false
+            if (!_state.value.syncFailing) {
+                _state.update { it.copy(syncHealth = "idle · queue empty") }
+            }
+            return
+        }
+        // Rows with nowhere to go. Not a fault — this is the offline-first default — so
+        // it is reported without turning the card red.
+        if (endpoint == null) {
+            _state.update { it.copy(syncHealth = "$queued row(s) held locally · no endpoint set") }
+            return
+        }
+
+        val sinceOk = System.currentTimeMillis() - lastSyncOkAtMs
+        if (sinceOk < STALE_SYNC_MS) return
+
+        val stalledMin = sinceOk / 60_000
+        _state.update {
+            it.copy(
+                syncFailing = true,
+                syncHealth = "$queued row(s) queued, nothing uploaded in $stalledMin min",
+            )
+        }
+
+        // Latched, not re-raised every tick: a dismissed dialog that reappears five
+        // seconds later is a dialog nobody reads. Cleared by the queue reaching zero or
+        // by any successful upload, so a genuine second stall alerts again.
+        if (stallAlerted) return
+        stallAlerted = true
+        raiseSyncAlert(
+            headline = "Queue is not draining",
+            detail = "$queued row(s) have been waiting and no batch has succeeded for " +
+                "$stalledMin minutes.\n\nIf the device is offline this is expected — " +
+                "capture is offline-first and the queue is doing its job. If it is " +
+                "online, a trigger path has stopped firing: check logcat for SyncWorker, " +
+                "and use Sync now on the Home card to get the exact drain result.",
+            terminal = false,
+            queued = queued,
+        )
+    }
+
+    private fun raiseSyncAlert(
+        headline: String,
+        detail: String,
+        terminal: Boolean,
+        queued: Int = _state.value.syncQueued,
+    ) {
+        if (terminal) syncTerminal = true
+        _state.update {
+            it.copy(
+                syncFailing = true,
+                syncHealth = headline,
+                syncAlert = SyncAlert(headline, detail, terminal, queued),
+                log = (listOf("sync · $headline") + it.log).take(LOG_LIMIT),
+            )
+        }
+    }
+
+    /**
+     * A batch got through, so every latch above is stale by definition.
+     *
+     * Including [syncTerminal]: a 404 that starts working because the server was deployed,
+     * or a 403 cleared by a re-`configure()`, is exactly the case where the standing fault
+     * must stop suppressing everything else.
+     */
+    private fun onSyncSucceeded(health: String) {
+        lastSyncOkAtMs = System.currentTimeMillis()
+        consecutiveSyncFailures = 0
+        syncTerminal = false
+        stallAlerted = false
+        _state.update { it.copy(syncFailing = false, syncHealth = health) }
+    }
+
+    fun dismissSyncAlert() {
+        _state.update { it.copy(syncAlert = null) }
+    }
+
+    /**
+     * Drains inline and reports exactly what happened.
+     *
+     * The most useful button on the screen while integrating: `syncNow()` returns the
+     * drain result directly, including the `Retry` reason string, where the background
+     * path can only report an HTTP status through an event. A dead transport says so here
+     * and is merely "no response" there.
+     */
+    fun syncNow() = viewModelScope.launch {
+        if (!sync.isConfigured) {
+            raiseSyncAlert(
+                headline = "Sync is not configured",
+                detail = "No endpoint is set, so there is nothing to drain. Set SYNC_URL " +
+                    "in local.properties and reinstall.\n\nThis is a valid state, not a " +
+                    "fault: with no endpoint the SDK keeps every point in Room and opens " +
+                    "no socket.",
+                terminal = true,
+            )
+            return@launch
+        }
+
+        _state.update { it.copy(syncRunning = true) }
+        val result = runCatching { sync.syncNow() }
+        _state.update { it.copy(syncRunning = false) }
+
+        result.onFailure { failure ->
+            raiseSyncAlert(
+                headline = "syncNow() threw",
+                detail = "${failure::class.simpleName}: ${failure.message}",
+                terminal = true,
+            )
+            return@launch
+        }
+
+        when (val outcome = result.getOrThrow()) {
+            is SyncQueue.Result.Uploaded -> {
+                onSyncSucceeded("uploaded ${outcome.count} row(s)")
+                _toasts.tryEmit("Uploaded ${outcome.count} row(s)")
+            }
+            SyncQueue.Result.Empty -> {
+                onSyncSucceeded("idle · queue empty")
+                _toasts.tryEmit("Nothing queued")
+            }
+            // The two the events cannot describe: a reason string rather than a status.
+            is SyncQueue.Result.Retry -> raiseSyncAlert(
+                headline = "Upload failed — will retry",
+                detail = "The drain reported: ${outcome.reason}\n\n" +
+                    (outcome.retryAfterMs?.let { "Server asked to wait ${it / 1_000} s.\n\n" } ?: "") +
+                    "Rows stay queued. \"No transport configured\" here means Retrofit or " +
+                    "OkHttp is missing from the host; anything else is the server or the " +
+                    "network.",
+                terminal = false,
+            )
+            SyncQueue.Result.AuthExpired -> classifySyncFailure(HTTP_UNAUTHORIZED, ++consecutiveSyncFailures)
+            SyncQueue.Result.Forbidden -> classifySyncFailure(HTTP_FORBIDDEN, ++consecutiveSyncFailures)
+        }
+        pollSyncQueue()
     }
 
     /**
@@ -774,11 +1176,48 @@ class TrackerViewModel(
             initializer {
                 val app = this[ViewModelProvider.AndroidViewModelFactory.APPLICATION_KEY]
                     as SampleApplication
-                TrackerViewModel(app.tracker, app.captureLog)
+                TrackerViewModel(
+                    tracker = app.tracker,
+                    sync = app.sync,
+                    captureLog = app.captureLog,
+                    syncConfigError = app.syncConfigError,
+                    transportAvailable = app.syncTransportAvailable,
+                    deviceId = app.deviceId,
+                    onSessionChanged = app::installSync,
+                )
             }
         }
 
         private const val LOG_LIMIT = 300
+
+        /** How often the Home screen re-reads the upload queue depth. */
+        private const val SYNC_POLL_MS = 5_000L
+
+        /**
+         * How long a non-empty queue may sit with no successful upload before it is
+         * called a fault rather than a device that happens to be offline.
+         *
+         * Above the SDK's own 16-minute staleness bar would hide the very case that bar
+         * exists to fix; far below it would fire on every tunnel. Five minutes is long
+         * enough that ordinary loss of signal passes unremarked.
+         */
+        private const val STALE_SYNC_MS = 5 * 60 * 1_000L
+
+        /**
+         * Consecutive failures before a *transient* failure earns a dialog.
+         *
+         * One 500 is the retry loop working. Interrupting for it teaches the reader to
+         * dismiss this dialog unread, which is precisely what must not happen when the
+         * terminal one arrives.
+         */
+        private const val TRANSIENT_FAILURES_BEFORE_ALERT = 3
+
+        private val HTTP_OK_RANGE = 200..299
+        private val HTTP_CLIENT_ERRORS = 400..499
+        private const val HTTP_UNAUTHORIZED = 401
+        private const val HTTP_FORBIDDEN = 403
+        private const val HTTP_NOT_FOUND = 404
+        private const val HTTP_TOO_MANY_REQUESTS = 429
         private const val MAX_POINTS = 5_000
         private const val MAX_DECISIONS = 500
         private const val MAX_GEOFENCE_EVENTS = 5_000

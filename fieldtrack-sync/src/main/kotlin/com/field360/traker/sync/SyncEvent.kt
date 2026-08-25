@@ -28,4 +28,21 @@ public sealed interface SyncEvent {
      * it implements [SyncTransport] and sees the whole exchange.
      */
     public data class HttpResponse(val statusCode: Int?, val count: Int) : SyncEvent
+
+    /**
+     * The device came back onto a usable network with rows still queued, and a drain was
+     * requested because of it.
+     *
+     * The event a host needs to turn "offline, 240 queued" into "syncing" without polling
+     * [TrackerSync.pendingCount] on a timer. Emitted on the rising edge only — a
+     * reconnection, not a heartbeat — and never when the queue is empty, because a
+     * reconnection with nothing to send is not something a user needs to be told about.
+     *
+     * Only fires while the process is alive. A drain that WorkManager runs later, in a
+     * process the host is not watching, reports itself through [HttpResponse] as usual.
+     *
+     * @property queued rows waiting at the moment the network returned. What was
+     *   *attempted*, not what was stored — the drain itself reports that.
+     */
+    public data class NetworkAvailable(val queued: Int) : SyncEvent
 }

@@ -36,6 +36,7 @@ import com.field360.fieldtrack.sample.screen.DebugOverlayScreen
 import com.field360.fieldtrack.sample.screen.DecisionLogScreen
 import com.field360.fieldtrack.sample.screen.HomeScreen
 import com.field360.fieldtrack.sample.screen.LicenseAlertDialog
+import com.field360.fieldtrack.sample.screen.SyncAlertDialog
 import com.field360.fieldtrack.sample.screen.TrackScreen
 import java.io.File
 
@@ -163,6 +164,20 @@ private fun SampleApp(
         LicenseAlertDialog(alert = alert, onDismiss = viewModel::dismissLicenseAlert)
     }
 
+    // Upload problems interrupt from any tab too. Deliberately below the licence dialog:
+    // a licence that stopped tracking is why there is nothing to upload, and answering
+    // the upload question first would send the reader after the wrong fault.
+    state.syncAlert?.let { alert ->
+        SyncAlertDialog(
+            alert = alert,
+            onRetry = {
+                viewModel.dismissSyncAlert()
+                viewModel.syncNow()
+            },
+            onDismiss = viewModel::dismissSyncAlert,
+        )
+    }
+
     if (state.showBackgroundDialog) {
         BackgroundLocationDialog(
             step = state.backgroundStep,
@@ -218,6 +233,7 @@ private fun SampleApp(
                         onRequestForeground { viewModel.showBackgroundRationale() }
                     },
                     onAllowBackground = viewModel::showBackgroundRationale,
+                    onSyncNow = { viewModel.syncNow() },
                     onShareLog = { onShareLog(state.logPath) },
                     onClearLog = viewModel::clearLog,
                     onTestCurrentLocation = viewModel::testCurrentLocation,

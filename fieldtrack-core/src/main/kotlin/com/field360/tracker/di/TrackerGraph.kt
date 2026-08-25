@@ -421,6 +421,7 @@ internal class TrackerGraph private constructor(
             activityRecognizer = activityRecognizer,
             significantMotion = significantMotion,
             watchdog = watchdog,
+            syncScheduler = syncScheduler,
             context = context,
             events = events,
         )

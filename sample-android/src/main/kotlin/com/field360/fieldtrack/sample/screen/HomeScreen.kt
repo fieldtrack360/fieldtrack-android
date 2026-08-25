@@ -15,6 +15,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -27,6 +28,7 @@ fun HomeScreen(
     onStop: () -> Unit,
     onRequestPermissions: () -> Unit,
     onAllowBackground: () -> Unit,
+    onSyncNow: () -> Unit = {},
     onShareLog: () -> Unit = {},
     onClearLog: () -> Unit = {},
     onOpenSession: (String) -> Unit = {},
@@ -70,6 +72,45 @@ fun HomeScreen(
                     )
                     Text("Session: ${state.sessionId?.take(8) ?: "—"}")
                     Text("Points accepted: ${state.pointCount}")
+
+                    // The upload half. "Not configured" is a working state, not an error —
+                    // the SDK is offline-first and a host that sets no SYNC_URL simply
+                    // keeps everything in Room, so this must not be dressed up as a fault.
+                    val syncColour = if (state.syncFailing) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        Color.Unspecified
+                    }
+                    if (state.syncEndpoint == null) {
+                        Text("Sync: not configured — set SYNC_URL in local.properties", color = syncColour)
+                    } else {
+                        Text("Sync: ${state.syncEndpoint}", color = syncColour)
+                        // Sent as `device_id` in every request envelope. Shown because it
+                        // is a generated UUID — otherwise there is no way to correlate a
+                        // row on the server with the install that sent it.
+                        Text("device_id: ${state.syncDeviceId}", color = syncColour)
+                    }
+                    // Outside the branch on purpose: rows accumulate in Room whether or
+                    // not anything can upload them, and the backlog is the number worth
+                    // showing most when nothing can. It climbs with no network and drops
+                    // to zero shortly after one returns; a queue that is merely growing
+                    // emits no events at all, so this is the only line that separates
+                    // "offline" from "broken".
+                    Text("Queued: ${state.syncQueued} row(s)", color = syncColour)
+                    if (state.syncHealth.isNotBlank()) {
+                        Text("Status: ${state.syncHealth}", color = syncColour)
+                    }
+                    if (state.syncLastEvent.isNotBlank()) {
+                        Text("Last exchange: ${state.syncLastEvent}", color = syncColour)
+                    }
+                    // Drains inline and reports the exact result — including the reason
+                    // string a background drain can only report as a status code. The
+                    // fastest way to find out why nothing is arriving.
+                    OutlinedButton(
+                        onClick = onSyncNow,
+                        enabled = !state.syncRunning,
+                    ) { Text(if (state.syncRunning) "Syncing…" else "Sync now") }
+
                     state.error?.let {
                         Text(it, color = MaterialTheme.colorScheme.error)
                     }

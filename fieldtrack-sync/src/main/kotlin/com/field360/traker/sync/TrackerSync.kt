@@ -16,15 +16,20 @@ import com.field360.tracker.TrackerArtifacts
 import com.field360.tracker.domain.repository.SyncTrigger
 import com.field360.traker.geo.port.TrackLogger
 import com.field360.traker.sync.internal.MAX_PARAM_DEPTH
+import com.field360.traker.sync.internal.NetworkMonitor
 import com.field360.traker.sync.internal.NoOpTransport
 import com.field360.traker.sync.internal.SyncService
 import com.field360.traker.sync.internal.jsonParamOrNull
 import java.net.URI
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.launch
 
 /**
  * @property autoSync upload as points arrive. With it off, the host calls [TrackerSync.syncNow].
@@ -357,6 +362,22 @@ public class TrackerSync internal constructor(
     private var haltedReason: String? = null
 
     /**
+     * Where the connectivity callback's work lands. Its own scope rather than the
+     * caller's: the callback arrives on a platform thread with no scope of its own, and
+     * the queue lookup it needs is a database read that must not run there.
+     *
+     * `SupervisorJob` so a failed lookup cannot cancel the scope and silently retire the
+     * connectivity path for the rest of the process.
+     */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * The prompt half of "upload when the network comes back" — see [NetworkMonitor] for
+     * why the durable half ([SyncWorker]'s network constraint) is not sufficient alone.
+     */
+    private val networkMonitor = NetworkMonitor(context, logger) { onNetworkUsable() }
+
+    /**
      * What the server said, one event per exchange — including the exchanges the host did
      * not ask for. [syncNow] already returns the outcome of a drain a host requested;
      * [requestSync] hands the work to WorkManager, which may run it minutes later in a
@@ -408,6 +429,40 @@ public class TrackerSync internal constructor(
         // has gone stale — because those are the moments it can see and this module
         // cannot. With autoSync off nothing is registered and the host owns the schedule.
         artifacts.registerSyncTrigger(if (config.autoSync) SyncTrigger(::requestSync) else null)
+
+        // Connectivity is the fourth moment, and the one none of the above can see: a
+        // device that has been offline stores points and requests drains that fail, and
+        // then nothing changes until the network does. Gated on autoSync for the same
+        // reason the trigger is — with it off the host owns the schedule, and a drain it
+        // did not ask for is a surprise request against its own credential.
+        networkMonitor.stop()
+        if (resolved.autoSync) {
+            // Registration replays the current default network, so a configure() made
+            // while already online is itself a rising edge and drains any backlog left
+            // over from a previous run. When the platform refuses to watch at all, that
+            // one check still has to happen — so make it by hand.
+            if (!networkMonitor.start(resolved.requiresUnmeteredNetwork)) onNetworkUsable()
+        }
+    }
+
+    /**
+     * A usable network appeared. Ask for a drain, but only if there is anything to drain.
+     *
+     * The queue lookup is what keeps this from being a wake-up call: a reconnection with
+     * an empty queue is the overwhelmingly common case on a device that is mostly online,
+     * and enqueueing a worker to discover that costs a process start for nothing.
+     */
+    private fun onNetworkUsable() {
+        scope.launch {
+            if (config == null || haltedReason != null) return@launch
+
+            val queued = runCatching { queue.pendingCount() }.getOrDefault(0)
+            if (queued == 0) return@launch
+
+            sdkLog { logger.d(TAG, "Network back with $queued row(s) queued; requesting a drain") }
+            eventSink.tryEmit(SyncEvent.NetworkAvailable(queued))
+            requestSync()
+        }
     }
 
     public suspend fun pendingCount(): Int = queue.pendingCount()
@@ -463,6 +518,9 @@ public class TrackerSync internal constructor(
         // Core must stop nudging too, or every accepted point re-enters a loop that has
         // already been told to stop.
         artifacts.registerSyncTrigger(null)
+        // And so must connectivity. A halted uploader that still drains on every
+        // reconnection is the same retry loop by a different door.
+        networkMonitor.stop()
     }
 
     /**
@@ -494,6 +552,7 @@ public class TrackerSync internal constructor(
         config = null
         transport = null
         artifacts.registerSyncTrigger(null)
+        networkMonitor.stop()
     }
 
     private fun defaultTransport(): SyncTransport = runCatching { OkHttpSyncTransport() }
