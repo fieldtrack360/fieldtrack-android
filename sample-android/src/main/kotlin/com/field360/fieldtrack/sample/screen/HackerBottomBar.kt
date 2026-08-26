@@ -1,6 +1,7 @@
 package com.field360.fieldtrack.sample.screen
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -37,7 +38,8 @@ data class HackerTab(
 
 /**
  * The bottom menu as a terminal's mode line: a hairline rule, four numbered slots, and
- * the selected one inverted the way a TUI marks focus.
+ * the selected one blacked out behind a green frame — focus marked by dropping the slot
+ * out of the bar rather than by lighting it up.
  *
  * Material's `NavigationBar` was doing none of that work here — it wants an icon per
  * item, its selection indicator is a pill, and its container colour is derived from a
@@ -74,9 +76,16 @@ fun HackerBottomBar(
                 Column(
                     Modifier
                         .weight(1f)
-                        // Inverted when focused — solid accent, black text — so the
-                        // current tab is legible in peripheral vision.
-                        .background(if (active) Hack.Green else Hack.Surface)
+                        // Selected is BLACK — the slot drops out of the bar rather than
+                        // lighting up, which is what a terminal does when a pane takes
+                        // focus. It is the darkest thing on screen, so it separates from
+                        // the unselected slots (which sit one step up on [Hack.Surface])
+                        // without a saturated block competing with the console above.
+                        .background(if (active) Color.Black else Hack.Surface)
+                        // Black on near-black is a quiet difference, so the accent goes on
+                        // the border and the text instead. Unselected keeps a hairline of
+                        // the rule colour, so the four slots still read as four slots.
+                        .border(1.dp, if (active) Hack.Green else Hack.Line)
                         .clickable { onSelect(tab) }
                         .padding(vertical = 8.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -85,15 +94,17 @@ fun HackerBottomBar(
                     Text(
                         text = tab.code,
                         style = MonoBody.copy(
-                            color = if (active) Color.Black.copy(alpha = CODE_ALPHA) else Hack.Dim,
+                            color = if (active) Hack.Green.copy(alpha = CODE_ALPHA) else Hack.Dim,
                             fontSize = 9.sp,
                             letterSpacing = 1.sp,
                         ),
                     )
                     Text(
-                        text = tab.label.uppercase(),
+                        // The caret is the second half of the focus cue, and the half that
+                        // survives being looked at from the corner of the eye.
+                        text = if (active) "> ${tab.label.uppercase()}" else tab.label.uppercase(),
                         style = MonoBody.copy(
-                            color = if (active) Color.Black else Hack.Text,
+                            color = if (active) Hack.Green else Hack.Dim,
                             fontWeight = FontWeight.Bold,
                             fontSize = 11.sp,
                         ),
@@ -103,7 +114,7 @@ fun HackerBottomBar(
                     Text(
                         text = tab.badge ?: " ",
                         style = MonoBody.copy(
-                            color = if (active) Color.Black else tab.badgeColor,
+                            color = tab.badgeColor,
                             fontWeight = FontWeight.Bold,
                             fontSize = 9.sp,
                         ),

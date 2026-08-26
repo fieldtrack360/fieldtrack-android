@@ -1057,6 +1057,16 @@ class TrackerViewModel(
      * Degraded grants are surfaced too, and those the user may overrule: see
      * [startAnyway].
      */
+    /**
+     * Whether [start] would be held at the permission dialog rather than reaching the SDK.
+     *
+     * Exposed so the host can order the two questions correctly: a permission grant says
+     * this app may read location, the device switch says the device produces any, and
+     * asking about the switch first is asking about someone else's problem. Cheap — three
+     * package-manager reads.
+     */
+    fun hasPermissionGap(): Boolean = preflight() != null
+
     fun start() {
         val alert = preflight()
         if (alert != null) {
@@ -1476,6 +1486,20 @@ class TrackerViewModel(
      * change in Settings while this process is alive, and the Settings route is the whole
      * point of the background step (EC-05).
      */
+    /**
+     * Re-reads the GPS/location-services switch from the platform.
+     *
+     * Called on the way back from the system location dialog. `ProviderStateMonitor` is
+     * broadcast-driven and would catch the change on its own, but not before the composable
+     * that asked for it has already recomposed — so the button that says "enable location"
+     * would still say it for a second after location was enabled.
+     */
+    fun refreshProviderState() {
+        val provider = tracker.refreshProviderState()
+        _state.update { it.copy(providerState = provider) }
+        Log.d(TAG, "providerState · refreshed services=${provider.locationServicesEnabled}")
+    }
+
     fun refreshPermissions() {
         val step = when (tracker.permissions().backgroundRequest()) {
             PermissionManager.BackgroundRequest.AlreadyGranted -> BackgroundStep.GRANTED

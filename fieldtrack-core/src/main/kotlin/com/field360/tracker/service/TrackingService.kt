@@ -21,6 +21,7 @@ import com.field360.tracker.domain.model.TrackerEvent
 import com.field360.tracker.domain.repository.ConfigRepository
 import com.field360.traker.geo.port.TrackLogger
 import com.field360.tracker.motion.MotionController
+import com.field360.tracker.work.RestoreWorker
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -190,9 +191,20 @@ public class TrackingService : LifecycleService() {
         //           FGS may only START from an eligible state even when granted.
         // Stop cleanly to honour the start-foreground contract; otherwise the platform
         // piles a "did not call startForeground" ANR on top of the original failure.
-        // RestoreWorker re-promotes when the app is next eligible (EC-62).
         sdkLog { logger.w(TAG, "startForeground(location) refused: ${e.message}") }
         events.tryEmit(TrackerEvent.Error(ErrorCode.FGS_START_REFUSED, e.message.orEmpty()))
+
+        // The retry this comment has always claimed happens (EC-62), and until now did
+        // not: nothing else in the SDK enqueues a restore from here. `HealthLoop` was the
+        // only caller, and the health loop lives *inside* this service — so a refusal on
+        // the very first start command, or a process killed before the first tick at
+        // `healthLoopMs`, left the session open with nothing scheduled to bring it back.
+        //
+        // Enqueued unconditionally rather than behind a session check. `RestoreWorker`
+        // reads `sessions.current()` at the moment it runs, so a refusal on the way out
+        // of a session that has already closed resolves to a no-op there, and
+        // `SessionTeardown` cancels the unique work by name regardless.
+        RestoreWorker.enqueueExpedited(applicationContext)
         stopSelf()
         false
     }

@@ -42,6 +42,8 @@ fun HomeScreen(
     onStop: () -> Unit,
     onRequestPermissions: () -> Unit,
     onAllowBackground: () -> Unit,
+    /** Raises the system location dialog. See MainActivity.ensureLocationEnabled. */
+    onEnableLocation: () -> Unit = {},
     onSyncNow: () -> Unit = {},
     onShareLog: () -> Unit = {},
     onClearLog: () -> Unit = {},
@@ -174,6 +176,18 @@ fun HomeScreen(
                     FlagBadge("power save", !state.providerState.powerSaveMode)
                     FlagBadge("airplane", !state.providerState.airplaneMode)
                     Badge(state.providerState.accuracyAuthorization.name, Hack.Cyan)
+                }
+                // The one device-side fault a host can actually fix from inside the app.
+                // A granted permission on a phone with the location switch off records
+                // nothing at all, and the switch is not something start() can turn on.
+                if (!state.providerState.locationServicesEnabled) {
+                    Alert("location services are off — nothing can be recorded", Hack.Red)
+                    HackButton(
+                        text = "enable location",
+                        onClick = onEnableLocation,
+                        accent = Hack.Amber,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
                 }
             }
         }

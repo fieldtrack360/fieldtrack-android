@@ -7,6 +7,7 @@ import com.field360.tracker.di.TrackerGraph
 import com.field360.tracker.domain.model.TrackerEvent
 import com.field360.traker.geo.model.ActivityType
 import com.field360.tracker.service.CaptureBus
+import com.field360.tracker.service.reviveServiceIfNeeded
 import com.google.android.gms.location.ActivityTransitionResult
 import com.google.android.gms.location.DetectedActivity
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -24,6 +25,13 @@ public class ActivityTransitionReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (!ActivityTransitionResult.hasResult(intent)) return
         val result = ActivityTransitionResult.extractResult(intent) ?: return
+
+        // First, because the rest of this method is useless without it. The registration
+        // that delivered this broadcast lives in Play Services and outlives our process,
+        // so after an OEM kill this runs with no service and no collector on `CaptureBus`
+        // — the label is emitted to a flow nobody reads and the extra fix never happens.
+        // A no-op when the service is already up.
+        reviveServiceIfNeeded(context)
 
         // Resolved here rather than field-injected: a manifest-declared receiver is
         // constructed by the system, so there is no constructor to wire and nothing to

@@ -10,6 +10,7 @@ import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Column
@@ -29,6 +30,11 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.google.android.gms.common.api.ResolvableApiException
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.LocationSettingsRequest
+import com.google.android.gms.location.Priority
 import com.field360.fieldtrack.sample.screen.BackgroundLocationDialog
 import com.field360.fieldtrack.sample.screen.DebugOverlayScreen
 import com.field360.fieldtrack.sample.screen.DecisionLogScreen
@@ -52,6 +58,24 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { granted -> onPermissionResult?.invoke(granted) }
 
+    private var onLocationSettingsResult: (() -> Unit)? = null
+
+    /**
+     * The result of the system "turn on location" dialog.
+     *
+     * The continuation runs either way. A user who declines still gets the session: the
+     * SDK opens it, `CaptureGate` suspends capture, and it resumes on its own when the
+     * switch comes back (EC-06, EC-07). Refusing to open the session instead would lose
+     * the record of a drive that was attempted, which is the opposite of what this SDK is
+     * for — and the screen says SUSPENDED throughout, so nothing is being hidden.
+     */
+    private val resolveLocationSettings = registerForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult(),
+    ) {
+        onLocationSettingsResult?.invoke()
+        onLocationSettingsResult = null
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
@@ -73,6 +97,7 @@ class MainActivity : ComponentActivity() {
                         requestBackgroundLocation()
                     },
                     onOpenSettings = { startActivity(trackerSettingsIntent()) },
+                    onEnsureLocation = ::ensureLocationEnabled,
                     onShareLog = ::shareLog,
                 )
             }
@@ -94,6 +119,67 @@ class MainActivity : ComponentActivity() {
             add(Manifest.permission.ACTIVITY_RECOGNITION)
         }
     }.toTypedArray()
+
+    /**
+     * Asks the OS to switch location on, then runs [then].
+     *
+     * This is the half of "can this device track" that runtime permissions do not cover,
+     * and the half that was missing: a granted `ACCESS_FINE_LOCATION` on a phone with the
+     * location master switch off produces a session that records nothing, reports
+     * `CaptureSuspended`, and looks — to anyone who did not read the reason line — like the
+     * SDK silently failing.
+     *
+     * `SettingsClient` rather than an intent to the settings screen, because it is the one
+     * route that keeps the user in the app: Play Services shows the "For a better
+     * experience, turn on device location" sheet, and one tap flips the switch. The
+     * settings-screen intent is the fallback for a device that has no Play Services, where
+     * the sheet does not exist at all.
+     *
+     * Deliberately NOT called from inside the SDK. `Tracker` shows no UI by design
+     * (PERMISSIONS.md §5) — it reports `ProviderState.locationServicesEnabled` and leaves
+     * the asking to the host, because only the host knows when an interruption is welcome.
+     * This method is that host half.
+     */
+    private fun ensureLocationEnabled(then: () -> Unit) {
+        val request = LocationSettingsRequest.Builder()
+            // The same priority the SDK will actually request with. Asking about a weaker
+            // one would get a "yes" for a configuration that is not the one being started.
+            .addLocationRequest(
+                LocationRequest.Builder(
+                    Priority.PRIORITY_HIGH_ACCURACY,
+                    LOCATION_CHECK_INTERVAL_MS,
+                ).build(),
+            )
+            // Shows the sheet even when the user previously ticked "never again" for it.
+            .setAlwaysShow(true)
+            .build()
+
+        LocationServices.getSettingsClient(this)
+            .checkLocationSettings(request)
+            // Already satisfied: no dialog, no interruption, straight through.
+            .addOnSuccessListener { then() }
+            .addOnFailureListener { failure ->
+                val resolution = (failure as? ResolvableApiException)?.resolution
+                if (resolution == null) {
+                    // No Play Services resolution available. The settings screen is the
+                    // only route left, and it leaves the app — so `then()` does NOT run:
+                    // the user comes back and presses Start, rather than finding a session
+                    // already open behind the settings screen they were sent to.
+                    startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+                    return@addOnFailureListener
+                }
+                onLocationSettingsResult = then
+                runCatching {
+                    resolveLocationSettings.launch(IntentSenderRequest.Builder(resolution).build())
+                }.onFailure {
+                    // The IntentSender can be dead by the time it is launched. Fall back
+                    // rather than swallowing it — a Start that does nothing at all is the
+                    // worst of the outcomes here.
+                    onLocationSettingsResult = null
+                    startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+                }
+            }
+    }
 
     /**
      * Hands the capture file out as a content:// URI. `adb pull` works too, but a field
@@ -127,6 +213,12 @@ class MainActivity : ComponentActivity() {
         requestPermissions.launch(arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION))
     }
 
+    private companion object {
+        /** Mirrors `geolocation.intervalMs` in `SampleApplication`, so the check asks about
+         *  the stream that is actually about to start. */
+        const val LOCATION_CHECK_INTERVAL_MS = 15_000L
+    }
+
     private fun trackerSettingsIntent() =
         Intent(
             Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
@@ -152,12 +244,31 @@ private fun SampleApp(
     onRequestForeground: ((Map<String, Boolean>) -> Unit) -> Unit,
     onRequestBackground: (() -> Unit) -> Unit,
     onOpenSettings: () -> Unit,
+    /** Raises the system location dialog if needed, then runs the block. */
+    onEnsureLocation: (() -> Unit) -> Unit,
     onShareLog: (String) -> Unit,
 ) {
     val viewModel: TrackerViewModel = viewModel(factory = TrackerViewModel.Factory)
     val state by viewModel.state.collectAsStateWithLifecycle()
     var tab by remember { mutableStateOf(Tab.HOME) }
     val context = LocalContext.current
+
+    // Both gates, in the order the OS enforces them: the permission dialog first — raised
+    // by `start()`'s own preflight — and the location switch second, since asking to turn
+    // location on before this app may read it is a question about someone else's problem.
+    fun startWithLocationCheck() {
+        // start() raises the permission dialog itself and returns without touching the
+        // SDK, so this hands off and stops. The Grant path comes back through here once
+        // the OS has answered, and the location sheet is then the next question.
+        if (viewModel.hasPermissionGap()) {
+            viewModel.start()
+            return
+        }
+        onEnsureLocation {
+            viewModel.refreshProviderState()
+            viewModel.start()
+        }
+    }
 
     // Collected here rather than in the view model because a toast needs a Context, and
     // handing one to a view model is how it outlives the activity it came from.
@@ -213,7 +324,11 @@ private fun SampleApp(
                         // the preflight runs again on the new grants and either starts or
                         // says what is still missing. A denial therefore re-states the cost
                         // rather than silently doing nothing.
-                        onRequestForeground { viewModel.start() }
+                        //
+                        // Through the location check on the way, because a grant is only
+                        // half of it: permission says this app may read location, the
+                        // switch says the device produces any.
+                        onRequestForeground { startWithLocationCheck() }
 
                     PermissionAction.BACKGROUND_LADDER -> viewModel.showBackgroundRationale()
                 }
@@ -284,8 +399,14 @@ private fun SampleApp(
             when (tab) {
                 Tab.HOME -> HomeScreen(
                     state = state,
-                    onStart = viewModel::start,
+                    onStart = ::startWithLocationCheck,
                     onStop = viewModel::stop,
+                    // Offered on the provider card as well as on Start: a switch flipped
+                    // off mid-session suspends capture, and the fix should be one tap from
+                    // the line that reports it.
+                    onEnableLocation = {
+                        onEnsureLocation { viewModel.refreshProviderState() }
+                    },
                     // Foreground first, then offer the background rung — never both in
                     // one request array, which Android denies silently (EC-04).
                     onRequestPermissions = {

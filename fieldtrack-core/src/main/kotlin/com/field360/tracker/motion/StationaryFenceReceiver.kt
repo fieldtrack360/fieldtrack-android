@@ -8,6 +8,7 @@ import com.field360.tracker.domain.model.GeofenceTransition
 import com.field360.tracker.domain.model.TrackerEvent
 import com.google.android.gms.location.Geofence
 import com.field360.tracker.service.CaptureBus
+import com.field360.tracker.service.reviveServiceIfNeeded
 import com.google.android.gms.location.GeofencingEvent
 import kotlinx.coroutines.flow.MutableSharedFlow
 
@@ -27,6 +28,13 @@ public class StationaryFenceReceiver : BroadcastReceiver() {
             events.tryEmit(TrackerEvent.Diagnostic("geofence_error: ${event.errorCode}"))
             return
         }
+
+        // On any real transition, not only the stationary-exit case handled below. A
+        // system geofence is the one wake path that survives an OEM killing the process,
+        // so being woken by one is the moment to put the service back — whatever the
+        // transition turns out to mean. Below this line, `CaptureBus.request()` assumes a
+        // collector that only exists while the service is alive.
+        reviveServiceIfNeeded(context)
 
         val transition = when (event.geofenceTransition) {
             Geofence.GEOFENCE_TRANSITION_ENTER -> GeofenceTransition.ENTER

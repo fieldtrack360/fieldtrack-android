@@ -64,6 +64,20 @@ internal class BackstopWorker(
         val session = deps.sessions.current() ?: return Result.success()
         val config = deps.config.load() ?: TrackerConfig()
 
+        // A session is open and there is no service serving it — the process was killed.
+        // Nothing else notices that from outside the process: `HealthLoop` runs *inside*
+        // the service and cannot report its own absence, and the wake receivers only fire
+        // when the user moves. This tick is the one piece of supervision that survives.
+        //
+        // Best effort, and honestly so. On API 31+ a plain job is not on the allowlist for
+        // starting a foreground service from the background, so this can be refused; it
+        // succeeds below API 31, on OEMs that do not enforce it, and whenever the app was
+        // recently in the foreground. `TrackingService` reports its own refusal and
+        // enqueues a restore, so a refused attempt is not a silent one.
+        if (!TrackingService.running && config.service.foregroundService) {
+            runCatching { TrackingService.start(applicationContext, config.service) }
+        }
+
         // Through OneShotProvider, not the raw source: it carries the timeout, the
         // retry cap and the mutex that stops a coincident activity-transition capture
         // from firing a second concurrent request (EC-17, EC-20).

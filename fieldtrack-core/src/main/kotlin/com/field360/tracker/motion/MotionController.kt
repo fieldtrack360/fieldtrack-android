@@ -55,12 +55,19 @@ internal class MotionController(
     private var config: TrackerConfig? = null
     private var lastPoint: TrackPoint? = null
 
+    /**
+     * Whether the session-opening anchor fence has been written yet — see
+     * [armAnchorFenceOnce]. Per session, so it is cleared in both [start] and [stop].
+     */
+    private var anchorFenceArmed = false
+
     val motionState: MotionState get() = state.motion
 
     fun start(config: TrackerConfig) {
         this.config = config
         state = MotionStateMachine.State()
         lastPoint = null
+        anchorFenceArmed = false
 
         consumerJob?.cancel()
         consumerJob = scope.launch {
@@ -83,16 +90,61 @@ internal class MotionController(
         config = null
         state = MotionStateMachine.State()
         lastPoint = null
+        anchorFenceArmed = false
     }
 
     /** Fed for every point the pipeline accepted. */
     fun onAcceptedPoint(point: TrackPoint) {
         lastPoint = point
+        armAnchorFenceOnce(point)
         offer(
             MotionEvent.AcceptedFix(
                 latitude = point.latitude,
                 longitude = point.longitude,
                 isMoving = point.movementStatus == MovementStatus.MOVING,
+            ),
+        )
+    }
+
+    /**
+     * Registers the wake fence on the FIRST accepted fix of the session, rather than
+     * waiting for [onEnterStationary].
+     *
+     * The window this closes is the opening minutes of a session, and it was total. A
+     * process killed there had **nothing** registered with the operating system: the
+     * fence is written on the STATIONARY transition, which needs an accepted fix *and*
+     * `stopTimeoutMin` on top of it — five minutes by default — and significant motion is
+     * a `TriggerEventListener` living in this process, so it dies with it. Activity
+     * recognition is the only other system registration, and this SDK's own notes record
+     * whole drives reported `STILL` on OnePlus and Xiaomi under battery saver. So for the
+     * first five minutes of every session there was no reliable way back in.
+     *
+     * A system geofence has neither problem: Play Services holds it, it outlives the
+     * process, and being woken by one puts the app in the API 31+ allowlist for starting
+     * a foreground service from the background — which is what makes
+     * `reviveServiceIfNeeded` legal on that path.
+     *
+     * Deliberately not re-armed after [onEnterMoving] unregisters it. Through a drive the
+     * service is alive and activity transitions are frequent; holding a fence the user is
+     * actively leaving is the battery cost EC-138 is about. This covers the gap before
+     * the first transition, and hands back to the existing behaviour after it.
+     */
+    private fun armAnchorFenceOnce(point: TrackPoint) {
+        val active = config ?: return
+        if (anchorFenceArmed) return
+        // Set before the call, not after: `register()` is fire-and-observe and a failure
+        // is reported through events, so retrying it on every accepted fix would turn a
+        // device with geofencing unavailable into a registration attempt per fix.
+        anchorFenceArmed = true
+
+        stationaryFence.register(
+            TrackerGeofence(
+                id = active.motion.stationaryGeofenceId,
+                latitude = point.latitude,
+                longitude = point.longitude,
+                radiusM = active.motion.stationaryRadiusM,
+                onEnterEvent = active.motion.stationaryGeofenceOnEnterEvent,
+                onExitEvent = active.motion.stationaryGeofenceOnExitEvent,
             ),
         )
     }

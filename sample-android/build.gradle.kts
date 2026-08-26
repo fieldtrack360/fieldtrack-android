@@ -169,6 +169,11 @@ dependencies {
     implementation(libs.maps.compose)
     implementation(libs.play.services.maps)
 
+    // For SettingsClient alone — the "turn on location" dialog. fieldtrack-core depends on
+    // this too, but as `implementation`, so it reaches the sample's runtime classpath and
+    // not its compile one. A host that wants to raise that dialog declares it itself.
+    implementation(libs.play.services.location)
+
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.kotlinx.coroutines.android)

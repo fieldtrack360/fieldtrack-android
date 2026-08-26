@@ -232,7 +232,14 @@ fun FlagBadge(label: String, on: Boolean, onColor: Color = Hack.Green, offColor:
     Badge(text = label, color = if (on) onColor else offColor)
 }
 
-/** The primary action: black on solid green, the way a terminal inverts a selection. */
+/**
+ * The primary action: black, framed and lettered in the accent.
+ *
+ * Black rather than a solid accent fill, matching the selected slot in [HackerBottomBar].
+ * A screen of saturated green blocks is the failure mode of this palette — the accent
+ * stops meaning "look here" once four things wear it — so weight carries the hierarchy
+ * instead: a heavier frame and brighter letters than [GhostButton], on the same ground.
+ */
 @Composable
 fun HackButton(
     text: String,
@@ -246,9 +253,13 @@ fun HackButton(
         enabled = enabled,
         shape = RoundedCornerShape(2.dp),
         contentPadding = ButtonPadding,
+        border = BorderStroke(PRIMARY_BORDER, if (enabled) accent else Hack.Line),
         colors = ButtonDefaults.buttonColors(
-            containerColor = accent,
-            contentColor = Color.Black,
+            containerColor = Color.Black,
+            contentColor = accent,
+            // Disabled lifts off black instead of dimming the letters alone: a disabled
+            // START and an enabled one differing only in text brightness is not a
+            // difference anyone reads at arm's length.
             disabledContainerColor = Hack.SurfaceHi,
             disabledContentColor = Hack.Dim,
         ),
@@ -318,6 +329,9 @@ private val ButtonPadding = androidx.compose.foundation.layout.PaddingValues(
     horizontal = 12.dp,
     vertical = 6.dp,
 )
+
+/** Heavier than [GhostButton] hairline: the frame is what makes it the primary. */
+private val PRIMARY_BORDER = 2.dp
 
 private const val ACCENT_BORDER_ALPHA = 0.55f
 private const val BADGE_BORDER_ALPHA = 0.6f
