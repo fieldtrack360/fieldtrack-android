@@ -73,6 +73,14 @@ public data class TrackerConfig(
         if (motion.stationaryGeofenceOnExitEvent.isBlank()) {
             add("motion.stationaryGeofenceOnExitEvent must not be blank")
         }
+        // Only when it will actually be posted: a host that leaves the diagnostic off has
+        // no reason to be refused start-up over a string nothing reads.
+        if (service.showSyncStatusInNotification && service.syncNotificationText.isBlank()) {
+            add("service.syncNotificationText must not be blank when showSyncStatusInNotification is on")
+        }
+        if (service.syncNotificationTitle?.isBlank() == true) {
+            add("service.syncNotificationTitle must not be blank — use null to keep notificationTitle")
+        }
         // Checked here rather than where it is consumed, because a typo'd base URL should
         // fail while the host is assembling config — not one `configure()` call later in a
         // different module, reported against a path the host did not write.
@@ -422,6 +430,24 @@ public data class TrackerConfig(
         public fun notificationSmallIconResName(value: String?): Builder =
             apply { service = service.copy(notificationSmallIconResName = value) }
 
+        /** Diagnostic only — see [ServiceConfig.showSyncStatusInNotification]. */
+        public fun showSyncStatusInNotification(value: Boolean): Builder =
+            apply { service = service.copy(showSyncStatusInNotification = value) }
+
+        /**
+         * The upload-status wording, the same shape as [notification].
+         *
+         * @param title `null` keeps the tracking title — see [ServiceConfig.syncNotificationTitle].
+         * @param text supports `{pending}` and `{age}` — see [ServiceConfig.syncNotificationText].
+         */
+        public fun syncNotification(title: String?, text: String): Builder =
+            apply {
+                service = service.copy(
+                    syncNotificationTitle = title,
+                    syncNotificationText = text,
+                )
+            }
+
         // ── persistence ──────────────────────────────────────────────────────
 
         public fun maxDaysToPersist(value: Int): Builder =
@@ -691,6 +717,55 @@ public data class ServiceConfig(
     val notificationChannelId: String = "trackit_tracking",
     val notificationChannelName: String = "Location tracking",
     val notificationSmallIconResName: String? = null,
+    /**
+     * Replace [notificationText] with a live upload-queue status while tracking:
+     * `unsynced 42 · last upload 21m ago`.
+     *
+     * **Defaults off, and should stay off in a shipping app.** It is a diagnostic. The
+     * ongoing notification is the one piece of SDK surface a real user reads, and
+     * "unsynced 42" means nothing to them while meaning something alarming.
+     *
+     * What it is *for* is the one test that cannot be run from inside the app: kill the
+     * host, take the device offline, wait, bring connectivity back, and confirm the queue
+     * drains — all without launching anything, because launching the app is itself a
+     * trigger and would invalidate the test. The notification is the only readout that
+     * survives that, and it needs no debugger, no adb, and no server-side check.
+     *
+     * Refreshed on the [watchdogIntervalMs] tick, so the number lags reality by up to that
+     * long. A count that has not moved for one tick has not necessarily stalled.
+     *
+     * The wording is [syncNotificationTitle] and [syncNotificationText], set the same way
+     * [notificationTitle] and [notificationText] are.
+     */
+    val showSyncStatusInNotification: Boolean = false,
+    /**
+     * Title shown while the upload status is on screen, or `null` to keep
+     * [notificationTitle].
+     *
+     * Null by default because the title is the app's identity in the shade — a host that
+     * wants "Recording your location" there while tracking generally wants it there during
+     * a sync backlog too. Set it when the two states deserve different headlines.
+     */
+    val syncNotificationTitle: String? = null,
+    /**
+     * The upload-status line, with two placeholders substituted at post time:
+     *
+     * | Token | Becomes |
+     * |---|---|
+     * | `{pending}` | rows queued and not yet uploaded, e.g. `42` |
+     * | `{age}` | how long since the last confirmed upload, e.g. `21m ago`, or `never` |
+     *
+     * An unknown `{token}` is left alone rather than blanked, so a typo shows up on the
+     * notification as itself instead of silently vanishing.
+     *
+     * Both tokens are optional and may appear in any order — `"{pending} to upload"` is a
+     * perfectly good template. Including neither is allowed and gives a static string,
+     * which is a reasonable choice for a shipping app that wants to say "syncing" without
+     * putting a number in front of a user.
+     *
+     * Ignored entirely unless [showSyncStatusInNotification] is on.
+     */
+    val syncNotificationText: String = "unsynced {pending} · last upload {age}",
 )
 
 @Serializable

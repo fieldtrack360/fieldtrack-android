@@ -89,6 +89,7 @@ import com.field360.tracker.permission.PermissionManager
 import com.field360.tracker.permission.ProviderStateMonitor
 import com.field360.tracker.service.HealthLoop
 import com.field360.tracker.work.DaoUploadQueueStats
+import com.field360.tracker.work.UploadQueueStats
 import com.field360.tracker.work.SyncScheduler
 import com.field360.tracker.work.Watchdog
 import kotlinx.coroutines.CoroutineScope
@@ -207,9 +208,23 @@ internal class TrackerGraph private constructor(
     /** The one public door fieldtrack-sync uploads through. */
     val pendingUploads: PendingUploadStore by lazy { PendingUploadStoreImpl(pointDao) }
 
+    /**
+     * How deep the upload queue is and when it last drained.
+     *
+     * Hoisted out of [syncScheduler] so the two readers share one instance rather than
+     * each wrapping the DAO themselves. `TrackingService` is the second reader — it
+     * renders these numbers into the ongoing notification when
+     * `ServiceConfig.showSyncStatusInNotification` is on.
+     *
+     * Note this is a **core** type reading core's own table, not a call into
+     * `fieldtrack-sync`: the queue is rows in `TrackPointDao`, so counting them needs no
+     * dependency on the sync artifact and works identically when it is absent.
+     */
+    val uploadQueueStats: UploadQueueStats by lazy { DaoUploadQueueStats(pointDao) }
+
     /** The door in the other direction: core asking for a drain (G-4). */
     val syncScheduler: SyncScheduler by lazy {
-        SyncScheduler(DaoUploadQueueStats(pointDao), clock, logger)
+        SyncScheduler(uploadQueueStats, clock, logger)
     }
 
     // ── platform seams ──────────────────────────────────────────────────────

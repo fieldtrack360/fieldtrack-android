@@ -193,15 +193,26 @@ class TrackerViewModel(
     /** What the host passed to `persistRawFixes()`. The SDK exposes no way to read it back. */
     private val persistRawFixes: Boolean = false,
     /**
-     * Re-runs `configure()` with the given session id in `extraParams`.
+     * Re-runs `configure()` with the given session in `extraParams`.
+     *
+     * Takes the whole [TrackSession] rather than its id, because the host formats the
+     * envelope's `session_id` from `startedAtMs` — see `SampleApplication.SESSION_ID_FORMAT`.
+     * Which field of the session ends up on the wire is the host's business, so it gets
+     * the session and decides.
      *
      * A lambda rather than the `Application` itself: a view model holding a Context is how
      * one outlives the process it came from, and this needs exactly one capability from it.
      */
-    private val onSessionChanged: (String?) -> Unit = {},
+    private val onSessionChanged: (TrackSession?) -> Unit = {},
 ) : ViewModel() {
 
-    /** The session id currently baked into `SyncConfig.extraParams`. */
+    /**
+     * The session id whose details are currently baked into `SyncConfig.extraParams`.
+     *
+     * Deliberately the SDK's id and not the formatted string the host actually sends: two
+     * sessions started in the same minute format identically, so guarding on the rendered
+     * value would skip the `configure()` for the second of them.
+     */
     private var configuredSessionId: String? = null
 
     /** The `observePoints()` subscription for the open session. See [observeSessionPoints]. */
@@ -313,6 +324,16 @@ class TrackerViewModel(
         val syncEndpoint: String? = null,
         /** Sent as `device_id` in the request envelope. A generated per-install UUID. */
         val syncDeviceId: String = "",
+        /**
+         * Sent as `session_id` in the request envelope: the session's start time, in the
+         * device's timezone, per `sessionEnvelopeId`.
+         *
+         * Null while no session is open, which is exactly when the field is omitted from
+         * the envelope rather than sent empty. Held here so the Home card reports what is
+         * actually on the wire — this is deliberately NOT `state.sessionId`, which is the
+         * SDK's id and no longer what gets uploaded.
+         */
+        val syncSessionId: String? = null,
         val syncQueued: Int = 0,
         val syncLastEvent: String = "",
         /**
@@ -380,7 +401,14 @@ class TrackerViewModel(
                 // thrash both.
                 if (sdk.currentSessionId != configuredSessionId) {
                     configuredSessionId = sdk.currentSessionId
-                    onSessionChanged(sdk.currentSessionId)
+                    // The row, not just the id: the host needs `startedAtMs` to build the
+                    // `session_id` it sends. Null when the session just closed, which is
+                    // the case that clears the field from the envelope entirely.
+                    val session = sdk.currentSessionId?.let { tracker.currentSession() }
+                    onSessionChanged(session)
+                    // The same function the envelope uses, so the card cannot claim to be
+                    // sending something other than what went out.
+                    _state.update { it.copy(syncSessionId = session?.let(::sessionEnvelopeId)) }
                     observeSessionPoints(sdk.currentSessionId)
                 }
             }

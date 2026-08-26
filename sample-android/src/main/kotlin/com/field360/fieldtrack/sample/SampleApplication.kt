@@ -9,6 +9,7 @@ import com.field360.tracker.LocationProviderType
 import com.field360.tracker.Tracker
 import com.field360.tracker.TrackerConfig
 import com.field360.tracker.TrackingMode
+import com.field360.tracker.domain.model.TrackSession
 import com.field360.tracker.domain.model.TrackerGeofence
 import com.field360.tracker.domain.model.TrackerResult
 import com.field360.tracker.integrity.IntegrityPolicy
@@ -22,6 +23,10 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import java.time.Duration
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 
 /**
  * A plain `Application` — no DI framework, no annotations, nothing the SDK requires.
@@ -220,6 +225,17 @@ class SampleApplication : Application() {
             // By NAME, not by @DrawableRes id: the config is persisted, and an id does not
             // survive the next R regeneration. Resolved against this app's resources.
             .notificationSmallIconResName("ic_stat_tracking")
+            // On here and off in the SDK's defaults, which is the right way round. It
+            // replaces the notification text with `unsynced 42 · last upload 21m ago`, so
+            // the offline-backlog test can be read off the lock screen with the app dead —
+            // the only way to run that test without the act of observing it (launching the
+            // app) becoming a sync trigger and invalidating the result.
+            .showSyncStatusInNotification(true)
+            // Its wording, set the same way `notification()` above sets the tracking one.
+            // `{pending}` and `{age}` are substituted at post time; a template with neither
+            // is legal and gives a static string. The title is stated rather than left null
+            // so the shade says which of the two states is on screen.
+            .syncNotification("FieldTrack sample · upload", "unsynced {pending} · last upload {age}")
 
             // ── persistence ─────────────────────────────────────────────────
             .maxDaysToPersist(7)
@@ -297,6 +313,13 @@ class SampleApplication : Application() {
      * was current at the last `configure()`, and the server has no way to tell. `SyncPoint`
      * carries no session id of its own, so nothing downstream can correct it.
      *
+     * ## What this sample sends as `session_id`
+     *
+     * The session's **start time**, formatted for a human — not the SDK's id. See
+     * [SESSION_ID_FORMAT] for the trade that makes, and read it before copying this into a
+     * production host: the SDK's `TrackSession.id` is a unique identifier and a formatted
+     * minute is not.
+     *
      * It is right when the queue is drained before each session ends, which for an online
      * device it effectively is. It is wrong for exactly the offline backlog this SDK is
      * built to survive. If per-row attribution matters, the honest fix is a `session_id`
@@ -305,7 +328,7 @@ class SampleApplication : Application() {
      * Re-`configure()` also clears a 403 halt, which is its documented recovery path. A
      * halted uploader therefore un-halts at the next session start and retries once.
      */
-    fun installSync(sessionId: String? = null) {
+    fun installSync(session: TrackSession? = null) {
         val url = BuildConfig.SYNC_URL
         if (url.isBlank()) return
 
@@ -348,7 +371,7 @@ class SampleApplication : Application() {
                             // Omitted rather than sent null while no session is open:
                             // `null` is not a supported extraParams value, and a literal
                             // "none" would be a session id the server could index on.
-                            sessionId?.let { put("session_id", it) }
+                            session?.let { put("session_id", sessionEnvelopeId(it)) }
                         },
                     )
                     .build(),
@@ -410,3 +433,50 @@ class SampleApplication : Application() {
         const val PERSIST_RAW_POINTS: Boolean = true
     }
 }
+
+/**
+ * What this sample sends as the upload envelope's `session_id`: `26-08-2026 03:14 PM`.
+ *
+ * Top-level and `internal` rather than private to [SampleApplication] because two places
+ * need the same answer — the envelope that goes out, and the Home screen row that claims
+ * what went out. Two formatters would drift, and a screen that misreports the wire is
+ * worse than one that reports nothing.
+ *
+ * `TrackSession.startedAtMs` is wall-clock milliseconds, rendered against
+ * [ZoneId.systemDefault] — the clock the field worker was actually looking at. The
+ * instant is fixed at session start; a device carried across a timezone mid-session
+ * changes only how it renders, never which moment it names.
+ *
+ * **This replaces the SDK's `TrackSession.id`, and that is a trade the sample is making
+ * deliberately, not a pattern to copy blindly.** What it gives up:
+ *
+ *  - **Uniqueness.** Two sessions started in the same minute produce the same string.
+ *    A double tap on Start does exactly that — `StartTrackingUseCase` opens a new session
+ *    per call — and the server cannot tell the two apart.
+ *  - **Correlation.** Nothing on the wire now matches the id the SDK stores locally, so an
+ *    uploaded batch cannot be traced back to a session in the on-device database or in the
+ *    debug overlay.
+ *
+ * What it buys is a value readable in a backend without a join, which for a diagnostic
+ * sample is worth more than either. A production host that wants both should send the id
+ * and put the formatted time in a field of its own.
+ */
+internal fun sessionEnvelopeId(session: TrackSession): String =
+    SESSION_ID_FORMAT.format(
+        Instant.ofEpochMilli(session.startedAtMs).atZone(ZoneId.systemDefault()),
+    )
+
+/**
+ * The pattern the user asked for, with two choices worth stating.
+ *
+ * `Locale.US` is pinned rather than left to the device, and that is not cosmetic: `hh` and
+ * `a` are locale-sensitive, so on a Hindi or Arabic device the default locale renders
+ * localised digits and a localised AM/PM marker. The server would receive
+ * `०३:१४ पूर्वाह्न` where it expected `03:14 PM`. The *timezone* still follows the
+ * device — only the rendering is fixed.
+ *
+ * `DateTimeFormatter` and not `SimpleDateFormat`: this is read from whichever thread calls
+ * `installSync`, and `SimpleDateFormat` is mutable and not thread-safe.
+ */
+private val SESSION_ID_FORMAT: DateTimeFormatter =
+    DateTimeFormatter.ofPattern("dd-MM-yyyy hh:mm a", Locale.US)

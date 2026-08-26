@@ -218,6 +218,14 @@ fun HomeScreen(
                     // A generated per-install UUID: without it on screen there is no way
                     // to correlate a row on the server with the install that sent it.
                     KeyValue("device_id", state.syncDeviceId.take(DEVICE_ID_CHARS), Hack.Cyan)
+                    // The session's start time, not the SDK's session id — see
+                    // `sessionEnvelopeId`. Shown whole rather than truncated: the whole
+                    // point of the format is that it is readable.
+                    KeyValue(
+                        "session_id",
+                        state.syncSessionId ?: "omitted · no session",
+                        if (state.syncSessionId == null) Hack.Dim else Hack.Cyan,
+                    )
                 }
                 // Outside the branch on purpose. Rows accumulate whether or not anything
                 // can upload them, and a queue that is merely growing emits no events at

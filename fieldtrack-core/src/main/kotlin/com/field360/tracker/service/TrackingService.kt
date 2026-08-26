@@ -22,6 +22,7 @@ import com.field360.tracker.domain.repository.ConfigRepository
 import com.field360.traker.geo.port.TrackLogger
 import com.field360.tracker.motion.MotionController
 import com.field360.tracker.work.RestoreWorker
+import com.field360.tracker.work.UploadQueueStats
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -59,6 +60,8 @@ public class TrackingService : LifecycleService() {
 
     private val configRepository: ConfigRepository get() = graph.config
 
+    private val queueStats: UploadQueueStats get() = graph.uploadQueueStats
+
     /** The supervision coroutines for the session currently being served. */
     private var supervision: Job? = null
 
@@ -67,6 +70,18 @@ public class TrackingService : LifecycleService() {
      * persisted config it just read differs from what is already on screen.
      */
     private var postedNotification: ServiceConfig? = null
+
+    /**
+     * The upload-queue line currently on screen, or null when the feature is off or
+     * nothing has been read yet.
+     *
+     * Tracked separately from [postedNotification] because it changes for a different
+     * reason and on a different clock: the config moves when the host reconfigures, this
+     * moves every time a row is queued or drained. Comparing it before re-posting is what
+     * keeps a stationary device with a settled queue from re-notifying once a minute
+     * forever.
+     */
+    private var postedStatusLine: String? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
@@ -142,6 +157,18 @@ public class TrackingService : LifecycleService() {
                     motionController.tick()
                 }
             }
+
+            // Its own loop rather than a line inside the tick above: this one touches the
+            // database and the notification manager, and a slow query must not delay the
+            // motion clock that the stop timeout depends on.
+            if (config.service.showSyncStatusInNotification) {
+                launch {
+                    while (isActive) {
+                        refreshSyncStatus(config.service)
+                        delay(config.service.watchdogIntervalMs)
+                    }
+                }
+            }
         }
     }
 
@@ -151,7 +178,54 @@ public class TrackingService : LifecycleService() {
         postedNotification = config
         runCatching {
             getSystemService(NotificationManager::class.java)
-                .notify(NOTIFICATION_ID, buildNotification(config))
+                .notify(NOTIFICATION_ID, buildNotification(config, postedStatusLine))
+        }
+    }
+
+    /**
+     * Reads the upload queue and re-posts the notification when the answer has changed.
+     *
+     * The whole point of putting this on the notification is that it is readable with the
+     * host app dead — see [ServiceConfig.showSyncStatusInNotification]. So every failure
+     * here is swallowed into a line that says so rather than propagated: this runs in the
+     * supervision scope, and an exception would take the force-capture collector and the
+     * motion clock down with it over a diagnostic.
+     */
+    private suspend fun refreshSyncStatus(config: ServiceConfig) {
+        // Nothing is listening for a drain, so the queue depth is not a backlog — see
+        // `SyncScheduler.isConfigured`. Checked on every tick rather than once, because a
+        // host may call `configure()` after tracking has started, and a 401/403 can clear
+        // it mid-session; the line appears and disappears with it.
+        if (!graph.syncScheduler.isConfigured) {
+            // Put the host's own text back if a status line is currently on screen. Only
+            // then: an unconditional re-post would re-notify every tick for the whole life
+            // of a session that never had sync configured.
+            if (postedStatusLine != null) {
+                postedStatusLine = null
+                runCatching {
+                    getSystemService(NotificationManager::class.java)
+                        .notify(NOTIFICATION_ID, buildNotification(postedNotification ?: config))
+                }
+            }
+            return
+        }
+
+        val line = runCatching {
+            syncStatusLine(
+                template = config.syncNotificationText,
+                pending = queueStats.pendingCount(),
+                lastSyncMs = queueStats.lastSyncTimeMs(),
+                nowMs = graph.clock.wallTimeMs(),
+            )
+        }.getOrElse { "upload status unavailable" }
+
+        if (line == postedStatusLine) return
+        postedStatusLine = line
+
+        val current = postedNotification ?: config
+        runCatching {
+            getSystemService(NotificationManager::class.java)
+                .notify(NOTIFICATION_ID, buildNotification(current, line))
         }
     }
 
@@ -212,7 +286,7 @@ public class TrackingService : LifecycleService() {
     private fun cachedServiceConfig(): ServiceConfig =
         graph.configStore.cached?.service ?: ServiceConfig()
 
-    private fun buildNotification(config: ServiceConfig): Notification {
+    private fun buildNotification(config: ServiceConfig, statusLine: String? = null): Notification {
         val manager = getSystemService(NotificationManager::class.java)
         // Re-created on every start: a user-deleted channel makes the notification
         // invisible and gets the service killed on some OEMs (EC-76).
@@ -224,8 +298,16 @@ public class TrackingService : LifecycleService() {
         manager.createNotificationChannel(channel)
 
         return NotificationCompat.Builder(this, config.notificationChannelId)
-            .setContentTitle(config.notificationTitle)
-            .setContentText(config.notificationText)
+            // The sync title only applies while a sync line is actually on screen, and
+            // only when the host set one — null means "the tracking title is right for
+            // both states", which is the common case.
+            .setContentTitle(
+                statusLine?.let { config.syncNotificationTitle } ?: config.notificationTitle,
+            )
+            // The status line REPLACES the host's text rather than appending to it. The
+            // collapsed notification shows one line, and a concatenation would push the
+            // number — the only part being read during the test — off the end of it.
+            .setContentText(statusLine ?: config.notificationText)
             .setSmallIcon(resolveSmallIcon(config.notificationSmallIconResName))
             .setOngoing(true)
             .setSilent(true)
@@ -324,6 +406,58 @@ public class TrackingService : LifecycleService() {
  * (A13). A `SharedFlow` has no such failure mode: if nothing is running, there is
  * simply no collector.
  */
+/**
+ * Renders [ServiceConfig.syncNotificationText] against the queue — by default
+ * `unsynced 42 · last upload 21m ago`.
+ *
+ * Both default halves earn their place. The count alone cannot tell a queue that is
+ * draining from one that is merely not growing — a parked device stores nothing, so a
+ * still count is the *expected* reading, not a stalled one. The upload age is what
+ * separates them: it resets the moment anything reaches the server. A host that overrides
+ * the template and keeps only `{pending}` gives that up knowingly.
+ *
+ * Substitution is literal and order-independent, and an unrecognised `{token}` is left
+ * exactly as written — a typo then shows up on the notification as itself rather than
+ * silently becoming an empty string, which is the failure that would otherwise be
+ * diagnosed as "the sync status is broken".
+ *
+ * Internal and top-level rather than a private method, so the formatting is reachable from
+ * a JVM test without standing up a Service.
+ */
+internal fun syncStatusLine(
+    template: String,
+    pending: Int,
+    lastSyncMs: Long?,
+    nowMs: Long,
+): String {
+    val age = when {
+        lastSyncMs == null || lastSyncMs <= 0L -> "never"
+        // A clock that moved backwards — an NTP correction, a user editing the date —
+        // would otherwise render a negative age. "just now" is wrong by at most the skew
+        // and is never nonsense.
+        nowMs <= lastSyncMs -> "just now"
+        else -> formatAge(nowMs - lastSyncMs)
+    }
+    return template
+        .replace(TOKEN_PENDING, pending.toString())
+        .replace(TOKEN_AGE, age)
+}
+
+private const val TOKEN_PENDING = "{pending}"
+private const val TOKEN_AGE = "{age}"
+
+private fun formatAge(millis: Long): String {
+    val seconds = millis / 1_000
+    val minutes = seconds / 60
+    val hours = minutes / 60
+    return when {
+        seconds < 60 -> "${seconds}s ago"
+        minutes < 60 -> "${minutes}m ago"
+        hours < 24 -> "${hours}h ago"
+        else -> "${hours / 24}d ago"
+    }
+}
+
 internal object CaptureBus {
     val forceCapture: MutableSharedFlow<Unit> = MutableSharedFlow(extraBufferCapacity = 1)
 
