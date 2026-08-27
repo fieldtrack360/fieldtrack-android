@@ -5,7 +5,9 @@ import com.field360.traker.geo.model.FixDecision
 import com.field360.traker.geo.model.MotionState
 import com.field360.traker.geo.model.ProviderSnapshot
 import com.field360.traker.geo.model.TrackPoint
+import com.field360.tracker.TrackingMode
 import com.field360.tracker.integrity.IntegrityReport
+import com.field360.tracker.motion.MotionQuality
 import kotlinx.serialization.Serializable
 
 /**
@@ -351,6 +353,39 @@ public data class TrackerState(
     val motionState: MotionState = MotionState.STOPPED,
     val providerState: ProviderState = ProviderState(),
     val currentSessionId: String? = null,
+    /**
+     * What the SDK concluded about this device's motion hardware at `ready()`.
+     *
+     * Carried on the state rather than left to the `MOTION_DETECTION_DEGRADED` event
+     * alone, because that event cannot be relied on. It is emitted *inside* `ready()`, and
+     * `Tracker.events` is a `SharedFlow` with `replay = 0` — a host that follows the
+     * documented order (`ready()` in `Application.onCreate`, collector in an Activity or
+     * view model) starts collecting after the emit and never sees it. A `StateFlow` always
+     * has a current value, so a late collector still gets this.
+     *
+     * `POOR` means motion gating is not trustworthy on this hardware and the configured
+     * `trackingMode` was overridden — see [effectiveTrackingMode]. Note it is not purely a
+     * hardware verdict: `ACTIVITY_RECOGNITION` being denied reaches `POOR` on a device with
+     * no significant-motion or step sensor, so this can change when a grant does.
+     *
+     * `Tracker.getSensors()` remains the way to ask *which* sensors are missing; this is
+     * the one-value answer to whether it matters.
+     */
+    val motionQuality: MotionQuality = MotionQuality.FULL,
+    /**
+     * The tracking mode actually in force, which is not always the one that was asked for.
+     *
+     * On `motionQuality = POOR` the SDK rewrites the mode to
+     * [TrackingMode.CONTINUOUS] — running a motion-gated design on hardware that cannot
+     * detect motion produces gaps the user blames on the SDK (EC-137). Nothing else
+     * exposes the resolved config, so without this a host has no way to learn that the
+     * `MOTION_ONLY` it requested is not what is running.
+     *
+     * Worth reading before attributing battery use to a mode: `CONTINUOUS` keeps the
+     * location stream registered while stationary and `MOTION_ONLY` does not, so this
+     * override costs materially more power than the mode it replaces.
+     */
+    val effectiveTrackingMode: TrackingMode = TrackingMode.ADAPTIVE,
 )
 
 /**

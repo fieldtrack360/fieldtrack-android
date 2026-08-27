@@ -8,6 +8,8 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.field360.tracker.RawFix
 import com.field360.tracker.Tracker
+import com.field360.tracker.TrackerConfig
+import com.field360.tracker.TrackingMode
 import com.field360.tracker.domain.model.ErrorCode
 import com.field360.tracker.domain.model.LicenseStatus
 import com.field360.tracker.domain.model.LocationAccuracy
@@ -18,6 +20,8 @@ import com.field360.tracker.domain.model.TrackSession
 import com.field360.tracker.domain.model.TrackerEvent
 import com.field360.tracker.domain.model.TrackerGeofence
 import com.field360.tracker.domain.model.TrackerResult
+import com.field360.tracker.motion.DeviceSensors
+import com.field360.tracker.motion.MotionQuality
 import com.field360.tracker.permission.PermissionManager
 import com.field360.traker.geo.math.Geodesy
 import com.field360.traker.geo.model.FixDecision
@@ -204,6 +208,15 @@ class TrackerViewModel(
      * one outlives the process it came from, and this needs exactly one capability from it.
      */
     private val onSessionChanged: (TrackSession?) -> Unit = {},
+    /**
+     * What the host handed `ready()` at startup — the seed for the config console, and
+     * what its Reset button returns to.
+     *
+     * Passed in rather than rebuilt here because there must be exactly one answer to "what
+     * is this app configured with". The screen edits a copy of this value; nothing reads
+     * the SDK's resolved config back, because `Tracker` exposes no way to.
+     */
+    private val defaultConfig: TrackerConfig = TrackerConfig(),
 ) : ViewModel() {
 
     /**
@@ -265,6 +278,28 @@ class TrackerViewModel(
         val sessionId: String? = null,
         val motionState: MotionState = MotionState.STOPPED,
         val providerState: ProviderState = ProviderState(),
+        /**
+         * What motion hardware this device has, from `Tracker.getSensors()`.
+         *
+         * Null until the first probe. Re-read on every resume, because the verdict depends
+         * on `ACTIVITY_RECOGNITION` as well as on hardware.
+         */
+        val deviceSensors: DeviceSensors? = null,
+        /**
+         * The SDK's own verdict, off `TrackerState` rather than off the probe above.
+         *
+         * The two agree, and both are here on purpose: this one is what the SDK *acted*
+         * on at `ready()`, and [deviceSensors] is which sensors explain it. Read from the
+         * state flow because the `MOTION_DETECTION_DEGRADED` event fires inside `ready()`
+         * — before this view model exists — and `events` has `replay = 0`, so the event
+         * itself never reaches this app.
+         */
+        val motionQuality: MotionQuality = MotionQuality.FULL,
+        /**
+         * The mode actually in force. Differs from the configured one when the SDK
+         * overrode it on POOR hardware.
+         */
+        val effectiveTrackingMode: TrackingMode = TrackingMode.ADAPTIVE,
         val pointCount: Int = 0,
         val lastEvent: String = "",
         val lastHeartbeatAtMs: Long? = null,
@@ -350,9 +385,40 @@ class TrackerViewModel(
         val registeredGeofenceCount: Int = 0,
         val geofenceEventCount: Int = 0,
         val geofences: List<TrackerGeofence> = emptyList(),
+
+        // ── the config console ──────────────────────────────────────────────
+
+        /** The config being edited on screen. Not yet given to the SDK. */
+        val configDraft: TrackerConfig = TrackerConfig(),
+        /**
+         * The last config `ready()` actually accepted.
+         *
+         * Kept beside the draft so the screen can mark, per field, which values the SDK
+         * has not been told about — a diff of two configs, rather than a dirty flag the
+         * editor has to remember to set and Apply has to remember to clear.
+         */
+        val configApplied: TrackerConfig = TrackerConfig(),
+        /**
+         * Raw text for the fields currently being typed in, keyed by field name.
+         *
+         * Needed because `""` and `"-"` are not valid `Long`s but are what every number
+         * looks like halfway through being typed. The box shows this string; the draft
+         * above only ever holds parsed values.
+         */
+        val configText: Map<String, String> = emptyMap(),
+        /** Fields whose typed text does not parse. Apply refuses while this is non-empty. */
+        val configInvalid: Set<String> = emptySet(),
+        /** `TrackerConfig.validate()`, verbatim, from the last refused Apply. */
+        val configErrors: List<String> = emptyList(),
+        /** True across the stop → ready → start cycle, so Apply cannot be pressed twice. */
+        val configApplying: Boolean = false,
+        /** What the last Apply did, in one line. Cleared by the next edit. */
+        val configNotice: String? = null,
     )
 
-    private val _state = MutableStateFlow(UiState())
+    private val _state = MutableStateFlow(
+        UiState(configDraft = defaultConfig, configApplied = defaultConfig),
+    )
     val state: StateFlow<UiState> = _state.asStateFlow()
 
     /**
@@ -392,6 +458,8 @@ class TrackerViewModel(
                         sessionId = sdk.currentSessionId,
                         motionState = sdk.motionState,
                         providerState = sdk.providerState,
+                        motionQuality = sdk.motionQuality,
+                        effectiveTrackingMode = sdk.effectiveTrackingMode,
                     )
                 }
                 // `extraParams` is frozen when configure() runs, so a session_id that is
@@ -1203,6 +1271,180 @@ class TrackerViewModel(
         refresh()
     }
 
+    // ── the config console ──────────────────────────────────────────────────
+
+    /**
+     * An edit that cannot be invalid — a toggle, a dropdown.
+     *
+     * Takes the whole transform rather than a field name and a value, which is what keeps
+     * this view model free of the config schema: the screen knows which `copy()` a row
+     * writes to, and this knows nothing except that the draft moved.
+     *
+     * Clears the last validator output. Those errors describe the config that was
+     * refused, and leaving them under a screen the user has since edited is how a fixed
+     * problem goes on being reported.
+     */
+    fun editConfig(transform: (TrackerConfig) -> TrackerConfig) {
+        _state.update {
+            it.copy(
+                configDraft = transform(it.configDraft),
+                configErrors = emptyList(),
+                configNotice = null,
+            )
+        }
+    }
+
+    /**
+     * An edit typed into a box, which may not be a value of its field's type yet.
+     *
+     * The typed string is always kept — see [UiState.configText]. The draft moves only
+     * when [parse] answers, and the field is remembered as invalid until it does, which is
+     * what [applyConfig] refuses on. Discarding the text instead and showing the last good
+     * value would make a number impossible to clear and retype.
+     */
+    fun editConfigText(
+        key: String,
+        raw: String,
+        parse: (TrackerConfig, String) -> TrackerConfig?,
+    ) {
+        _state.update { current ->
+            val parsed = parse(current.configDraft, raw)
+            current.copy(
+                configDraft = parsed ?: current.configDraft,
+                configText = current.configText + (key to raw),
+                configInvalid = if (parsed == null) {
+                    current.configInvalid + key
+                } else {
+                    current.configInvalid - key
+                },
+                configErrors = emptyList(),
+                configNotice = null,
+            )
+        }
+    }
+
+    /** Back to what this app configured at startup — every value in `buildTrackerConfig`. */
+    fun resetConfig() = seedConfig(defaultConfig, "reset to the sample's startup config")
+
+    /**
+     * Back to `TrackerConfig()` — the SDK's own defaults, none of the sample's choices.
+     *
+     * Worth having as a separate button: the two differ in about a dozen fields, and "does
+     * this reproduce on a stock config" is the first question worth asking about any
+     * capture problem this app is used to chase.
+     */
+    fun resetConfigToSdkDefaults() = seedConfig(TrackerConfig(), "reset to SDK defaults")
+
+    private fun seedConfig(config: TrackerConfig, notice: String) {
+        _state.update {
+            it.copy(
+                configDraft = config,
+                configText = emptyMap(),
+                configInvalid = emptySet(),
+                configErrors = emptyList(),
+                configNotice = "$notice — press apply to send it to the SDK",
+            )
+        }
+    }
+
+    /**
+     * Hand the draft to the SDK, restarting the session if one is open.
+     *
+     * Three gates, in the order that produces the most useful message:
+     *
+     *  1. an unparseable box — named here rather than by `validate()`, which would report
+     *     the *last good* value and send the reader looking at a field that is fine;
+     *  2. `validate()`, whose output is printed verbatim;
+     *  3. `ready()`'s own answer, which is where a licence or integrity refusal shows up.
+     *
+     * The restart is not cosmetic. `intervalMs`, the notification, the foreground service
+     * and the cadence tiers are all bound when a session starts, so a `ready()` alone
+     * would leave the screen showing a config the running session is not using — the one
+     * failure mode a config editor must not have.
+     */
+    fun applyConfig() {
+        val current = _state.value
+        if (current.configApplying) return
+        if (current.configInvalid.isNotEmpty()) {
+            _state.update { state ->
+                state.copy(
+                    configErrors = current.configInvalid.sorted()
+                        .map { key -> "$key is not a value of its type" },
+                    configNotice = null,
+                )
+            }
+            return
+        }
+        val draft = current.configDraft
+        val errors = draft.validate()
+        if (errors.isNotEmpty()) {
+            captureLog.note("CONFIG", "refused: ${errors.joinToString("; ")}")
+            _state.update { it.copy(configErrors = errors, configNotice = null) }
+            return
+        }
+        viewModelScope.launch { applyConfigNow(draft) }
+    }
+
+    private suspend fun applyConfigNow(draft: TrackerConfig) {
+        val wasTracking = _state.value.isTracking
+        _state.update {
+            it.copy(configApplying = true, configErrors = emptyList(), configNotice = null)
+        }
+        captureLog.note("CONFIG", "apply requested restartSession=$wasTracking")
+
+        // Stopped before `ready()`, not after: a session closed afterwards would be closed
+        // under the new config, and its stored points would then be attributable to
+        // neither. Dumped to the log first for the same reason `stop()` does it — the run
+        // that is about to be replaced is the one worth keeping a record of.
+        if (wasTracking) {
+            val sessionId = tracker.currentSession()?.id ?: _state.value.sessionId
+            tracker.stop()
+            captureLog.note("CONFIG", "stopped session=${sessionId ?: "-"} to reconfigure")
+            dumpSession(sessionId)
+        }
+
+        when (val result = tracker.ready(draft)) {
+            is TrackerResult.Ok -> {
+                captureLog.note("CONFIG", "ready() ok state=${result.value}")
+                _state.update {
+                    it.copy(
+                        configApplied = draft,
+                        configText = emptyMap(),
+                        configInvalid = emptySet(),
+                        configApplying = false,
+                        configNotice = if (wasTracking) {
+                            "applied · session restarted"
+                        } else {
+                            "applied · takes effect on the next start"
+                        },
+                    )
+                }
+                if (wasTracking) launchStart().join()
+                _toasts.tryEmit(if (wasTracking) "Config applied, session restarted" else "Config applied")
+            }
+
+            is TrackerResult.Error -> {
+                captureLog.note("CONFIG", "ready() failed code=${result.code} message=${result.message}")
+                _state.update {
+                    it.copy(
+                        configApplying = false,
+                        configErrors = listOf("${result.code}: ${result.message}"),
+                        // Said out loud: the session is already gone at this point, and a
+                        // screen that reported only the refusal would leave the tester
+                        // believing their run is still recording.
+                        configNotice = if (wasTracking) {
+                            "not applied — the session was stopped and NOT restarted"
+                        } else {
+                            "not applied"
+                        },
+                    )
+                }
+            }
+        }
+        loadSessions()
+        refresh()
+    }
+
     /** Requests a snapshot without starting or modifying a tracking session. */
     fun testCurrentLocation() = runApiCheck("CURRENT") {
         when (val result = tracker.getCurrentLocation()) {
@@ -1544,6 +1786,23 @@ class TrackerViewModel(
                 showBackgroundDialog = it.showBackgroundDialog && step.isActionable(),
             )
         }
+        // Re-probed here, not only at startup. `MotionQuality` depends on
+        // ACTIVITY_RECOGNITION as well as on hardware, so a grant made in Settings changes
+        // the verdict — and a card still reporting POOR after the user fixed it is worse
+        // than no card. This runs on every resume, which is exactly when a grant can have
+        // changed behind the app's back.
+        refreshSensors()
+    }
+
+    /**
+     * What motion hardware this device has, straight from the SDK.
+     *
+     * A probe rather than a stored value: `SensorProbe` reads the `SensorManager` and the
+     * current permission state each time, and both can move. Cheap enough to call on every
+     * resume — it is a handful of `getDefaultSensor` lookups and no I/O.
+     */
+    private fun refreshSensors() {
+        _state.update { it.copy(deviceSensors = tracker.getSensors()) }
     }
 
     /**
@@ -1612,6 +1871,10 @@ class TrackerViewModel(
                     deviceId = app.deviceId,
                     persistRawFixes = SampleApplication.PERSIST_RAW_FIXES,
                     onSessionChanged = app::installSync,
+                    // The same instance `ready()` was called with in `onCreate`, not a
+                    // second build of it: the console has to open showing what is actually
+                    // running, and two calls to a builder is two chances to disagree.
+                    defaultConfig = app.defaultConfig,
                 )
             }
         }

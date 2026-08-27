@@ -46,6 +46,7 @@ import com.field360.fieldtrack.sample.screen.hackerColorScheme
 import com.field360.fieldtrack.sample.screen.hackerTypography
 import com.field360.fieldtrack.sample.screen.LicenseAlertDialog
 import com.field360.fieldtrack.sample.screen.PermissionAlertDialog
+import com.field360.fieldtrack.sample.screen.StatusScreen
 import com.field360.fieldtrack.sample.screen.SyncAlertDialog
 import com.field360.fieldtrack.sample.screen.TrackScreen
 import java.io.File
@@ -227,16 +228,27 @@ class MainActivity : ComponentActivity() {
 }
 
 /**
- * The four screens, numbered.
+ * The five screens, numbered.
  *
  * @property code shown above the label in the bar. A number per slot is what a terminal
- *   menu offers, and it keeps the four items the same width whatever they are called.
+ *   menu offers, and it keeps the items the same width whatever they are called.
  */
 private enum class Tab(val code: String, val label: String) {
-    HOME("01", "Home"),
-    TRACK("02", "Track"),
-    DEBUG("03", "Debug"),
-    DECISIONS("04", "Decisions"),
+    /** The configuration console. See [HomeScreen]. */
+    HOME("01", "Config"),
+
+    /**
+     * What Home used to be — every diagnostic panel, unchanged.
+     *
+     * Second rather than first because a tester who has just changed a setting looks at
+     * the result of it, and the result is here. It carries the sync-queue badge for the
+     * same reason it used to sit on Home: a queue growing while nothing uploads is the
+     * fault this app exists to make visible.
+     */
+    STATUS("02", "Status"),
+    TRACK("03", "Track"),
+    DEBUG("04", "Debug"),
+    DECISIONS("05", "Decisions"),
 }
 
 @Composable
@@ -365,14 +377,19 @@ private fun SampleApp(
             code = entry.code,
             label = entry.label,
             badge = when (entry) {
+                // Config edited and not yet applied. Visible from every tab for the same
+                // reason the queue depth is: it is silently true and it changes what the
+                // next Start will do. A whole-config comparison rather than a field count
+                // — the count belongs on the screen that can show which fields.
+                Tab.HOME -> "*".takeIf { state.configDraft != state.configApplied }
                 // A queue that is growing while nothing uploads is the fault this app
                 // exists to make visible, and it is visible from every tab.
-                Tab.HOME -> state.syncQueued.takeIf { it > 0 }?.let { "Q$it" }
+                Tab.STATUS -> state.syncQueued.takeIf { it > 0 }?.let { "Q$it" }
                 Tab.TRACK -> state.points.size.takeIf { it > 0 }?.toString()
                 Tab.DEBUG -> state.rawFixes.size.takeIf { it > 0 }?.toString()
                 Tab.DECISIONS -> state.decisions.size.takeIf { it > 0 }?.toString()
             },
-            badgeColor = if (entry == Tab.HOME && state.syncFailing) Hack.Red else Hack.Amber,
+            badgeColor = if (entry == Tab.STATUS && state.syncFailing) Hack.Red else Hack.Amber,
         )
     }
 
@@ -397,10 +414,22 @@ private fun SampleApp(
     ) { padding ->
         Column(Modifier.fillMaxSize().background(Hack.Bg).padding(padding)) {
             when (tab) {
+                // The configuration console. Start and Stop live here as well as being
+                // the thing Apply drives: a config edit and the session it applies to are
+                // one decision, and splitting them across two tabs is how a value gets
+                // typed and never applied.
                 Tab.HOME -> HomeScreen(
                     state = state,
                     onStart = ::startWithLocationCheck,
                     onStop = viewModel::stop,
+                    onEditConfig = viewModel::editConfig,
+                    onEditConfigText = viewModel::editConfigText,
+                    onApplyConfig = viewModel::applyConfig,
+                    onResetConfig = viewModel::resetConfig,
+                    onResetToSdkDefaults = viewModel::resetConfigToSdkDefaults,
+                )
+                Tab.STATUS -> StatusScreen(
+                    state = state,
                     // Offered on the provider card as well as on Start: a switch flipped
                     // off mid-session suspends capture, and the fix should be one tap from
                     // the line that reports it.

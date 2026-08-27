@@ -318,6 +318,17 @@ public class Tracker internal constructor(
                 isReady = true,
                 currentSessionId = sessions.current()?.id,
                 providerState = providerStateMonitor.state.value,
+                // Both read off the RESOLVED config, not the supplied one. That is the
+                // point of publishing them: `resolveConfig` may have overridden the mode
+                // on poor motion hardware, and the `MOTION_DETECTION_DEGRADED` event that
+                // says so is emitted above, to a `replay = 0` flow, before most hosts have
+                // a collector. See `TrackerState.motionQuality`.
+                // `sensors` is null only on the validation-failure path, which returned
+                // above — so this elvis is unreachable here. Kept rather than asserted
+                // because the honest fallback is "what we already knew", and publishing a
+                // default FULL would state a hardware verdict nothing produced.
+                motionQuality = resolved.sensors?.motionQuality ?: it.motionQuality,
+                effectiveTrackingMode = resolved.config.geolocation.trackingMode,
             )
         }
         return TrackerResult.Ok(_state.value)

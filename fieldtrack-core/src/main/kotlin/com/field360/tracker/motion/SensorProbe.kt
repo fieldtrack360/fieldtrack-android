@@ -81,7 +81,14 @@ public enum class MotionQuality {
     /** Accelerometer + gyroscope + a trigger sensor. Default behaviour. */
     FULL,
 
-    /** Accelerometer present, gyroscope or trigger sensors missing. Widen stop timeout. */
+    /**
+     * Accelerometer present, gyroscope or trigger sensors missing.
+     *
+     * The mode is left alone; `ResolveConfigUseCase` doubles `motion.stopTimeoutMin`
+     * instead and emits a `Diagnostic` saying so. Stops on such a device are detected
+     * later and less certainly, and waiting longer before believing one is the cheaper
+     * error — a late stop costs a few extra fixes, a false stop costs the rest of the trip.
+     */
     DEGRADED,
 
     /** Motion gating is not trustworthy — force CONTINUOUS and tell the host. */

@@ -214,8 +214,8 @@ Fastest wins:
 |---|---|---|
 | Navigation | 1 s | `navigationMode = true` — outranks everything |
 | Turn burst | 4 s | `TurnDetector` says the vehicle is measurably turning |
-| Vehicular | 12 s | Motion state says vehicular, `adaptiveCadence = true` |
-| Normal | 60 s | Everything else |
+| Vehicular | 12 s | A fix reports **≥ 2.5 m/s** (≈ 9 km/h), `adaptiveCadence = true`. Dropped at `STOP_PENDING` and restored if the vehicle pulls away |
+| Normal | 60 s | Everything else — **including walking**, which is moving but not vehicular |
 
 ### 3.5 Stored points are raw; the puck is filtered
 
@@ -531,10 +531,29 @@ as; on `NETWORK_ONLY` it is what *every* fix arrives as.
 | `ADAPTIVE` | **Default.** Stream while moving with adaptive cadence, heartbeat-only while stationary | Middle | Good |
 | `MOTION_ONLY` | Location fully off while stationary | Lowest | Coarsest |
 
-On a device whose `motionQuality` is `POOR`, `ready()` forces `CONTINUOUS` and emits
-`Error(MOTION_DETECTION_DEGRADED)` naming the missing sensors — running a motion-gated
-design on hardware that cannot support motion detection produces gaps users blame on the
-SDK (EC-137).
+`ready()` acts on the device's `motionQuality` rather than merely reporting it — running a
+motion-gated design on hardware that cannot support motion detection produces gaps users
+blame on the SDK (EC-137):
+
+| `motionQuality` | What `ready()` does |
+|---|---|
+| `POOR` | Forces `CONTINUOUS`, emits `Error(MOTION_DETECTION_DEGRADED)` naming the missing sensors. **Costs battery** — `CONTINUOUS` keeps the stream registered while stationary and `MOTION_ONLY` does not, so a host that chose `MOTION_ONLY` for power gets the opposite |
+| `DEGRADED` | Doubles `motion.stopTimeoutMin`, mode untouched. Emits a `Diagnostic` naming the old and new value. Stops are detected later on such hardware, and waiting longer beats declaring a stop that did not happen |
+
+`POOR` is not purely a hardware verdict: a denied `ACTIVITY_RECOGNITION` reaches it on a
+device with no significant-motion or step sensor. Check the grant before blaming the phone,
+and re-run `ready()` after granting it to get a fresh verdict.
+
+Read the result from `TrackerState`, not from the event:
+
+```kotlin
+tracker.state.value.motionQuality        // FULL | DEGRADED | POOR
+tracker.state.value.effectiveTrackingMode // what is actually running
+```
+
+`MOTION_DETECTION_DEGRADED` fires *inside* `ready()`, and `tracker.events` has
+`replay = 0` — a collector created after `ready()` never receives it. The state flow always
+has a current value.
 
 ### 5.6 Cadence and turn fidelity
 

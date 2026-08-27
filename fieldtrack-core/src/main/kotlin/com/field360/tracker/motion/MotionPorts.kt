@@ -75,6 +75,18 @@ internal interface YawRateSource {
  */
 internal interface CaptureStream {
     fun onMoving()
+
+    /**
+     * A stop the machine is not yet committed to — a traffic light or a real parking,
+     * indistinguishable at this point.
+     *
+     * The cadence answer is the same either way: nothing needs vehicular sampling from a
+     * vehicle that has stopped moving. The tier is parked rather than dropped, so pulling
+     * away restores it on the [onMoving] transition instead of waiting for a fix at the
+     * base interval to measure speed again (EC-56).
+     */
+    fun onStopPending()
+
     fun onStationary()
     fun setVehicular(vehicular: Boolean)
 }

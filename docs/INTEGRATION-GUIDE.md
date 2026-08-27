@@ -457,7 +457,7 @@ Builder methods for the whole blocks: `.geolocation()`, `.motion()`, `.service()
 
 | Field | Type | Default | What it does |
 |---|---|---|---|
-| `trackingMode` | `TrackingMode` | `ADAPTIVE` | See below |
+| `trackingMode` | `TrackingMode` | `ADAPTIVE` | See below. **Can be overridden at `ready()`** on hardware that cannot detect motion — [§12.1](#121-motion-hardware-and-what-it-can-override) |
 | `providerType` | `LocationProviderType` | `FUSED` | Which hardware produces fixes |
 | `desiredAccuracy` | `DesiredAccuracy` | `HIGH` | Biases the *fused* provider's own source choice. `HIGH`, `BALANCED`, `LOW` |
 | `accuracy` | `AccuracyConfig` | `BALANCED` profile | The accuracy meter — see [§5.6](#56-accuracyconfig) |
@@ -467,8 +467,8 @@ Builder methods for the whole blocks: `.geolocation()`, `.motion()`, `.service()
 | `maxUpdateDelayMs` | `Long` | `60_000` | OS batching window |
 | `maxFixAgeMs` | `Long` | `10_000` | Older fixes are treated as stale |
 | `deliveryStalenessMs` | `Long` | `60_000` | Delivery-gap threshold |
-| `adaptiveCadence` | `Boolean` | `true` | Speed up while vehicular |
-| `vehicularIntervalMs` | `Long` | `12_000` | The vehicular tier interval |
+| `adaptiveCadence` | `Boolean` | `true` | Speed up while vehicular. Off pins every moving fix to `intervalMs` |
+| `vehicularIntervalMs` | `Long` | `12_000` | The vehicular tier interval. Raised by **measured speed** (≥ 2.5 m/s ≈ 9 km/h), not by the motion state — a walking session stays on `intervalMs` |
 | `turnBurst` | `Boolean` | `true` | Third tier: sample faster while measurably turning |
 | `turnBurstIntervalMs` | `Long` | `4_000` | Must be > 0 and ≤ the tier it accelerates |
 | `oneShotTimeoutMs` | `Long` | `30_000` | `getCurrentLocation()` timeout |
@@ -484,6 +484,29 @@ Builder methods for the whole blocks: `.geolocation()`, `.motion()`, `.service()
 | `CONTINUOUS` | Stream at `intervalMs` always; the filter does all thinning. Highest fidelity, highest battery |
 | `ADAPTIVE` | Stream while moving with adaptive cadence; heartbeat-only while stationary (default) |
 | `MOTION_ONLY` | Location fully off while stationary. Lowest battery, coarsest stop timing |
+
+**When each tier is in force** (fastest wins: navigation → turn burst → vehicular → base):
+
+| Tier | Raised by | Dropped by |
+|---|---|---|
+| vehicular | A fix reporting **≥ 2.5 m/s** — the same threshold the turn burst and the gyroscope use. Not the `MOVING` motion state: walking is moving and is not vehicular | `STOP_PENDING` — the moment fixes stop reporting movement, not `stopTimeoutMin` later |
+| turn burst | `TurnDetector` (GNSS heading) or `GyroTurnMonitor` (yaw rate), whichever sees the corner first | Both releasing it, or a stop |
+
+A tier dropped at `STOP_PENDING` is *parked*, not forgotten: pulling away restores it on the
+`MOVING` transition rather than waiting for another fix to measure speed. A committed stop
+(`STATIONARY`) clears the claim, so whatever moves next earns the tier from speed again.
+
+The battery difference between the three modes is mostly *not* the interval — it is whether
+the location stream stays registered while the device is parked. `ADAPTIVE` keeps it registered
+and lets the filter thin, because the heartbeat is what recovers a device whose wake paths
+all failed; `MOTION_ONLY` genuinely unregisters it. A phone parked for eight hours costs
+near zero on the third and a full day of radio duty on the first two.
+
+**The mode you set is not always the mode that runs.** On a device where motion detection
+cannot be trusted, `ready()` rewrites this to `CONTINUOUS` — which is the most expensive
+mode short of `navigationMode`, so a host that chose `MOTION_ONLY` for battery gets the
+opposite. Read `TrackerState.effectiveTrackingMode` for what is actually in force, and
+[§12.1](#121-motion-hardware-and-what-it-can-override) for when and why.
 
 **`LocationProviderType`**
 
@@ -562,11 +585,52 @@ Builder: `.useSignificantMotion()`, `.useStepCorroboration()`, `.useAcceleromete
 | `notificationChannelId` | `String` | `"trackit_tracking"` | Channel id |
 | `notificationChannelName` | `String` | `"Location tracking"` | Channel name shown in system settings |
 | `notificationSmallIconResName` | `String?` | `null` | Drawable **resource name** (e.g. `"ic_tracking"`) for the small icon |
+| `showSyncStatusInNotification` | `Boolean` | `false` | **Diagnostic — leave off in a shipping app.** Replaces `notificationText` with a live upload-queue line while tracking. See below |
+| `syncNotificationTitle` | `String?` | `null` | Title shown while the sync line is on screen. `null` keeps `notificationTitle` — the usual choice |
+| `syncNotificationText` | `String` | `"unsynced {pending} · last upload {age}"` | The sync line template. See the token table below. Ignored unless `showSyncStatusInNotification` is on |
 
 Builder: `.foregroundService()`, `.stopOnTerminate()`, `.startOnBoot()`, `.healthLoopMs()`,
 `.watchdogIntervalMs()`, `.watchdogThrottleMs()`, `.backstopIntervalMin()`,
 `.deadTrackerMovingMin()`, `.deadTrackerStationaryMin()`, `.wakeLockMs()`,
-`.notification(title, text)`, `.notificationChannel(id, name)`, `.notificationSmallIconResName()`.
+`.notification(title, text)`, `.notificationChannel(id, name)`, `.notificationSmallIconResName()`,
+`.showSyncStatusInNotification()`, `.syncNotification(title, text)`.
+
+#### The upload-status notification
+
+Off by default, and it should stay off in a shipping app. The ongoing notification is the one
+piece of SDK surface a real user reads, and `unsynced 42` means nothing to them while meaning
+something alarming.
+
+What it is *for* is the one test that cannot be run from inside the app: kill the host, take the
+device offline, wait, restore connectivity, and confirm the queue drains — without launching
+anything, because launching the app is itself a sync trigger and would invalidate the test. The
+notification is the only readout that survives that, and it needs no debugger, no adb and no
+server-side check.
+
+`syncNotificationText` is substituted at post time:
+
+| Token | Becomes |
+|---|---|
+| `{pending}` | Rows queued and not yet uploaded, e.g. `42` |
+| `{age}` | Time since the last confirmed upload, e.g. `21m ago`, or `never` |
+
+Both tokens are optional and may appear in any order — `"{pending} to upload"` is a valid
+template, as is a static string with neither. An unrecognised `{token}` is left exactly as
+written rather than blanked, so a typo shows up on the notification as itself instead of
+silently vanishing.
+
+Keep both defaults unless you have a reason not to. The count alone cannot tell a draining queue
+from one that is merely not growing — a parked device stores nothing, so a still count is the
+*expected* reading, not a stalled one. `{age}` is what separates them: it resets the moment
+anything reaches the server.
+
+Two more things to know before reading the number:
+
+- It refreshes on the `watchdogIntervalMs` tick, so it lags reality by up to that long. A count
+  that has not moved for one tick has not necessarily stalled.
+- The line only appears while sync is actually configured. With no `configure()` call — or after
+  a terminal `401` / `403` clears the config mid-session — the notification reverts to your own
+  `notificationText`. See [§14.4](#144-terminal-failure-semantics).
 
 ### 5.6 `AccuracyConfig`
 
@@ -629,6 +693,10 @@ Builder: `.maxDaysToPersist()`, `.maxRecords()`, `.persistRawFixes()`, `.rawRing
 - `recoveryTrustMeters <= 0`
 - `NETWORK_ONLY` with an accuracy ceiling below 50 m
 - `navigationMode` with `providerType = PASSIVE`
+- blank `syncNotificationText` while `showSyncStatusInNotification` is on — checked only when
+  the line will actually be posted, so leaving the diagnostic off is never refused over a
+  string nothing reads
+- `syncNotificationTitle` set to a blank string — use `null` to keep `notificationTitle`
 
 ---
 
@@ -776,17 +844,42 @@ lifecycleScope.launch {
 Collect from a lifecycle scope for UI, or from an application-scoped one for work that must
 continue with no UI on screen.
 
+**`events` has no replay.** It is a `SharedFlow` with `replay = 0`, so an event emitted
+while nothing is collecting is gone — it is a stream of things that happened, not a record
+of the current state. That matters for one event in particular:
+`MOTION_DETECTION_DEGRADED` is emitted **inside `ready()`**, and the documented startup
+order has `ready()` in `Application.onCreate` with your collector created later in an
+Activity or view model. If you follow that order you will never see it.
+
+Nothing is lost, because the condition it reports is on the state flow instead — read
+`TrackerState.motionQuality` ([§7.2](#72-trackerstate)), which always has a current value
+however late you subscribe. The general rule: **conditions live on `TrackerState`,
+transitions live on `events`.** If you need an event that fires during `ready()`, start
+collecting before you call it.
+
 ### 7.2 `TrackerState`
 
 ```kotlin
 data class TrackerState(
     val isReady: Boolean = false,
     val isTracking: Boolean = false,
+    val isCapturing: Boolean = false,          // false while isTracking = suspended
     val motionState: MotionState = MotionState.STOPPED,
     val providerState: ProviderState = ProviderState(),
     val currentSessionId: String? = null,
+    val motionQuality: MotionQuality = MotionQuality.FULL,
+    val effectiveTrackingMode: TrackingMode = TrackingMode.ADAPTIVE,
 )
 ```
+
+| Field | Read it for |
+|---|---|
+| `isTracking` vs `isCapturing` | A session with a revoked permission or a switched-off GPS stays open with `isTracking = true` and stops capturing. `false` while tracking means **suspended**, and the reason is on `TrackerEvent.CaptureSuspended` |
+| `motionQuality` | Whether this device's motion hardware can support the mode you asked for. The reliable read — the event that reports it fires during `ready()` and is easily missed ([§12.1](#121-motion-hardware-and-what-it-can-override)) |
+| `effectiveTrackingMode` | The mode actually in force, which differs from the configured one when the SDK overrode it. Nothing else exposes the resolved config |
+
+Both `motionQuality` and `effectiveTrackingMode` are set by `ready()` and do not change
+until the next `ready()` call.
 
 ### 7.3 `ProviderState`
 
@@ -1255,11 +1348,61 @@ data class DeviceSensors(
 )
 ```
 
-| `MotionQuality` | Meaning |
-|---|---|
-| `FULL` | Accelerometer + gyroscope + a trigger sensor. Default behaviour |
-| `DEGRADED` | Accelerometer present, gyroscope or trigger sensors missing. Stop timeout widens |
-| `POOR` | Motion gating is untrustworthy — capture is forced to `CONTINUOUS` and `MOTION_DETECTION_DEGRADED` is reported |
+### 12.1 Motion hardware, and what it can override
+
+`MotionQuality` is not a diagnostic. The SDK acts on it at `ready()`, before any session
+opens, because running a motion-gated design on hardware that cannot detect motion produces
+gaps a user blames on the SDK rather than on the device (EC-137).
+
+| `MotionQuality` | Derived when | What the SDK does about it |
+|---|---|---|
+| `FULL` | Accelerometer **and** gyroscope **and** (significant-motion or step-detector) | Nothing — your config runs as written |
+| `DEGRADED` | Anything between the two | `motion.stopTimeoutMin` is **doubled**, mode untouched. A `Diagnostic` event names the old and new value |
+| `POOR` | No accelerometer, **or** `ACTIVITY_RECOGNITION` denied with no significant-motion and no step-detector | `trackingMode` is forced to `CONTINUOUS` (unless it already is). `TrackerEvent.Error(MOTION_DETECTION_DEGRADED)` names the missing sensors |
+
+Three things about this are worth knowing before you debug a device.
+
+**`POOR` is not purely a hardware verdict.** Read the second half of that row again: a
+denied `ACTIVITY_RECOGNITION` runtime permission reaches `POOR` on a device with no
+significant-motion or step sensor, and plenty of otherwise-capable mid-range hardware has
+neither. The message then reads `accelerometer=true`, which looks self-contradictory until
+you notice the permission half. **Check the grant before you blame the phone.** The verdict
+changes when the grant does, so re-read it after a permission flow rather than caching it
+from startup.
+
+**`POOR` costs battery.** `CONTINUOUS` keeps the location stream registered while
+stationary and `MOTION_ONLY` does not — see [§5.2](#52-geolocationconfig). The override is
+the right trade (gaps are worse than power) but it is the opposite of what a host choosing
+`MOTION_ONLY` asked for, so the event message says so explicitly.
+
+**`DEGRADED` widens rather than overrides.** Stops on such a device are detected later and
+less certainly. Waiting longer before believing one is the cheaper error: a late stop costs
+a few extra fixes, a false stop costs the rest of the trip. The value is doubled rather
+than replaced with a constant, so your own timeout still expresses your use case.
+
+### 12.2 Reading it
+
+```kotlin
+// The verdict, and whether it changed your mode. Always current, whenever you subscribe.
+tracker.state.value.motionQuality        // FULL | DEGRADED | POOR
+tracker.state.value.effectiveTrackingMode
+
+// Which sensors explain that verdict.
+tracker.getSensors()
+```
+
+Use `TrackerState` for the verdict and `getSensors()` for the detail.
+
+Do **not** rely on the `MOTION_DETECTION_DEGRADED` event alone: it is emitted inside
+`ready()`, and `events` has `replay = 0`, so a collector created afterwards — the
+documented and usual order — never receives it. See
+[§7.1](#71-trackerevent--the-event-flow). The event is still worth handling if you collect
+early; it is simply not a reliable way to *discover* the condition.
+
+Both `state` fields are set by `ready()` and hold until the next `ready()` call, so a host
+that re-runs `ready()` after granting `ACTIVITY_RECOGNITION` gets a re-evaluated verdict —
+which is the recovery path when the cause was a denied permission rather than absent
+hardware.
 
 ---
 
@@ -1512,6 +1655,14 @@ lifecycleScope.launch {
 | **403 Forbidden** | **Terminal, but non-destructive.** Uploads halt, **rows are kept**, tracking continues. Recovery is calling `configure()` again with a working credential |
 | **Anything else** | Rows stay queued and retry with linear backoff (30 s base) via WorkManager, network-constrained |
 | `Retry-After` header | Honoured — the server's own schedule replaces the SDK's |
+
+One visible side effect of both terminal cases: if you turned on
+[`showSyncStatusInNotification`](#55-serviceconfig), the upload-status line disappears with the
+config and the notification goes back to your own `notificationText`. That is the same reading as
+"sync was never configured", so a status line that vanishes mid-session means a `401` or `403`
+landed — check `SyncEvent.HttpResponse` for which. After a `403` the rows are still on disk and
+resume uploading once `configure()` is called with a working credential; after a `401` they are
+gone.
 
 ### 14.5 The wire format
 
@@ -2137,8 +2288,15 @@ fire and the runtime waiver already applies.
 | Uploads retry forever | `http://` URL blocked by Android's default network security policy | Use `https://`, or `allowCleartext = true` for a local dev server |
 | Uploads stopped, rows still queued | A 403 halted the queue | Call `sync.configure(...)` again with a working credential |
 | Tracking stopped and the queue emptied | A 401 tore everything down | Re-authenticate, then `ready()` / `start()` / `configure()` again |
+| The upload-status line vanished mid-session | A 401 or 403 cleared the sync config — the line is only posted while sync is configured | Check `SyncEvent.HttpResponse` for which, then the two rows above ([§14.4](#144-terminal-failure-semantics)) |
+| The upload-status line never appeared | `showSyncStatusInNotification` left off, or `configure()` never called | Turn the flag on **and** configure sync; it is a diagnostic and stays off by default ([§5.5](#55-serviceconfig)) |
+| `{pending}` shown literally on the notification | A typo'd token in `syncNotificationText` | Only `{pending}` and `{age}` are substituted; an unknown token is left as written on purpose |
+| The unsynced count looks frozen | It refreshes on the `watchdogIntervalMs` tick, and a parked device queues nothing | Read `{age}` alongside it — a still count with a rising age is a real stall, a still count with a resetting age is not |
 | `SNAP_UNAVAILABLE` in `warnings` | Your snap provider could not answer | Never fatal — the raw track is drawn. Check the OSRM server |
-| `MOTION_DETECTION_DEGRADED` | `motionQuality = POOR` on this hardware | Capture is forced to `CONTINUOUS`; expect more battery use |
+| `MOTION_DETECTION_DEGRADED` | `motionQuality = POOR` on this hardware | Capture is forced to `CONTINUOUS`; expect more battery use ([§12.1](#121-motion-hardware-and-what-it-can-override)) |
+| `MOTION_ONLY` behaves like `CONTINUOUS`, battery high | `motionQuality = POOR` — the mode was overridden at `ready()` | Read `tracker.state.value.effectiveTrackingMode`. Check `ACTIVITY_RECOGNITION` is granted: a denial reaches `POOR` on hardware that is otherwise fine, and re-running `ready()` after the grant clears it |
+| Never saw `MOTION_DETECTION_DEGRADED` on a device you know is degraded | It is emitted inside `ready()`, and `events` has `replay = 0` | Read `TrackerState.motionQuality` instead — it always has a current value. Collect `events` before calling `ready()` if you want the event itself |
+| Stops reported minutes late | `motionQuality = DEGRADED` — the SDK doubled `stopTimeoutMin` | Working as designed on hardware with no gyroscope or trigger sensor. The `Diagnostic` at `ready()` names the old and new value |
 | `ready()`/`start()` returns `DEVICE_INTEGRITY_BLOCKED` | A `BLOCK`-policy signal fired | Read `tracker.integrity()` for the signals ([§19](#19-device-integrity)); relax that policy to `WARN` if the device is legitimate |
 | Session ends by itself with `DEVICE_INTEGRITY_BLOCKED` | The health-loop re-check fired mid-session | Same as above; `integrityRecheckIntervalMs(0)` disables the periodic re-check |
 | Integrity findings never appear | The host app is debuggable, so the layer is waived | Expected. Check `IntegrityReport.waived`; exercise the layer in a release build |

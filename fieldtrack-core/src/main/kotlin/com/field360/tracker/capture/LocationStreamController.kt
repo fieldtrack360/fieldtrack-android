@@ -6,6 +6,7 @@ import com.field360.tracker.sdkLog
 import com.field360.tracker.data.location.FixMapper
 import com.field360.tracker.data.location.LocationRequests
 import com.field360.tracker.data.location.LocationSource
+import com.field360.traker.geo.filter.TrackerConstants
 import com.field360.traker.geo.port.TrackLogger
 import com.field360.tracker.motion.CaptureStream
 import kotlinx.coroutines.CoroutineScope
@@ -70,6 +71,13 @@ internal class LocationStreamController(
     private val ingestor: FixIngestor,
     private val logger: TrackLogger,
     private val scope: CoroutineScope,
+    /**
+     * For `turnBurstMinSpeed` alone — the SDK's one definition of "this is a vehicle",
+     * already used by `GyroTurnMonitor` to decide whether to open the gyroscope and by the
+     * acceptance pipeline to gate the turn burst. The cadence tier is a third consumer of
+     * the same number rather than a fourth opinion about it.
+     */
+    private val constants: TrackerConstants = TrackerConstants.Default,
 ) : CaptureStream, CaptureSwitch {
 
     private var job: Job? = null
@@ -77,6 +85,18 @@ internal class LocationStreamController(
 
     @Volatile
     private var vehicular: Boolean = false
+
+    /**
+     * The vehicular tier was in force when the vehicle stopped, and is owed back if it
+     * moves off again.
+     *
+     * Set only by [onStopPending], and only from a tier that was itself raised by a
+     * measured vehicular speed — which is what keeps a walking session from ever
+     * restoring one. Cleared on [onStationary], because a committed stop ends the claim:
+     * whatever happens next has to earn the tier from speed again.
+     */
+    @Volatile
+    private var vehicularParked: Boolean = false
 
     @Volatile
     private var turning: Boolean = false
@@ -104,6 +124,7 @@ internal class LocationStreamController(
     fun start(config: TrackerConfig, vehicular: Boolean = false) {
         this.config = config
         this.vehicular = vehicular
+        this.vehicularParked = false
         this.turnRequests.clear()
         this.turning = false
         // A new session starts unblocked; `CaptureGate.arm` re-evaluates immediately after
@@ -228,6 +249,10 @@ internal class LocationStreamController(
         // is already off — and a burst left running against a parked phone is the
         // battery complaint this feature would otherwise earn.
         clearTurning()
+        // A committed stop ends the claim on the tier: whatever moves next has to earn it
+        // from a measured speed again, which is what stops a drive that ended in a walk
+        // from carrying the vehicular cadence into the walk.
+        vehicularParked = false
         setVehicular(false)
     }
 
@@ -238,6 +263,65 @@ internal class LocationStreamController(
         // outage must not be able to unblock capture; only `CaptureGate` may.
         if (suspended) return
         if (!isRunning) start(active, vehicular = false)
+
+        // Pulling away from a stop the vehicle had not committed to. Restored here rather
+        // than left for the speed feed, because at the base interval the next fix is up to
+        // a minute away and the corner immediately after a junction is exactly the
+        // geometry the vehicular tier exists to catch.
+        //
+        // Safe against the walking case this whole change is about: `vehicularParked` is
+        // only ever set from a measured vehicular speed, so a session that never saw one
+        // has nothing to restore.
+        if (vehicularParked) {
+            vehicularParked = false
+            setVehicular(true)
+        }
+    }
+
+    /**
+     * Every fix's speed, accepted or rejected — the signal that decides the vehicular tier.
+     *
+     * Previously the tier was raised by `MotionController` on any `MOVING` transition,
+     * which meant a pedestrian got `vehicularIntervalMs` (12 s by default) instead of
+     * `intervalMs` (60 s) — five times the fix rate, for a walker whose track needs
+     * nothing of the kind. `GeolocationConfig.vehicularIntervalMs` documents itself as the
+     * tier used "once fixes report vehicle speed", and this is what makes that true.
+     *
+     * Raw rather than accepted fixes, and the same threshold `GyroTurnMonitor` and the
+     * acceptance pipeline already use: there is one definition of "vehicular" in the SDK
+     * and this is a third consumer of it, not a fourth opinion.
+     *
+     * Note what this deliberately does **not** do: it never lowers the tier. A vehicle
+     * stopped at a light reports zero speed for a minute and is not done driving, and a
+     * tier that fell on every stopped fix would rebuild the location request at every
+     * junction. Lowering is a motion-state decision — see [onStopPending] and
+     * [onStationary].
+     */
+    fun onObservedSpeed(speedMps: Float) {
+        val active = config ?: return
+        if (!active.geolocation.adaptiveCadence) return
+        if (speedMps < constants.turnBurstMinSpeed) return
+
+        vehicularParked = false
+        setVehicular(true)
+    }
+
+    /**
+     * The vehicle has stopped moving, but the machine has not committed to a stop.
+     *
+     * Drops to the base tier now rather than at `STATIONARY`, which is `stopTimeoutMin`
+     * later — five minutes by default, and ten on hardware where `MotionQuality.DEGRADED`
+     * doubled it. For a delivery rider with twenty stops an hour, that window at the
+     * vehicular tier was the dominant cost of the whole cadence design.
+     *
+     * The tier is remembered rather than forgotten, so [onMoving] can restore it without
+     * waiting to measure speed again.
+     */
+    override fun onStopPending() {
+        if (!vehicular) return
+        vehicularParked = true
+        sdkLog { logger.d(TAG, "Stop pending: parking the vehicular tier") }
+        setVehicular(false)
     }
 
     fun stop() {
@@ -249,6 +333,7 @@ internal class LocationStreamController(
         stop()
         config = null
         vehicular = false
+        vehicularParked = false
         turnRequests.clear()
         turning = false
         // Cleared with the rest of the session state: a suspension belongs to the session

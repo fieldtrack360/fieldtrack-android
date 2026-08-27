@@ -210,7 +210,7 @@ public class StartTrackingUseCase internal constructor(
         // sampling rate. A callback rather than an injected dependency because the stream
         // controller already depends on the ingestor (EC-45).
         ingestor.onTurnBurst = { streamController.setTurning(TurnSource.GNSS_BEARING, it) }
-        armGyroTurnPrediction(config)
+        wireObservedSpeed(gyroArmed = armGyroTurnPrediction(config))
         ingestor.start(session, scope)
         watchdog.reset()
         oneShotProvider.resetFailures()
@@ -258,11 +258,16 @@ public class StartTrackingUseCase internal constructor(
      * Nothing here registers a sensor. [GyroTurnMonitor] opens the gyroscope on the first
      * fix reporting vehicular speed and closes it a minute after the last, so a session
      * spent walking or parked never touches it.
+     *
+     * @return whether the monitor was armed, so [wireObservedSpeed] knows whether the
+     *   speed feed has a second consumer. It must not simply call `onSpeed` regardless:
+     *   that method opens the gyroscope, and calling it on a host that turned gyro
+     *   prediction off would register the sensor it declined.
      */
-    private fun armGyroTurnPrediction(config: TrackerConfig) {
-        if (!config.geolocation.turnBurst) return
-        if (!config.sensors.useGyroTurnPrediction) return
-        if (!gyroTurnMonitor.isAvailable) return
+    private fun armGyroTurnPrediction(config: TrackerConfig): Boolean {
+        if (!config.geolocation.turnBurst) return false
+        if (!config.sensors.useGyroTurnPrediction) return false
+        if (!gyroTurnMonitor.isAvailable) return false
 
         gyroTurnMonitor.onTurning = { turning ->
             streamController.setTurning(TurnSource.GYROSCOPE, turning)
@@ -271,8 +276,24 @@ public class StartTrackingUseCase internal constructor(
             // fix it is holding (EC-45d, EC-45e).
             ingestor.gyroTurning = turning
         }
-        ingestor.onObservedSpeed = gyroTurnMonitor::onSpeed
         gyroTurnMonitor.start()
+        return true
+    }
+
+    /**
+     * Fans every fix's speed out to the two things that need it.
+     *
+     * Wired unconditionally, which is the change: this used to be set inside
+     * [armGyroTurnPrediction] and therefore existed only when a gyroscope was armed. The
+     * cadence tier needs the same signal on every device — a host with `turnBurst` off, or
+     * a phone with no gyroscope, still has a vehicular tier to raise — and without this it
+     * would have had none, leaving the tier permanently off instead of permanently on.
+     */
+    private fun wireObservedSpeed(gyroArmed: Boolean) {
+        ingestor.onObservedSpeed = { speedMps ->
+            streamController.onObservedSpeed(speedMps)
+            if (gyroArmed) gyroTurnMonitor.onSpeed(speedMps)
+        }
     }
 }
 
@@ -426,23 +447,63 @@ public class ResolveConfigUseCase internal constructor(
         // Act on the hardware, don't merely report it. Running a motion-gated design on
         // a device that cannot support motion detection produces gaps the user blames on
         // the SDK, so degrade the mode and say which sensors are missing (EC-137).
+        //
+        // Both tiers below are acted on, which is the difference between this and the
+        // incumbent's diagnostic-only `getSensors()` — see `SensorProbe`. `POOR` changes
+        // the mode; `DEGRADED` leaves the mode alone and widens the stop timeout instead.
         val sensors = sensorProbe.probe()
-        val effective = if (sensors.motionQuality == MotionQuality.POOR &&
-            resolved.geolocation.trackingMode != TrackingMode.CONTINUOUS
-        ) {
-            events.tryEmit(
-                TrackerEvent.Error(
-                    ErrorCode.MOTION_DETECTION_DEGRADED,
-                    "motionQuality=POOR (accelerometer=${sensors.accelerometer}, " +
-                        "gyroscope=${sensors.gyroscope}, significantMotion=${sensors.significantMotion}, " +
-                        "stepDetector=${sensors.stepDetector}); forcing CONTINUOUS",
-                ),
-            )
-            resolved.copy(
-                geolocation = resolved.geolocation.copy(trackingMode = TrackingMode.CONTINUOUS),
-            )
-        } else {
-            resolved
+        val effective = when {
+            sensors.motionQuality == MotionQuality.POOR &&
+                resolved.geolocation.trackingMode != TrackingMode.CONTINUOUS -> {
+                events.tryEmit(
+                    TrackerEvent.Error(
+                        ErrorCode.MOTION_DETECTION_DEGRADED,
+                        "motionQuality=POOR (accelerometer=${sensors.accelerometer}, " +
+                            "gyroscope=${sensors.gyroscope}, significantMotion=${sensors.significantMotion}, " +
+                            "stepDetector=${sensors.stepDetector}); " +
+                            "forcing CONTINUOUS in place of ${resolved.geolocation.trackingMode} — " +
+                            // The consequence, not just the decision. A host that chose
+                            // MOTION_ONLY chose it for battery, and this override hands it
+                            // the most expensive mode short of navigation. Saying only
+                            // "forcing CONTINUOUS" turns that into a battery complaint
+                            // nobody can trace back to here.
+                            "the location stream will now run while stationary, which costs " +
+                            "materially more battery than the requested mode",
+                    ),
+                )
+                resolved.copy(
+                    geolocation = resolved.geolocation.copy(trackingMode = TrackingMode.CONTINUOUS),
+                )
+            }
+
+            // A device with an accelerometer but no gyroscope and no hardware trigger
+            // detects a stop later and less certainly than one with both. Widening the
+            // timeout trades stop *precision* for not declaring a stop that did not
+            // happen — the cheaper error of the two, because a late stop costs a few extra
+            // fixes and a false stop costs the rest of the trip.
+            //
+            // Applied in every mode, not only the motion-gated ones: the timeout governs
+            // how long the SDK waits before believing a stop, and that belief drives the
+            // cadence tiers and `stopOnStationary` regardless of which mode is running.
+            sensors.motionQuality == MotionQuality.DEGRADED -> {
+                val widened = resolved.motion.stopTimeoutMin * DEGRADED_STOP_TIMEOUT_FACTOR
+                // Announced for the same reason the mode override is: a config the SDK
+                // rewrote behind the host's back and never mentioned is the failure this
+                // whole path exists to avoid. Diagnostic rather than Error — nothing is
+                // wrong, and nothing the host did needs correcting.
+                events.tryEmit(
+                    TrackerEvent.Diagnostic(
+                        "motionQuality=DEGRADED (gyroscope=${sensors.gyroscope}, " +
+                            "significantMotion=${sensors.significantMotion}, " +
+                            "stepDetector=${sensors.stepDetector}); " +
+                            "motion.stopTimeoutMin widened " +
+                            "${resolved.motion.stopTimeoutMin} -> $widened min",
+                    ),
+                )
+                resolved.copy(motion = resolved.motion.copy(stopTimeoutMin = widened))
+            }
+
+            else -> resolved
         }
 
         // Two settings that must not be able to contradict each other: `security.mockLocation
@@ -487,4 +548,17 @@ public class ResolveConfigUseCase internal constructor(
     )
 
     public enum class ConfigSource { DEFAULT, PERSISTED, SUPPLIED }
+
+    private companion object {
+        /**
+         * How much `motion.stopTimeoutMin` is widened on `MotionQuality.DEGRADED`.
+         *
+         * Doubling rather than a fixed number of minutes, because the host's value is a
+         * statement about its own use case — a courier stopping for 90 seconds and a
+         * survey rig parked for an hour want different timeouts, and a flat `+10` would
+         * be most of the first and none of the second. The factor keeps the host's
+         * intent and only makes the SDK slower to believe a stop it cannot corroborate.
+         */
+        const val DEGRADED_STOP_TIMEOUT_FACTOR = 2
+    }
 }

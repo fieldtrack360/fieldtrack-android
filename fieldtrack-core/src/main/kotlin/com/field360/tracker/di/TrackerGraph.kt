@@ -371,7 +371,10 @@ internal class TrackerGraph private constructor(
     }
 
     val streamController: LocationStreamController by lazy {
-        LocationStreamController(locationSource, fixMapper, ingestor, logger, scope)
+        // The graph's constants, not the parameter default: the vehicular-speed threshold
+        // has to be the same object the gyro monitor and the pipeline are judging against,
+        // or a tuned build would move two of the three.
+        LocationStreamController(locationSource, fixMapper, ingestor, logger, scope, constants)
     }
     val captureStream: CaptureStream by lazy { streamController }
 

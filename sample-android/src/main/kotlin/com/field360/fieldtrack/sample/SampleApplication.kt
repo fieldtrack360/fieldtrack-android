@@ -83,12 +83,25 @@ class SampleApplication : Application() {
             runCatching { Class.forName("okhttp3.OkHttpClient") }.isSuccess
     }
 
+    /**
+     * The config this app starts with — built once, read by two callers.
+     *
+     * `onCreate` hands it to `ready()`, and `TrackerViewModel` seeds the config console
+     * from it so the editor opens showing what is actually running. Building it twice
+     * would let those two disagree, and a console that misreports the live config is worse
+     * than no console.
+     *
+     * It is also what the console's Reset returns to, which is the other reason it is a
+     * value rather than a function call at the one call site.
+     */
+    val defaultConfig: TrackerConfig by lazy { buildTrackerConfig() }
+
     override fun onCreate() {
         super.onCreate()
         installRoadSnapping()
         installSync()
         scope.launch {
-            val config = buildTrackerConfig()
+            val config = defaultConfig
             Log.i(TRACKER_TAG, "ready() config=$config")
             when (val result = tracker.ready(config)) {
                 is TrackerResult.Ok ->

@@ -1,519 +1,332 @@
 package com.field360.fieldtrack.sample.screen
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.field360.fieldtrack.sample.TrackerViewModel
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import com.field360.tracker.TrackerConfig
 
 /**
- * The test console: everything a field run needs to answer "is this actually recording",
- * in cards, scrolling, under one terminal theme.
+ * The configuration console: every option in [TrackerConfig], editable, over a status
+ * strip that says whether anything is recording.
  *
- * Ordered by the question each panel answers, hardest first — the top card is the one a
- * tester looks at while driving, and everything below it is what they scroll to when the
- * top card says something is wrong. The live event stream is last for the same reason: it
- * is the evidence, not the verdict.
+ * Home is this rather than the status console it used to be — that moved to [StatusScreen]
+ * — because of what this app is for. The SDK's behaviour is almost entirely a function of
+ * its config, and a sample that hardcodes one config can demonstrate exactly one of them.
+ * Reproducing a field report meant editing `SampleApplication`, rebuilding and reinstalling;
+ * it is now three taps, in the field, on the device that showed the problem.
+ *
+ * The layout is fixed at both ends and scrolls in the middle, and both pins are load-bearing:
+ *
+ *  - **The header** stays because every value below it changes what capture does, and a
+ *    tester editing `intervalMs` needs to see whether a session is running while they do
+ *    it. The strip is deliberately narrow — the full picture is one tab away.
+ *  - **The apply bar** stays because a change that has not been applied does nothing at
+ *    all, and eighty rows is far enough to scroll to forget that. It states what it is
+ *    about to do, including that it will restart a live session.
+ *
+ * Groups are collapsed by default. Expanding everything is 80 rows, and the job is to make
+ * one setting easy to find, not to show all of them at once.
  */
 @Composable
-@Suppress("LongMethod", "CyclomaticComplexMethod") // A console: one screen, many panels.
 fun HomeScreen(
     state: TrackerViewModel.UiState,
     onStart: () -> Unit,
     onStop: () -> Unit,
-    onRequestPermissions: () -> Unit,
-    onAllowBackground: () -> Unit,
-    /** Raises the system location dialog. See MainActivity.ensureLocationEnabled. */
-    onEnableLocation: () -> Unit = {},
-    onSyncNow: () -> Unit = {},
-    onShareLog: () -> Unit = {},
-    onClearLog: () -> Unit = {},
-    onOpenSession: (String) -> Unit = {},
-    onTestCurrentLocation: () -> Unit = {},
-    onAddTestGeofence: () -> Unit = {},
-    onAddTenTestGeofences: () -> Unit = {},
-    onListGeofences: () -> Unit = {},
-    onGetTestGeofence: () -> Unit = {},
-    onRemoveTestGeofence: () -> Unit = {},
-    onRemoveAllGeofences: () -> Unit = {},
-    onReadGeofenceHistory: () -> Unit = {},
-    onClearGeofenceHistory: () -> Unit = {},
+    onEditConfig: ((TrackerConfig) -> TrackerConfig) -> Unit = {},
+    onEditConfigText: (String, String, (TrackerConfig, String) -> TrackerConfig?) -> Unit =
+        { _, _, _ -> },
+    onApplyConfig: () -> Unit = {},
+    onResetConfig: () -> Unit = {},
+    onResetToSdkDefaults: () -> Unit = {},
 ) {
-    val backgroundActionable = state.backgroundStep != TrackerViewModel.BackgroundStep.GRANTED &&
-        state.backgroundStep != TrackerViewModel.BackgroundStep.NOT_APPLICABLE
+    val groups = remember { configGroups() }
 
-    // Three states, not two. An open session that is not capturing — revoked permission,
-    // GPS switched off — used to read exactly like a healthy one, which is how a stalled
-    // drive reached the end of the day before anyone noticed.
-    val statusLabel: String
-    val statusColor: Color
-    when {
-        state.isTracking && !state.isCapturing -> {
-            statusLabel = "suspended"
-            statusColor = Hack.Amber
-        }
-        state.isTracking -> {
-            statusLabel = "recording"
-            statusColor = Hack.Green
-        }
-        else -> {
-            statusLabel = "idle"
-            statusColor = Hack.Dim
+    // Which groups are open, as one delimited string rather than a `Set`.
+    //
+    // `rememberSaveable` writes through a Bundle, and a `Set` has no default saver — it
+    // would need one written by hand for a value that is genuinely a list of names with
+    // no commas in them. Survives rotation, dies with the process, which is the right
+    // lifetime for it.
+    var expandedCsv by rememberSaveable { mutableStateOf("") }
+    val expanded = expandedCsv.split(',').filter(String::isNotEmpty).toSet()
+
+    // Counted here, once, rather than per group inside the loop: the apply bar needs the
+    // total and each header needs its own share, and deriving both from one pass keeps
+    // them from ever disagreeing about what "edited" means.
+    val dirtyByGroup = groups.associate { group ->
+        group.title to group.fields.count { field ->
+            currentValue(field, state.configDraft) != currentValue(field, state.configApplied)
         }
     }
+    val dirtyTotal = dirtyByGroup.values.sum()
 
-    LazyColumn(
-        modifier = Modifier.fillMaxSize().background(Hack.Bg).padding(horizontal = 12.dp),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp),
-    ) {
-        item { ConsoleHeader(statusLabel = statusLabel, statusColor = statusColor) }
+    Column(Modifier.fillMaxSize().background(Hack.Bg)) {
+        ConsoleHeader(state = state, dirtyCount = dirtyTotal, onStart = onStart, onStop = onStop)
 
-        // ── the driving-position card ───────────────────────────────────────
-        item {
-            TerminalCard(
-                title = "session state",
-                accent = statusColor,
-                trailing = state.sessionId?.take(SHORT_ID) ?: "no session",
-            ) {
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Badge(statusLabel, statusColor)
-                    FlagBadge("capture", state.isCapturing)
-                    FlagBadge("gps", state.providerState.gpsEnabled)
-                    if (state.providerState.powerSaveMode) Badge("power save", Hack.Amber)
-                }
-                state.captureSuspendedReason?.let { Alert(it, Hack.Amber) }
-
-                KeyValue("points", state.pointCount.toString(), Hack.Green)
-                KeyValue("motion", state.motionState.name)
-                KeyValue("permission", state.permissionTier.name, tierColor(state))
-                KeyValue("licence", state.licenseStatus.ifBlank { "unknown" })
-                KeyValue("heartbeat", state.lastHeartbeatAtMs?.let(::clock) ?: "none", Hack.Dim)
-                KeyValue("last event", state.lastEvent.ifBlank { "—" }, Hack.Dim)
-
-                state.error?.let { Alert(it, Hack.Red) }
-            }
-        }
-
-        // ── controls, one row, unmissable ───────────────────────────────────
-        item {
-            TerminalCard(title = "control") {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    HackButton(
-                        text = "▶ start",
-                        onClick = onStart,
-                        enabled = !state.isTracking,
-                        modifier = Modifier.weight(1f),
-                    )
-                    HackButton(
-                        text = "■ stop",
-                        onClick = onStop,
-                        enabled = state.isTracking,
-                        accent = Hack.Red,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-            }
-        }
-
-        // ── the ladder, and where on it this device is ──────────────────────
-        item {
-            TerminalCard(
-                title = "permissions",
-                accent = if (backgroundActionable) Hack.Amber else Hack.Green,
-            ) {
-                KeyValue("tier", state.permissionTier.name, tierColor(state))
-                KeyValue("background", state.backgroundStep.name, if (backgroundActionable) Hack.Amber else Hack.Green)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    GhostButton(
-                        text = "grant location",
-                        onClick = onRequestPermissions,
-                        modifier = Modifier.weight(1f),
-                    )
-                    // Opens the rationale dialog, which routes to the runtime prompt on
-                    // API 29 or to Settings on API 30+, where the prompt does not exist
-                    // (EC-05).
-                    GhostButton(
-                        text = "allow always",
-                        onClick = onAllowBackground,
-                        enabled = backgroundActionable,
-                        accent = Hack.Amber,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-            }
-        }
-
-        // ── the device, as the SDK sees it ──────────────────────────────────
-        item {
-            TerminalCard(title = "provider") {
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    FlagBadge("services", state.providerState.locationServicesEnabled)
-                    FlagBadge("gps", state.providerState.gpsEnabled)
-                    FlagBadge("network", state.providerState.networkEnabled)
-                    FlagBadge("fused", state.providerState.fusedAvailable)
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    FlagBadge("power save", !state.providerState.powerSaveMode)
-                    FlagBadge("airplane", !state.providerState.airplaneMode)
-                    Badge(state.providerState.accuracyAuthorization.name, Hack.Cyan)
-                }
-                // The one device-side fault a host can actually fix from inside the app.
-                // A granted permission on a phone with the location switch off records
-                // nothing at all, and the switch is not something start() can turn on.
-                if (!state.providerState.locationServicesEnabled) {
-                    Alert("location services are off — nothing can be recorded", Hack.Red)
-                    HackButton(
-                        text = "enable location",
-                        onClick = onEnableLocation,
-                        accent = Hack.Amber,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-            }
-        }
-
-        // ── the upload half ─────────────────────────────────────────────────
-        item {
-            // "Not configured" is a working state, not an error: the SDK is offline-first,
-            // and a host that sets no SYNC_URL simply keeps everything in Room. Dressing
-            // that up as a fault sends the reader after a problem they do not have.
-            val syncAccent = when {
-                state.syncFailing -> Hack.Red
-                state.syncEndpoint == null -> Hack.Dim
-                else -> Hack.Green
-            }
-            TerminalCard(
-                title = "uplink",
-                accent = syncAccent,
-                trailing = if (state.syncEndpoint == null) "offline-first" else null,
-            ) {
-                if (state.syncEndpoint == null) {
-                    KeyValue("endpoint", "not configured", Hack.Dim)
-                    Text(
-                        "set SYNC_URL in local.properties to enable uploads",
-                        style = MonoBody.copy(color = Hack.Dim, fontSize = 11.sp),
-                    )
-                } else {
-                    KeyValue("endpoint", state.syncEndpoint, syncAccent)
-                    // A generated per-install UUID: without it on screen there is no way
-                    // to correlate a row on the server with the install that sent it.
-                    KeyValue("device_id", state.syncDeviceId.take(DEVICE_ID_CHARS), Hack.Cyan)
-                    // The session's start time, not the SDK's session id — see
-                    // `sessionEnvelopeId`. Shown whole rather than truncated: the whole
-                    // point of the format is that it is readable.
-                    KeyValue(
-                        "session_id",
-                        state.syncSessionId ?: "omitted · no session",
-                        if (state.syncSessionId == null) Hack.Dim else Hack.Cyan,
-                    )
-                }
-                // Outside the branch on purpose. Rows accumulate whether or not anything
-                // can upload them, and a queue that is merely growing emits no events at
-                // all — this is the only line separating "offline" from "broken".
-                KeyValue(
-                    "queued",
-                    "${state.syncQueued} row(s)",
-                    if (state.syncQueued > 0) Hack.Amber else Hack.Green,
-                )
-                if (state.syncHealth.isNotBlank()) KeyValue("status", state.syncHealth, syncAccent)
-                if (state.syncLastEvent.isNotBlank()) KeyValue("last tx", state.syncLastEvent, syncAccent)
-
-                // Drains inline and reports the exact result, including the reason string
-                // a background drain can only report as a status code.
-                GhostButton(
-                    text = if (state.syncRunning) "draining…" else "▲ sync now",
-                    onClick = onSyncNow,
-                    enabled = !state.syncRunning,
-                    modifier = Modifier.fillMaxWidth(),
+        LazyColumn(
+            modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp),
+            contentPadding = PaddingValues(vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            item {
+                Text(
+                    text = "every field below is a TrackerConfig option. edits apply on the " +
+                        "button at the bottom, not as you type.",
+                    style = MonoBody.copy(color = Hack.Dim, fontSize = 10.sp),
                 )
             }
-        }
 
-        // ── the API surface, exercised by hand ──────────────────────────────
-        item {
-            TerminalCard(
-                title = "api probes",
-                trailing = "fences ${state.registeredGeofenceCount} · hits ${state.geofenceEventCount}",
-            ) {
-                // The output of the last probe, verbatim. Never summarised: the exact
-                // string is the whole value of running one.
-                Box(
-                    Modifier
-                        .fillMaxWidth()
-                        .background(Hack.SurfaceHi)
-                        .padding(8.dp),
-                ) {
-                    Text(
-                        text = "$ ${state.apiCheckResult}",
-                        style = MonoBody.copy(
-                            color = when {
-                                state.apiCheckResult.contains("FAILED") -> Hack.Red
-                                state.apiCheckRunning -> Hack.Amber
-                                else -> Hack.Green
-                            },
-                            fontSize = 11.sp,
-                        ),
-                    )
-                }
-                HackButton(
-                    text = "test current location",
-                    onClick = onTestCurrentLocation,
-                    enabled = !state.apiCheckRunning,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                ProbeRow(
-                    left = "add fence here" to onAddTestGeofence,
-                    right = "list fences" to onListGeofences,
-                    enabled = !state.apiCheckRunning,
-                )
-                ProbeRow(
-                    left = "get test fence" to onGetTestGeofence,
-                    right = "remove test" to onRemoveTestGeofence,
-                    enabled = !state.apiCheckRunning,
-                )
-                ProbeRow(
-                    left = "read history" to onReadGeofenceHistory,
-                    right = "clear history" to onClearGeofenceHistory,
-                    enabled = !state.apiCheckRunning,
-                )
-                GhostButton(
-                    text = "add 10 fences",
-                    onClick = onAddTenTestGeofences,
-                    enabled = !state.apiCheckRunning,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                // Refused mid-session on purpose: removing the stationary fence under a
-                // live session is a way to break motion detection and blame the SDK.
-                GhostButton(
-                    text = "remove all fences",
-                    onClick = onRemoveAllGeofences,
-                    enabled = !state.apiCheckRunning && !state.isTracking,
-                    accent = Hack.Red,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-        }
-
-        // ── what has been recorded so far ───────────────────────────────────
-        item {
-            TerminalCard(
-                title = "recorded sessions",
-                trailing = "${state.sessions.size} total",
-            ) {
-                if (state.sessions.isEmpty()) {
-                    Text(
-                        "no sessions recorded on this install",
-                        style = MonoBody.copy(color = Hack.Dim, fontSize = 11.sp),
-                    )
-                } else {
-                    // Newest first, capped: this is a jump list, not the archive. Every
-                    // other tab reads whichever one is selected here.
-                    state.sessions.take(SESSION_ROWS).forEach { session ->
-                        SessionRow(
-                            id = session.id,
-                            startedAtMs = session.startedAtMs,
-                            open = session.isOpen,
-                            selected = session.id == state.selectedSessionId,
-                            onClick = { onOpenSession(session.id) },
-                        )
+            groups.forEach { group ->
+                item(key = group.title) {
+                    val isOpen = group.title in expanded
+                    ConfigGroupCard(
+                        title = group.title,
+                        fieldCount = group.fields.size,
+                        dirtyCount = dirtyByGroup.getValue(group.title),
+                        expanded = isOpen,
+                        onToggle = {
+                            val next = if (isOpen) expanded - group.title else expanded + group.title
+                            expandedCsv = next.joinToString(",")
+                        },
+                    ) {
+                        group.fields.forEach { field ->
+                            ConfigRow(
+                                field = field,
+                                state = state,
+                                onEditConfig = onEditConfig,
+                                onEditConfigText = onEditConfigText,
+                            )
+                        }
                     }
                 }
             }
         }
 
-        // ── the file a tester walks away with ───────────────────────────────
-        item {
-            TerminalCard(title = "capture log", trailing = "${state.logSizeBytes / BYTES_PER_KB} KB") {
-                KeyValue("file", state.logPath.substringAfterLast('/').ifBlank { "—" }, Hack.Dim)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    HackButton(
-                        text = "share",
-                        onClick = onShareLog,
-                        enabled = state.logSizeBytes > 0,
-                        modifier = Modifier.weight(1f),
-                    )
-                    GhostButton(
-                        text = "clear",
-                        onClick = onClearLog,
-                        accent = Hack.Red,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-            }
-        }
-
-        // ── the evidence ────────────────────────────────────────────────────
-        item {
-            Row(
-                Modifier.fillMaxWidth().padding(top = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text(
-                    "[ LIVE EVENT STREAM ]",
-                    style = MonoBody.copy(
-                        color = Hack.Green,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 11.sp,
-                        letterSpacing = 1.sp,
-                    ),
-                )
-                Text(
-                    "${state.log.size} line(s)",
-                    style = MonoBody.copy(color = Hack.Dim, fontSize = 11.sp),
-                )
-            }
-        }
-
-        if (state.log.isEmpty()) {
-            item {
-                Text(
-                    "> waiting for the first event…",
-                    style = MonoBody.copy(color = Hack.Dim, fontSize = 11.sp),
-                )
-            }
-        }
-
-        items(state.log) { line ->
-            Text(
-                text = "> $line",
-                style = MonoBody.copy(color = logColor(line), fontSize = 11.sp),
-                modifier = Modifier.fillMaxWidth().background(Hack.Surface).padding(6.dp),
-            )
-        }
-    }
-}
-
-/** `root@fieldtrack` and the one word that says whether anything is being recorded. */
-@Composable
-private fun ConsoleHeader(statusLabel: String, statusColor: Color) {
-    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                "root@fieldtrack",
-                style = MonoBody.copy(color = Hack.Green, fontWeight = FontWeight.Bold, fontSize = 16.sp),
-            )
-            Text(":~$ ", style = MonoBody.copy(color = Hack.Dim, fontSize = 16.sp))
-            Text(
-                statusLabel.uppercase(),
-                style = MonoBody.copy(color = statusColor, fontWeight = FontWeight.Bold, fontSize = 16.sp),
-            )
-            BlinkingCursor(statusColor)
-        }
-        Text(
-            "field capture diagnostics · sdk build ${com.field360.fieldtrack.sample.BuildConfig.VERSION_NAME}",
-            style = MonoBody.copy(color = Hack.Dim, fontSize = 10.sp),
+        ApplyBar(
+            state = state,
+            dirtyCount = dirtyTotal,
+            onApply = onApplyConfig,
+            onReset = onResetConfig,
+            onResetToSdkDefaults = onResetToSdkDefaults,
         )
     }
-}
-
-/** Two probes on one line — the pairing is by topic, so the row is a unit. */
-@Composable
-private fun ProbeRow(
-    left: Pair<String, () -> Unit>,
-    right: Pair<String, () -> Unit>,
-    enabled: Boolean,
-) {
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        GhostButton(left.first, left.second, Modifier.weight(1f), enabled)
-        GhostButton(right.first, right.second, Modifier.weight(1f), enabled)
-    }
-}
-
-/** One recorded session, and whether it is the one every other tab is pinned to. */
-@Composable
-private fun SessionRow(
-    id: String,
-    startedAtMs: Long,
-    open: Boolean,
-    selected: Boolean,
-    onClick: () -> Unit,
-) {
-    val accent = if (open) Hack.Green else Hack.Dim
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .background(if (selected) Hack.SurfaceHi else Color.Transparent)
-            .clickable(onClick = onClick)
-            .padding(horizontal = 6.dp, vertical = 5.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween,
-    ) {
-        Text(
-            text = (if (selected) "> " else "  ") + id.take(SHORT_ID),
-            style = MonoBody.copy(
-                color = if (selected) Hack.Green else Hack.Text,
-                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                fontSize = 11.sp,
-            ),
-        )
-        Text(clock(startedAtMs), style = MonoBody.copy(color = Hack.Dim, fontSize = 11.sp))
-        Badge(if (open) "open" else "closed", accent)
-    }
-}
-
-/** A line that is not a value — a suspension reason, an error. Boxed so it is not scanned past. */
-@Composable
-private fun Alert(text: String, color: Color) {
-    Text(
-        text = "! $text",
-        style = MonoBody.copy(color = color, fontSize = 11.sp),
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(color.copy(alpha = ALERT_FILL_ALPHA))
-            .padding(6.dp),
-    )
 }
 
 /**
- * Colours a stream line by what it says.
+ * One field, dispatched to its widget.
  *
- * Prefix matching on the strings the view model already writes, rather than a second
- * severity field carried alongside them: the line is the record, and a colour derived from
- * anything else can disagree with the text next to it.
+ * The whole reason [ConfigField] is data: this function is the entire rendering of the
+ * configuration surface, so a field cannot be drawn inconsistently with its neighbours
+ * even by accident.
  */
-private fun logColor(line: String): Color = when {
-    line.startsWith("ERROR") || line.startsWith("SUSPEND") -> Hack.Red
-    line.startsWith("DROP") || line.startsWith("REJECT") || line.startsWith("SKIP") -> Hack.Amber
-    line.startsWith("ACCEPT") || line.startsWith("RESUME") -> Hack.Green
-    line.startsWith("sync ·") || line.startsWith("HTTP") -> Hack.Cyan
-    else -> Hack.Text
+@Composable
+private fun ConfigRow(
+    field: ConfigField,
+    state: TrackerViewModel.UiState,
+    onEditConfig: ((TrackerConfig) -> TrackerConfig) -> Unit,
+    onEditConfigText: (String, String, (TrackerConfig, String) -> TrackerConfig?) -> Unit,
+) {
+    // A field is "edited" when the draft and the last applied config disagree about it —
+    // not when it has been touched. Typing a value and typing the old one back leaves
+    // nothing to apply, and the screen should say so.
+    val dirty = currentValue(field, state.configDraft) != currentValue(field, state.configApplied)
+
+    when (field) {
+        is BoolField -> ConfigToggleRow(
+            label = field.label,
+            hint = field.hint,
+            value = field.get(state.configDraft),
+            dirty = dirty,
+            onChange = { value -> onEditConfig { config -> field.set(config, value) } },
+        )
+
+        is ChoiceField -> ConfigChoiceRow(
+            label = field.label,
+            hint = field.hint,
+            value = field.get(state.configDraft),
+            options = field.options,
+            dirty = dirty,
+            onChange = { value -> onEditConfig { config -> field.set(config, value) } },
+        )
+
+        is TextField -> ConfigTextRow(
+            label = field.label,
+            hint = field.hint,
+            // The typed string wins while one exists. Falling back to the draft would
+            // rewrite the box out from under a half-typed number the moment it stopped
+            // parsing.
+            value = state.configText[field.key] ?: field.get(state.configDraft),
+            keyboard = field.keyboard,
+            invalid = field.key in state.configInvalid,
+            dirty = dirty,
+            onChange = { raw -> onEditConfigText(field.key, raw, field.parse) },
+        )
+    }
 }
 
-private fun tierColor(state: TrackerViewModel.UiState): Color = when (state.permissionTier.name) {
-    "FULL" -> Hack.Green
-    "NONE" -> Hack.Red
-    else -> Hack.Amber
+/** What this field currently reads as, for the draft-versus-applied comparison. */
+private fun currentValue(field: ConfigField, config: TrackerConfig): String = when (field) {
+    is BoolField -> field.get(config).toString()
+    is ChoiceField -> field.get(config)
+    is TextField -> field.get(config)
 }
 
-/** Wall clock only: the date is on the session, and a full timestamp costs a whole row. */
-private fun clock(atMs: Long): String =
-    SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(atMs))
+/**
+ * `root@fieldtrack`, whether anything is recording, and the two buttons that decide it.
+ *
+ * Narrow on purpose: this screen is for setting values, and the full diagnostic picture is
+ * one tab away. What survives the trim is what a config edit can be wrong about — is a
+ * session open, is it actually capturing, and how many points has it stored.
+ */
+@Composable
+private fun ConsoleHeader(
+    state: TrackerViewModel.UiState,
+    dirtyCount: Int,
+    onStart: () -> Unit,
+    onStop: () -> Unit,
+) {
+    val statusColor = statusColorOf(state)
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(Hack.Surface)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "root@fieldtrack",
+                style = MonoBody.copy(
+                    color = Hack.Green,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp,
+                ),
+            )
+            Text(":~$ ", style = MonoBody.copy(color = Hack.Dim, fontSize = 14.sp))
+            Text(
+                statusLabelOf(state).uppercase(),
+                style = MonoBody.copy(
+                    color = statusColor,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp,
+                ),
+            )
+            BlinkingCursor(statusColor)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Badge("pts ${state.pointCount}", Hack.Green)
+            Badge(state.permissionTier.name, tierColor(state))
+            FlagBadge("capture", state.isCapturing)
+            FlagBadge("gps", state.providerState.gpsEnabled)
+            if (dirtyCount > 0) Badge("$dirtyCount edited", Hack.Amber)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            HackButton(
+                text = "▶ start",
+                onClick = onStart,
+                enabled = !state.isTracking && !state.configApplying,
+                modifier = Modifier.weight(1f),
+            )
+            HackButton(
+                text = "■ stop",
+                onClick = onStop,
+                enabled = state.isTracking && !state.configApplying,
+                accent = Hack.Red,
+                modifier = Modifier.weight(1f),
+            )
+        }
+        // Why capture stopped, on the screen where someone is changing the settings that
+        // could have caused it. The full reason lives on the Status tab; this is the one
+        // line that says to go and read it.
+        state.captureSuspendedReason?.let { Alert(it, Hack.Amber) }
+    }
+}
 
-private const val SESSION_ROWS = 6
-private const val DEVICE_ID_CHARS = 18
-private const val BYTES_PER_KB = 1024
-private const val ALERT_FILL_ALPHA = 0.12f
+/**
+ * The pinned footer: what applying will do, what refused, and the two resets.
+ *
+ * The Apply button states its own consequence rather than leaving it to a note elsewhere.
+ * "restarts session" is not a warning here — it is what the button does, and a tester who
+ * reads it after the fact has already lost a run.
+ */
+@Composable
+private fun ApplyBar(
+    state: TrackerViewModel.UiState,
+    dirtyCount: Int,
+    onApply: () -> Unit,
+    onReset: () -> Unit,
+    onResetToSdkDefaults: () -> Unit,
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(Hack.Surface)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        // The validator's own words, or the name of a box that does not parse. Above the
+        // button rather than below it, because it is the reason the button did nothing.
+        if (state.configErrors.isNotEmpty()) ValidationErrors(state.configErrors)
+
+        state.configNotice?.let { notice ->
+            Text(
+                text = "· $notice",
+                style = MonoBody.copy(color = Hack.Cyan, fontSize = 10.sp),
+            )
+        }
+
+        HackButton(
+            text = when {
+                state.configApplying -> "applying…"
+                state.configInvalid.isNotEmpty() -> "fix ${state.configInvalid.size} invalid field(s)"
+                state.isTracking -> "apply · restarts session"
+                else -> "apply"
+            },
+            onClick = onApply,
+            // Deliberately NOT disabled on `dirtyCount == 0`: re-applying an unchanged
+            // config is how a tester re-runs `ready()` after granting a permission or
+            // clearing an integrity finding, and it is the cheapest way to see what the
+            // validator says about the config that is already running.
+            enabled = !state.configApplying && state.configInvalid.isEmpty(),
+            accent = if (dirtyCount > 0) Hack.Amber else Hack.Green,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            GhostButton(
+                text = "reset · sample",
+                onClick = onReset,
+                enabled = !state.configApplying,
+                modifier = Modifier.weight(1f),
+            )
+            GhostButton(
+                text = "reset · sdk defaults",
+                onClick = onResetToSdkDefaults,
+                enabled = !state.configApplying,
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
 
 @Composable
 @Preview(showBackground = true, backgroundColor = 0xFF060A06)
@@ -524,23 +337,10 @@ fun HomeScreenPreview() {
             isCapturing = true,
             pointCount = 128,
             sessionId = "8f2c41ab-77de-4f01-9c11-0d2a55b6e900",
-            licenseStatus = "debug installs waived",
-            lastHeartbeatAtMs = 1_724_582_400_000L,
-            syncQueued = 12,
-            syncEndpoint = "https://api.example.com/v1/location/batch",
-            syncDeviceId = "0f9a1c7e-3b44-4b0a-9f21-1c9d6e2a77bb",
-            apiCheckResult = "OK lat=23.02231 lng=72.57136 acc=8m",
-            log = listOf(
-                "ACCEPT  bearing_change  acc=6m",
-                "MOTION  MOVING",
-                "sync · HTTP 200 · 40 row(s)",
-                "DROP    accuracy 41m > 20m",
-                "ERROR   FGS_START_REFUSED: started from background",
-            ),
+            configDraft = TrackerConfig(),
+            configApplied = TrackerConfig(),
         ),
         onStart = {},
         onStop = {},
-        onRequestPermissions = {},
-        onAllowBackground = {},
     )
 }

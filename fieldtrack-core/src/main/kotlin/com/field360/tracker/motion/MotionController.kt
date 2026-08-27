@@ -184,7 +184,10 @@ internal class MotionController(
         when (changedTo) {
             MotionState.MOVING -> onEnterMoving(active)
             MotionState.STATIONARY -> onEnterStationary(active)
-            MotionState.STOP_PENDING, MotionState.STOPPED -> Unit
+            // Cadence only — no wake path is armed or disarmed here, because the machine
+            // has not decided this is a stop. `STATIONARY` is where that is committed to.
+            MotionState.STOP_PENDING -> streamController.onStopPending()
+            MotionState.STOPPED -> Unit
         }
     }
 
@@ -193,8 +196,18 @@ internal class MotionController(
         // a trigger sensor registered through a drive is pure battery cost (EC-138).
         significantMotion.disarm()
         stationaryFence.unregister(config.motion.stationaryGeofenceId)
+        // Note what is NOT here: `setVehicular(true)`.
+        //
+        // Moving is not the same fact as vehicular, and treating them as one gave every
+        // pedestrian session `vehicularIntervalMs` — 12 s against a 60 s base, five times
+        // the fix rate, for a walker whose track needs nothing of the kind.
+        // `GeolocationConfig.vehicularIntervalMs` has always documented itself as the tier
+        // used "once fixes report vehicle speed"; the tier is now raised from that speed,
+        // in `LocationStreamController.onObservedSpeed`.
+        //
+        // `onMoving` still restores a tier parked by a `STOP_PENDING`, so pulling away
+        // from a junction does not wait for the next fix to measure speed again.
         streamController.onMoving()
-        streamController.setVehicular(true)
     }
 
     private fun onEnterStationary(config: TrackerConfig) {
