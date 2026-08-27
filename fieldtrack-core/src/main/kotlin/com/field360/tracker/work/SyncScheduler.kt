@@ -56,6 +56,22 @@ internal class SyncScheduler(
     @Volatile
     private var lastRequestMs = 0L
 
+    /**
+     * Whether anything is actually listening for a drain request.
+     *
+     * False in three distinct situations, and they are one state as far as any reader is
+     * concerned: no `fieldtrack-sync` artifact on the classpath, an artifact present but
+     * never given a `SyncConfig`, and a config torn down by a 401/403. In all three
+     * nothing will ever upload, so a queue depth is not a backlog — it is the intended
+     * behaviour of an offline-first recorder with nowhere to send anything.
+     *
+     * `TrackingService` reads this before putting the upload status on the notification.
+     * Without it, a host that never set an endpoint would watch `unsynced` climb into the
+     * hundreds against `last upload never` and reasonably conclude sync was broken, when
+     * in fact it was never asked for.
+     */
+    val isConfigured: Boolean get() = trigger != null
+
     /** Null clears it — `autoSync = false`, or a 401/403 that tore the config down. */
     fun register(trigger: SyncTrigger?) {
         this.trigger = trigger
