@@ -643,8 +643,9 @@ Two more things to know before reading the number:
 - It refreshes on the `watchdogIntervalMs` tick, so it lags reality by up to that long. A count
   that has not moved for one tick has not necessarily stalled.
 - The line only appears while sync is actually configured. With no `configure()` call — or after
-  a terminal `401` / `403` clears the config mid-session — the notification reverts to your own
-  `notificationText`. See [§14.4](#144-terminal-failure-semantics).
+  a terminal `401` / `403` clears the config mid-session — the subtitle disappears and the body
+  reverts to your own `notificationText`. The title never moved, so the notification simply looks
+  as it did before the diagnostic was on. See [§14.4](#144-terminal-failure-semantics).
 
 ### 5.6 `AccuracyConfig`
 
@@ -1643,6 +1644,7 @@ sealed interface SyncQueue.Result {
 ```kotlin
 sealed interface SyncEvent {
     data class HttpResponse(val statusCode: Int?, val count: Int) : SyncEvent
+    data class NetworkAvailable(val queued: Int) : SyncEvent
 }
 ```
 
@@ -1650,15 +1652,24 @@ sealed interface SyncEvent {
 timeout). That is a device problem; a 500 is a server problem — do not report them the same way.
 `count` is what was *attempted*, not what was stored.
 
+`NetworkAvailable` fires when the device returns to a usable network **and** rows are actually
+queued — a reconnection with an empty queue is silent. `queued` is the depth at that moment. It
+says a drain was *requested*, not that one succeeded; the `HttpResponse` that follows is the
+outcome. See [When the network comes back](#when-the-network-comes-back).
+
 ```kotlin
 lifecycleScope.launch {
     sync.events.collect { event ->
         when (event) {
             is SyncEvent.HttpResponse -> showLastUpload(event.statusCode, event.count)
+            is SyncEvent.NetworkAvailable -> showBacklog(event.queued)
         }
     }
 }
 ```
+
+`events` is a `SharedFlow` with `replay = 1`, so a screen opened after a background drain sees
+the last event rather than a blank panel.
 
 ### 14.4 Terminal failure semantics
 
@@ -1670,13 +1681,37 @@ lifecycleScope.launch {
 | **Anything else** | Rows stay queued and retry with linear backoff (30 s base) via WorkManager, network-constrained |
 | `Retry-After` header | Honoured — the server's own schedule replaces the SDK's |
 
+Not every `Retry` is a failed exchange. `Retry("already draining")` means another drain holds the
+lock and is doing the work; `Retry("sync not configured")` and `Retry("no transport")` mean there
+was nothing to attempt. None of the three consume a backoff attempt — surface them as information,
+not as an upload error.
+
 One visible side effect of both terminal cases: if you turned on
-[`showSyncStatusInNotification`](#55-serviceconfig), the upload-status line disappears with the
-config and the notification goes back to your own `notificationText`. That is the same reading as
-"sync was never configured", so a status line that vanishes mid-session means a `401` or `403`
-landed — check `SyncEvent.HttpResponse` for which. After a `403` the rows are still on disk and
-resume uploading once `configure()` is called with a working credential; after a `401` they are
-gone.
+[`showSyncStatusInNotification`](#55-serviceconfig), the upload-status subtitle and line disappear
+with the config and the notification goes back to your own `notificationText`. That is the same
+reading as "sync was never configured", so a status line that vanishes mid-session means a `401`
+or `403` landed — check `SyncEvent.HttpResponse` for which. After a `403` the rows are still on
+disk and resume uploading once `configure()` is called with a working credential; after a `401`
+they are gone.
+
+#### When the network comes back
+
+Recovering from offline has two independent halves, and you need neither of them to do anything:
+
+- **Durable.** Every drain is enqueued as network-constrained WorkManager work, persisted in
+  WorkManager's own database. It survives process death and reboot, so a backlog recorded offline
+  uploads even if the app is killed before connectivity returns.
+- **Prompt.** While the process is alive, the SDK watches the default network and asks for a drain
+  the moment the device is on a *validated* one — not merely a connected one, so a captive portal
+  is not mistaken for internet. Rising edges only, throttled to one request per 15 s, and only
+  when the queue is non-empty. This is what emits `SyncEvent.NetworkAvailable`.
+
+The prompt half needs `autoSync = true`; with it off you own the schedule and nothing drains
+unless you call `syncNow()`. Both halves stop after a 401 or 403.
+
+**Queue order is FIFO** — oldest row first, across every unsent session, by insertion order rather
+than by any device clock. A backlog that spans a reboot still uploads in the order it was
+recorded.
 
 ### 14.5 The wire format
 
@@ -2301,6 +2336,9 @@ fire and the runtime waiver already applies.
 | Tracking ends when the user swipes the app away | `stopOnTerminate = true` | Leave it `false` (the default) |
 | Uploads retry forever | `http://` URL blocked by Android's default network security policy | Use `https://`, or `allowCleartext = true` for a local dev server |
 | Uploads stopped, rows still queued | A 403 halted the queue | Call `sync.configure(...)` again with a working credential |
+| Queue does not drain when the network returns | `autoSync = false`, so only the durable half runs — nothing asks for a drain until the next enqueued work is released | Set `autoSync = true`, or call `syncNow()` from your own connectivity handling |
+| `NetworkAvailable` arrives but nothing uploads | The drain ran and failed — the event says a drain was *requested*, not that it succeeded | Read the `HttpResponse` that follows for the reason; a `null` `statusCode` means the request never completed |
+| Backlog uploads in a scrambled order | Fixed — the queue is FIFO by insertion, including across a reboot | Update the SDK; older builds ordered on a monotonic clock that restarts at boot |
 | Tracking stopped and the queue emptied | A 401 tore everything down | Re-authenticate, then `ready()` / `start()` / `configure()` again |
 | The upload-status line vanished mid-session | A 401 or 403 cleared the sync config — the line is only posted while sync is configured | Check `SyncEvent.HttpResponse` for which, then the two rows above ([§14.4](#144-terminal-failure-semantics)) |
 | The upload-status line never appeared | `showSyncStatusInNotification` left off, or `configure()` never called | Turn the flag on **and** configure sync; it is a diagnostic and stays off by default ([§5.5](#55-serviceconfig)) |
