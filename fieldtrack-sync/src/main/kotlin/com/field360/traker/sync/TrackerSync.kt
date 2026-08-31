@@ -373,7 +373,7 @@ public class TrackerSync internal constructor(
         isUploadable = { config != null && haltedReason == null },
         onQueued = { queued ->
             eventSink.tryEmit(SyncEvent.NetworkAvailable(queued))
-            requestSync()
+            requestSyncOnReconnect()
         },
     )
 
@@ -462,14 +462,41 @@ public class TrackerSync internal constructor(
     }
 
     /**
+     * The connectivity path's own enqueue, and **not** [requestSync].
+     *
+     * The difference is `REPLACE` versus `KEEP`, and it is the whole reason the prompt half
+     * was not actually prompt. `KEEP` does nothing when a `fieldtrack-sync` request already
+     * exists in any unfinished state — and `ENQUEUED` is exactly what a request in linear
+     * backoff looks like. WorkManager's `NetworkType.CONNECTED` releases work on *connected*
+     * rather than *validated*, so the drain routinely runs a second or two before routing
+     * actually works, fails with an `IOException`, and re-enters backoff. The validated
+     * rising edge then arrived, read a non-empty queue, emitted
+     * [SyncEvent.NetworkAvailable] — and was dropped by `KEEP`, leaving the backlog to wait
+     * out a backoff that had already grown to minutes on a flaky link.
+     *
+     * `REPLACE` is right here for the same reason it is right for a `Retry-After`: this is
+     * not a burst. It is one request per rising edge, already throttled by [RisingEdge]'s
+     * cooldown and already gated on a non-empty queue, so there is nothing to defend
+     * against by keeping a stale backoff — and replacing it resets `runAttemptCount`, which
+     * is what stops a long offline stint from compounding into a five-hour delay.
+     */
+    private fun requestSyncOnReconnect() {
+        val activeConfig = config ?: return
+        if (haltedReason != null) return
+        SyncWorker.enqueueNow(context, activeConfig.requiresUnmeteredNetwork)
+    }
+
+    /**
      * Drains inline. Returns what happened so a host can surface it.
      *
      * Runs in the caller's scope, so an upload started from a `viewModelScope` is cancelled
      * with it. Prefer [requestSync] for anything not user-initiated.
      */
     public suspend fun syncNow(): SyncQueue.Result {
-        val activeConfig = config ?: return SyncQueue.Result.Retry("sync not configured")
-        val activeTransport = transport ?: return SyncQueue.Result.Retry("no transport")
+        val activeConfig = config
+            ?: return SyncQueue.Result.Retry(SyncQueue.REASON_NOT_CONFIGURED)
+        val activeTransport = transport
+            ?: return SyncQueue.Result.Retry(SyncQueue.REASON_NO_TRANSPORT)
         // Answer from memory rather than spending a request to be told the same thing.
         if (haltedReason != null) return SyncQueue.Result.Forbidden
 
@@ -609,6 +636,15 @@ internal class SyncWorker(
     override suspend fun doWork(): Result {
         val sync = TrackerSync.getInstance(applicationContext)
 
+        // Nothing is listening, so there is nothing this attempt can do and nothing a later
+        // one could do either — `configure()` is the host's call, not an event this worker
+        // can wait for. Reported as done rather than retried because a retry is not free:
+        // it leaves this unique work ENQUEUED in backoff, and everything that then asks for
+        // a drain under `KEEP` is silently dropped for as long as that lasts. A host that
+        // configures sync later than `Application.onCreate` would otherwise poison the
+        // queue on every process start.
+        if (!sync.isConfigured) return Result.success()
+
         return when (val result = sync.syncNow()) {
             is SyncQueue.Result.Uploaded, SyncQueue.Result.Empty -> Result.success()
             // Terminal: teardown already happened, so retrying would only re-fail.
@@ -625,8 +661,17 @@ internal class SyncWorker(
      * policy, fixed when the request was built, and `setInitialDelay` only affects a newly
      * enqueued one. So a server that named a time is honoured by enqueueing afresh and
      * reporting this attempt as done; without a time, the existing linear backoff stands.
+     *
+     * **Not every [SyncQueue.Result.Retry] is a failed exchange**, and the ones that are not
+     * must never reach `Result.retry()`. A retry permanently increments `runAttemptCount`,
+     * which grows the linear backoff for every *genuine* failure after it, and it parks this
+     * unique work in `ENQUEUED` where `KEEP` swallows every subsequent drain request. Paying
+     * that for a lock collision — a `syncNow()` from the host's UI overlapping this worker,
+     * which is a drain succeeding on another thread — is the wrong trade in both directions.
      */
     private fun reschedule(sync: TrackerSync, result: SyncQueue.Result.Retry): Result {
+        if (result.reason in NOT_A_FAILURE) return Result.success()
+
         val delayMs = result.retryAfterMs ?: return Result.retry()
         sync.rescheduleAfter(delayMs)
         return Result.success()
@@ -634,6 +679,18 @@ internal class SyncWorker(
 
     companion object {
         const val NAME = "fieldtrack-sync"
+
+        /**
+         * Retry reasons that describe this worker's own situation rather than a failed
+         * exchange with the server. Neither is worth a backoff attempt: the queue is
+         * already being drained by somebody else, or there is no configuration for a
+         * later attempt to find.
+         */
+        private val NOT_A_FAILURE = setOf(
+            SyncQueue.REASON_ALREADY_DRAINING,
+            SyncQueue.REASON_NOT_CONFIGURED,
+            SyncQueue.REASON_NO_TRANSPORT,
+        )
 
         fun enqueue(context: Context, requiresUnmetered: Boolean) {
             WorkManager.getInstance(context)
@@ -643,7 +700,21 @@ internal class SyncWorker(
         }
 
         /**
-         * The `Retry-After` path, and the only caller of `REPLACE`.
+         * The connectivity path — `REPLACE`, and see `TrackerSync.requestSyncOnReconnect`
+         * for why `KEEP` made the rising edge a no-op whenever a previous attempt was
+         * sitting in backoff.
+         */
+        fun enqueueNow(context: Context, requiresUnmetered: Boolean) {
+            WorkManager.getInstance(context)
+                .enqueueUniqueWork(
+                    NAME,
+                    ExistingWorkPolicy.REPLACE,
+                    requestFor(requiresUnmetered),
+                )
+        }
+
+        /**
+         * The `Retry-After` path.
          *
          * `KEEP` above defends against a burst of accepted points resetting the backoff.
          * There is no burst here — this runs once, from a drain the server itself

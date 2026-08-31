@@ -78,8 +78,8 @@ public data class TrackerConfig(
         if (service.showSyncStatusInNotification && service.syncNotificationText.isBlank()) {
             add("service.syncNotificationText must not be blank when showSyncStatusInNotification is on")
         }
-        if (service.syncNotificationTitle?.isBlank() == true) {
-            add("service.syncNotificationTitle must not be blank — use null to keep notificationTitle")
+        if (service.syncNotificationSubText?.isBlank() == true) {
+            add("service.syncNotificationSubText must not be blank — use null for no subtitle")
         }
         // Checked here rather than where it is consumed, because a typo'd base URL should
         // fail while the host is assembling config — not one `configure()` call later in a
@@ -435,15 +435,19 @@ public data class TrackerConfig(
             apply { service = service.copy(showSyncStatusInNotification = value) }
 
         /**
-         * The upload-status wording, the same shape as [notification].
+         * The upload-status wording. **Subtitle and description only** — unlike
+         * [notification], neither argument can touch the notification's title, which stays
+         * [ServiceConfig.notificationTitle] in both states.
          *
-         * @param title `null` keeps the tracking title — see [ServiceConfig.syncNotificationTitle].
-         * @param text supports `{pending}` and `{age}` — see [ServiceConfig.syncNotificationText].
+         * @param subText shown beside the title while the status line is up; `null` for no
+         *   subtitle. See [ServiceConfig.syncNotificationSubText].
+         * @param text the description, supporting `{pending}` and `{age}` — see
+         *   [ServiceConfig.syncNotificationText].
          */
-        public fun syncNotification(title: String?, text: String): Builder =
+        public fun syncNotification(subText: String?, text: String): Builder =
             apply {
                 service = service.copy(
-                    syncNotificationTitle = title,
+                    syncNotificationSubText = subText,
                     syncNotificationText = text,
                 )
             }
@@ -734,19 +738,32 @@ public data class ServiceConfig(
      * Refreshed on the [watchdogIntervalMs] tick, so the number lags reality by up to that
      * long. A count that has not moved for one tick has not necessarily stalled.
      *
-     * The wording is [syncNotificationTitle] and [syncNotificationText], set the same way
-     * [notificationTitle] and [notificationText] are.
+     * **Layered onto the host's notification, never replacing it.** [notificationTitle]
+     * stays put in both states; the diagnostic occupies the subtitle
+     * ([syncNotificationSubText]) and the description ([syncNotificationText]) and nothing
+     * else. A user glancing at the shade must still see which app is holding the foreground
+     * service.
      */
     val showSyncStatusInNotification: Boolean = false,
     /**
-     * Title shown while the upload status is on screen, or `null` to keep
-     * [notificationTitle].
+     * The **subtitle** shown beside [notificationTitle] while the upload status is on
+     * screen, or `null` for no subtitle.
      *
-     * Null by default because the title is the app's identity in the shade — a host that
-     * wants "Recording your location" there while tracking generally wants it there during
-     * a sync backlog too. Set it when the two states deserve different headlines.
+     * **This never replaces [notificationTitle].** The sync status is a diagnostic layered
+     * onto the host's ongoing notification, not a notification of its own. Overriding the
+     * title took away the only line naming the app that is holding the foreground service,
+     * so a user glancing at the shade saw a debug readout where their app's identity
+     * belongs. Title, subtitle and description are three slots: the host owns the first,
+     * this owns the second while a status line is showing, and [syncNotificationText] owns
+     * the third.
+     *
+     * Null by default, so a host that turns the diagnostic on without choosing wording gets
+     * the status line and no subtitle — which is the honest rendering of "nothing was said
+     * about this slot".
+     *
+     * Ignored entirely unless [showSyncStatusInNotification] is on.
      */
-    val syncNotificationTitle: String? = null,
+    val syncNotificationSubText: String? = null,
     /**
      * The upload-status line, with two placeholders substituted at post time:
      *

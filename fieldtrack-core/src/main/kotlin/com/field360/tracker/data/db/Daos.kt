@@ -89,7 +89,29 @@ internal interface TrackPointDao {
     suspend fun prune(cutoffMs: Long): Int
 
     // ── upload queue (used only by the optional fieldtrack-sync artifact) ──────
-    @Query("SELECT * FROM track_point WHERE syncState = 0 ORDER BY elapsedRealtimeNanos LIMIT :limit")
+
+    /**
+     * Insertion order, for the same reason as [query] — and this is the query where getting
+     * it wrong hurts most.
+     *
+     * `elapsedRealtimeNanos` restarts at zero on reboot, so a backlog that straddles one
+     * sorts its entire post-reboot tail to the *front* of the queue. Every other ordering
+     * query in this file moved to `id` for that reason (EC-88a); this one was left behind,
+     * and it is the only one with no `sessionId` filter to bound the damage — it sorts the
+     * whole table at once, across every session the device has ever recorded.
+     *
+     * A multi-day offline backlog is exactly what this SDK is built to survive and exactly
+     * what spans a reboot, so the failure lands on the case that matters: the batches go up
+     * shuffled, and a server that plots them in receipt order draws a braid. Nothing is lost
+     * — `MAX_BATCHES_PER_DRAIN` keeps going until the table is empty and the wire carries
+     * each point's own `time` — but the queue stops being FIFO precisely when the queue
+     * being FIFO is the whole point.
+     *
+     * Exact here for the same reason it is exact in [query]: `ClockGuard` drops out-of-order
+     * deliveries before they are ever stored (EC-92a), so nothing reaches this table except
+     * in the order it happened.
+     */
+    @Query("SELECT * FROM track_point WHERE syncState = 0 ORDER BY id LIMIT :limit")
     suspend fun pendingUpload(limit: Int): List<TrackPointEntity>
 
     @Query("SELECT COUNT(*) FROM track_point WHERE syncState = 0")

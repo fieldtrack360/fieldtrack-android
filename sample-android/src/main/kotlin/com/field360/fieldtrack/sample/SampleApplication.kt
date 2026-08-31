@@ -233,7 +233,7 @@ class SampleApplication : Application() {
             // What the user actually sees for the whole session. All of it is the host's,
             // the channel included: an SDK-named channel in an app's notification settings
             // is a support ticket.
-            .notification("FieldTrack sample", "Recording your location")
+            .notification("FieldTrack - Recording your location", "Recording your location")
             .notificationChannel("fieldtrack_sample_tracking", "Location tracking")
             // By NAME, not by @DrawableRes id: the config is persisted, and an id does not
             // survive the next R regeneration. Resolved against this app's resources.
@@ -248,7 +248,7 @@ class SampleApplication : Application() {
             // `{pending}` and `{age}` are substituted at post time; a template with neither
             // is legal and gives a static string. The title is stated rather than left null
             // so the shade says which of the two states is on screen.
-            .syncNotification("FieldTrack sample · upload", "unsynced {pending} · last upload {age}")
+            .syncNotification("FieldTrack  · upload", "unsynced {pending} · last upload {age}")
 
             // ── persistence ─────────────────────────────────────────────────
             .maxDaysToPersist(7)

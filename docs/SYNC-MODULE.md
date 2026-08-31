@@ -125,9 +125,21 @@ Four paths lead to an upload:
 | Drain result | Worker outcome |
 |---|---|
 | `Uploaded` / `Empty` | `success()` |
+| Not configured (checked before draining) | `success()` — no attempt can make a `configure()` appear |
+| `Retry("already draining")` / `("sync not configured")` / `("no transport")` | `success()` — this worker's own situation, not a failed exchange |
 | `Retry` (no `Retry-After`) | `retry()` — linear backoff, 30 s steps |
 | `Retry` with `retryAfterMs` | `success()` + re-enqueue with `setInitialDelay` at the server's own schedule (`ExistingWorkPolicy.REPLACE`, so the server's instruction is not discarded in favour of the 30 s default) |
 | `AuthExpired` / `Forbidden` | `failure()` — terminal, retrying would only re-fail |
+
+**Why the three non-failures must not reach `retry()`.** A retry permanently increments
+`runAttemptCount`, which grows the linear backoff for every *genuine* failure after it, and
+it parks the unique work in `ENQUEUED` — where `KEEP` swallows every later drain request,
+including the one a reconnection makes. Paying that for a lock collision (a host's
+`syncNow()` overlapping the worker, which is a drain *succeeding* on another thread), or for
+a host that calls `configure()` later than `Application.onCreate`, is the wrong trade in
+both directions. The reason strings are `internal` constants on `SyncQueue`; they are
+documentation for a host, not a protocol, and nothing outside the module should branch on
+them.
 
 `Retry-After` parsing (RFC 9110) accepts both delta-seconds and HTTP-date forms, and clamps
 the result to **1 second – 6 hours**. Unparseable, negative or already-past values read as
@@ -164,9 +176,23 @@ or the next supervision tick (up to fifteen). Details that matter:
   what distinguishes "attached to a network" from "packets reach the internet".
 - **Metered-aware.** Under `requiresUnmeteredNetwork(true)`, losing Wi-Fi is a falling
   edge, so re-joining it later is a rising one.
-- **Rising edges, throttled 15 s.** `onCapabilitiesChanged` fires for signal strength and
-  link speed — many times a minute in a moving vehicle. Only unusable → usable counts, and
-  a flapping validation on a weak network produces one request rather than a burst.
+- **Rising edges, throttled 15 s — and the throttle defers rather than drops.**
+  `onCapabilitiesChanged` fires for signal strength and link speed — many times a minute in
+  a moving vehicle. Only unusable → usable counts, and a flapping validation on a weak
+  network produces one request rather than a burst. A real reconnection is never one
+  callback (`onLost`, then unvalidated, then validated, all inside a couple of seconds), so
+  a rise suppressed by the cooldown books a drain for when the cooldown expires instead of
+  returning "not a rise" with nothing left to re-check it. Dropping it stranded the queue
+  until the next supervision tick — two minutes with the service alive, fifteen without.
+- **`REPLACE`, not `KEEP`.** The connectivity edge enqueues through its own path
+  (`SyncWorker.enqueueNow`). `KEEP` — correct for the accepted-point burst — does nothing
+  when a request already exists in any unfinished state, and `ENQUEUED` is what a request in
+  linear backoff looks like. Since WorkManager's `NetworkType.CONNECTED` releases work on
+  *connected* rather than *validated*, the drain routinely runs a second before routing
+  works, fails, and re-enters backoff; the validated edge that followed was then silently
+  swallowed, leaving the backlog to wait out a backoff already grown to minutes. `REPLACE`
+  also resets `runAttemptCount`, which is what stops a long offline stint compounding into
+  a five-hour delay.
 - **Queue-gated.** The queue depth is read before anything is enqueued: a reconnection
   with an empty queue is the common case and is not worth a worker.
 - **autoSync only.** With `autoSync(false)` the host owns the schedule, and a drain it did
@@ -467,7 +493,12 @@ read 30 s, write 20 s — override per-config via `SyncConfig.timeouts`.
    retries on reconnect. Batches that already succeeded stay marked synced.
 3. **Reconnect while running** — airplane mode on, drive/simulate until rows accumulate,
    airplane mode off. A `SyncEvent.NetworkAvailable` arrives within seconds and the queue
-   drains without waiting for the next accepted point.
+   drains without waiting for the next accepted point. **Check the drain, not just the
+   event**: the regression this covers emitted `NetworkAvailable` correctly and uploaded
+   nothing, because the enqueue behind it was a `KEEP` no-op against a request already in
+   backoff. Point at an unreachable host first so a few attempts fail and the backoff grows
+   past a minute, then restore the endpoint and toggle the network — the drain must go out
+   on the edge, not on the expired backoff.
 4. **Reconnect after the process is gone** — airplane mode on, capture, `stop()`,
    force-stop the app, airplane mode off. `NetworkMonitor` cannot help here; the drain
    `stopTracking()` left enqueued is what runs (§3.5). Confirm the rows arrive.

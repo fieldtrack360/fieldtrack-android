@@ -580,20 +580,20 @@ Builder: `.useSignificantMotion()`, `.useStepCorroboration()`, `.useAcceleromete
 | `deadTrackerMovingMin` | `Int` | `30` | Minutes with no fix while moving before declaring the tracker dead |
 | `deadTrackerStationaryMin` | `Int` | `60` | Same, while stationary |
 | `wakeLockMs` | `Long` | `20_000` | Wake-lock hold during a capture burst |
-| `notificationTitle` | `String` | `"Tracking active"` | Foreground notification title |
+| `notificationTitle` | `String` | `"Tracking active"` | Foreground notification title. **Never overridden** — the sync diagnostic below cannot take this slot |
 | `notificationText` | `String` | `"Recording your location"` | Foreground notification body |
 | `notificationChannelId` | `String` | `"trackit_tracking"` | Channel id |
 | `notificationChannelName` | `String` | `"Location tracking"` | Channel name shown in system settings |
 | `notificationSmallIconResName` | `String?` | `null` | Drawable **resource name** (e.g. `"ic_tracking"`) for the small icon |
-| `showSyncStatusInNotification` | `Boolean` | `false` | **Diagnostic — leave off in a shipping app.** Replaces `notificationText` with a live upload-queue line while tracking. See below |
-| `syncNotificationTitle` | `String?` | `null` | Title shown while the sync line is on screen. `null` keeps `notificationTitle` — the usual choice |
+| `showSyncStatusInNotification` | `Boolean` | `false` | **Diagnostic — leave off in a shipping app.** Layers a live upload-queue line onto the subtitle and body while tracking; the title is untouched. See below |
+| `syncNotificationSubText` | `String?` | `null` | The **subtitle** shown beside `notificationTitle` while the sync line is on screen. `null` = no subtitle. Rendered with `setSubText`; never replaces the title |
 | `syncNotificationText` | `String` | `"unsynced {pending} · last upload {age}"` | The sync line template. See the token table below. Ignored unless `showSyncStatusInNotification` is on |
 
 Builder: `.foregroundService()`, `.stopOnTerminate()`, `.startOnBoot()`, `.healthLoopMs()`,
 `.watchdogIntervalMs()`, `.watchdogThrottleMs()`, `.backstopIntervalMin()`,
 `.deadTrackerMovingMin()`, `.deadTrackerStationaryMin()`, `.wakeLockMs()`,
 `.notification(title, text)`, `.notificationChannel(id, name)`, `.notificationSmallIconResName()`,
-`.showSyncStatusInNotification()`, `.syncNotification(title, text)`.
+`.showSyncStatusInNotification()`, `.syncNotification(subText, text)`.
 
 #### The upload-status notification
 
@@ -606,6 +606,20 @@ device offline, wait, restore connectivity, and confirm the queue drains — wit
 anything, because launching the app is itself a sync trigger and would invalidate the test. The
 notification is the only readout that survives that, and it needs no debugger, no adb and no
 server-side check.
+
+It occupies **the subtitle and the body, never the title.** The notification has three text
+slots and the host keeps the one that matters:
+
+```
+┌──────────────────────────────────────┐
+│ Tracking active   ·   upload         │   ← notificationTitle · syncNotificationSubText
+│ unsynced 42 · last upload 21m ago    │   ← syncNotificationText
+└──────────────────────────────────────┘
+```
+
+With the diagnostic off — or on with no `syncNotificationSubText` set — there is no subtitle at
+all and the body is `notificationText`. The title reads the same either way, because it names
+the app holding the foreground service and a debug readout must not take that line.
 
 `syncNotificationText` is substituted at post time:
 
@@ -696,7 +710,7 @@ Builder: `.maxDaysToPersist()`, `.maxRecords()`, `.persistRawFixes()`, `.rawRing
 - blank `syncNotificationText` while `showSyncStatusInNotification` is on — checked only when
   the line will actually be posted, so leaving the diagnostic off is never refused over a
   string nothing reads
-- `syncNotificationTitle` set to a blank string — use `null` to keep `notificationTitle`
+- `syncNotificationSubText` set to a blank string — use `null` for no subtitle
 
 ---
 

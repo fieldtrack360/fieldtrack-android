@@ -606,15 +606,15 @@ fun configGroups(): List<ConfigGroup> = listOf(
             ),
             bool(
                 "showSyncStatusInNotification",
-                "replaces notificationText with the upload queue. Diagnostic",
+                "upload queue in the subtitle and body. Title untouched. Diagnostic",
                 { it.service.showSyncStatusInNotification },
                 { c, v -> c.copy(service = c.service.copy(showSyncStatusInNotification = v)) },
             ),
             nullableStringField(
-                "syncNotificationTitle",
-                "blank = keep notificationTitle",
-                { it.service.syncNotificationTitle },
-                { c, v -> c.copy(service = c.service.copy(syncNotificationTitle = v)) },
+                "syncNotificationSubText",
+                "subtitle beside the title. Blank = no subtitle",
+                { it.service.syncNotificationSubText },
+                { c, v -> c.copy(service = c.service.copy(syncNotificationSubText = v)) },
             ),
             stringField(
                 "syncNotificationText",

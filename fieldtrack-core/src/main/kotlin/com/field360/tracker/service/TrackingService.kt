@@ -298,12 +298,17 @@ public class TrackingService : LifecycleService() {
         manager.createNotificationChannel(channel)
 
         return NotificationCompat.Builder(this, config.notificationChannelId)
-            // The sync title only applies while a sync line is actually on screen, and
-            // only when the host set one — null means "the tracking title is right for
-            // both states", which is the common case.
-            .setContentTitle(
-                statusLine?.let { config.syncNotificationTitle } ?: config.notificationTitle,
-            )
+            // **The title is the host's, always.** The sync status is a diagnostic layered
+            // onto the ongoing notification, not a notification of its own, and letting it
+            // take the title took away the one line that says which app is holding the
+            // foreground service. A user who sees "FieldTrack · upload" where their app's
+            // name belongs has lost the notification's identity to a debug readout.
+            .setContentTitle(config.notificationTitle)
+            // The sync headline goes in the **subtitle**, beside the title rather than over
+            // it, and only while a status line is actually on screen. Null — the default,
+            // and the case when the host set no wording — leaves the notification with no
+            // subtitle at all, exactly as it looks with the diagnostic off.
+            .setSubText(statusLine?.let { config.syncNotificationSubText })
             // The status line REPLACES the host's text rather than appending to it. The
             // collapsed notification shows one line, and a concatenation would push the
             // number — the only part being read during the test — off the end of it.

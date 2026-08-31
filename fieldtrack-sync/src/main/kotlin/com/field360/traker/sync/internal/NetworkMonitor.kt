@@ -10,7 +10,9 @@ import com.field360.traker.sync.SyncQueue
 import com.field360.traker.sync.sdkLog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
@@ -79,6 +81,10 @@ internal class NetworkMonitor(
     private var manager: ConnectivityManager? = null
     private var callback: ConnectivityManager.NetworkCallback? = null
 
+    /** The timer owing a drain for a rise [RisingEdge] held back. Null when none is due. */
+    @Volatile
+    private var deferredDrain: Job? = null
+
     /**
      * Whether the *current* config wants an unmetered network. Read on the callback
      * thread, written from [start] on the host's thread.
@@ -132,7 +138,8 @@ internal class NetworkMonitor(
         val watcher = callback
         manager = null
         callback = null
-        edge.reset()
+        cancelDeferred()
+        synchronized(edge) { edge.reset() }
         if (service != null && watcher != null) {
             runCatching { service.unregisterNetworkCallback(watcher) }
         }
@@ -153,8 +160,48 @@ internal class NetworkMonitor(
         // elapsedRealtime, not wall time: a network transition and an NTP correction are
         // entirely capable of arriving together, and a throttle measured against a clock
         // that just jumped backwards would latch for as long as the jump.
-        if (!edge.rose(usable, SystemClock.elapsedRealtime())) return
-        drainIfQueued()
+        //
+        // Synchronised because [edge] is now touched from two threads: the platform's
+        // callback thread here, and the deferral timer below.
+        val verdict = synchronized(edge) { edge.rose(usable, SystemClock.elapsedRealtime()) }
+
+        when (verdict) {
+            RisingEdge.Verdict.Drain -> {
+                // A rise that fires now supersedes one waiting on the clock.
+                cancelDeferred()
+                drainIfQueued()
+            }
+            is RisingEdge.Verdict.Defer -> scheduleDeferredDrain(verdict.afterMs)
+            RisingEdge.Verdict.Ignore -> Unit
+        }
+    }
+
+    /**
+     * The drain owed for a rise the cooldown held back.
+     *
+     * Fires unconditionally rather than re-testing the network first, and that is
+     * deliberate: the work it enqueues carries its own connectivity constraint, so a
+     * network that fell again in the meantime costs a blocked request rather than a wasted
+     * one — while re-testing would reintroduce exactly the dropped-edge the deferral
+     * exists to close.
+     */
+    private fun scheduleDeferredDrain(afterMs: Long) = synchronized(edge) {
+        deferredDrain?.cancel()
+        deferredDrain = scope.launch {
+            delay(afterMs)
+            synchronized(edge) { edge.deferredFired(SystemClock.elapsedRealtime()) }
+            sdkLog { logger.d(TAG, "Reconnect held by the cooldown; draining now") }
+            drainIfQueued()
+        }
+    }
+
+    /**
+     * On the same monitor as [scheduleDeferredDrain], so a [stop] racing the callback
+     * thread cannot leave a timer behind that outlives the registration it belongs to.
+     */
+    private fun cancelDeferred() = synchronized(edge) {
+        deferredDrain?.cancel()
+        deferredDrain = null
     }
 
     /**
@@ -193,29 +240,79 @@ internal class NetworkMonitor(
  * - **Edges, not levels.** `onCapabilitiesChanged` fires for signal strength, for a
  *   changing link speed, for anything at all about the default network — many times a
  *   minute on a moving vehicle. Only the unusable → usable transition is news.
- * - **A cooldown on top.** Validation can genuinely oscillate on a weak network, and each
- *   oscillation is a real edge. `SyncWorker` coalesces the resulting enqueues via
- *   `ExistingWorkPolicy.KEEP`, so the cost of a burst is binder calls rather than
- *   requests — but they land on whatever thread the platform picked, and a drain that is
- *   already running gains nothing from being asked again.
+ * - **A cooldown on top, that defers rather than drops.** Validation can genuinely
+ *   oscillate on a weak network, and each oscillation is a real edge; one drain covers all
+ *   of them. What the cooldown must not do is *lose* the last one — a flap that settles
+ *   inside the window used to return false with nothing left to re-check it. So a
+ *   suppressed rise comes back as [Verdict.Defer] carrying the remaining cooldown, and the
+ *   caller owes a drain when it expires.
  */
 internal class RisingEdge(private val cooldownMs: Long = DEFAULT_COOLDOWN_MS) {
+
+    /** What [rose] decided. */
+    sealed interface Verdict {
+        /** A rise, past the cooldown. Drain now. */
+        data object Drain : Verdict
+
+        /**
+         * A **real** rise, held back by the cooldown rather than discarded.
+         *
+         * @property afterMs what is left of the cooldown. The caller owes a drain then.
+         */
+        data class Defer(val afterMs: Long) : Verdict
+
+        /** Not a rise, or a rise already covered by an outstanding [Defer]. */
+        data object Ignore : Verdict
+    }
 
     private var usable = false
     private var lastRiseMs = Long.MIN_VALUE
 
-    /** @return true when [usable] is a rise worth acting on. */
-    fun rose(usable: Boolean, nowMs: Long): Boolean {
+    /** Whether a [Verdict.Defer] is outstanding, so a flap cannot queue one per oscillation. */
+    private var deferred = false
+
+    /**
+     * @return what to do about [usable] at [nowMs].
+     *
+     * **A suppressed rise is deferred, not dropped**, and that is the whole reason this
+     * returns a verdict rather than a `Boolean`. A real reconnection is not one callback:
+     * `onLost`, then `onCapabilitiesChanged` without `VALIDATED`, then the validated one,
+     * all inside a couple of seconds. When the settle landed inside the cooldown the old
+     * code returned false and *nothing re-checked* — the network was up, rows were queued,
+     * and the only things left were the health tick (two minutes, and only while the
+     * service is alive) and the backstop worker (fifteen). Returning [Verdict.Defer] hands
+     * the caller the remaining cooldown so the drain happens late instead of never.
+     */
+    fun rose(usable: Boolean, nowMs: Long): Verdict {
         val previous = this.usable
         this.usable = usable
         // The level is always recorded, even when the rise is swallowed by the cooldown:
         // dropping it would leave the gate low and turn the next fall/rise pair into a
         // second edge for the same reconnection.
-        if (!usable || previous) return false
+        if (!usable || previous) return Verdict.Ignore
 
-        if (lastRiseMs != Long.MIN_VALUE && nowMs - lastRiseMs < cooldownMs) return false
+        val elapsed = nowMs - lastRiseMs
+        if (lastRiseMs != Long.MIN_VALUE && elapsed < cooldownMs) {
+            // One deferral covers the whole flap. Every further oscillation inside the
+            // window is the same reconnection, and a wake-up each would be the burst the
+            // cooldown exists to prevent.
+            if (deferred) return Verdict.Ignore
+            deferred = true
+            return Verdict.Defer(cooldownMs - elapsed)
+        }
+
+        deferred = false
         lastRiseMs = nowMs
-        return true
+        return Verdict.Drain
+    }
+
+    /**
+     * The deferred drain is happening now: it counts as the rise the cooldown is measured
+     * from, and it clears the way for the next one.
+     */
+    fun deferredFired(nowMs: Long) {
+        deferred = false
+        lastRiseMs = nowMs
     }
 
     /**
@@ -223,9 +320,14 @@ internal class RisingEdge(private val cooldownMs: Long = DEFAULT_COOLDOWN_MS) {
      * [NetworkMonitor.start] does on every `configure()` — replays the current network as
      * a fresh edge, and a host that re-configures in a loop would otherwise get an
      * unthrottled drain request each time.
+     *
+     * The deferral is dropped rather than kept, because [NetworkMonitor.stop] cancels the
+     * timer that would have fired it. Re-registration replays the current network anyway,
+     * so a still-usable one produces its own verdict immediately.
      */
     fun reset() {
         usable = false
+        deferred = false
     }
 
     companion object {

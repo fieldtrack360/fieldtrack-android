@@ -74,7 +74,7 @@ public class SyncQueue internal constructor(
         // One drain at a time. A scheduled retry and a manual syncNow() colliding would
         // upload the same rows twice; the server would dedupe on uuid, but the second
         // request is pure waste.
-        if (!mutex.tryLock()) return Result.Retry("already draining")
+        if (!mutex.tryLock()) return Result.Retry(REASON_ALREADY_DRAINING)
         try {
             var uploaded = 0
             // Bounded so one call cannot hold the lock through an enormous backlog.
@@ -227,7 +227,24 @@ public class SyncQueue internal constructor(
         is SyncResponse.Failure -> code
     }
 
-    private companion object {
+    /**
+     * `internal`, so the reason strings stay out of the published API while still being
+     * one definition rather than a literal repeated at the site that has to recognise it.
+     *
+     * [Result.Retry.reason] is documentation for a host, not a protocol — nothing outside
+     * this module should be branching on it, and `SyncWorker` only does so because these
+     * three reasons are the ones that are *not* a failed exchange.
+     */
+    internal companion object {
+        /** Another drain holds the lock. It is doing this caller's work. */
+        internal const val REASON_ALREADY_DRAINING = "already draining"
+
+        /** No `configure()` yet, or a 401/403 tore it down. */
+        internal const val REASON_NOT_CONFIGURED = "sync not configured"
+
+        /** Configured, but nothing to upload through. Unreachable in practice. */
+        internal const val REASON_NO_TRANSPORT = "no transport"
+
         const val TAG = "SyncQueue"
         const val MAX_BATCHES_PER_DRAIN = 20
         const val HTTP_UNAUTHORIZED = 401
