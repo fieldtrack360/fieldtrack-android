@@ -293,6 +293,21 @@ public class Tracker internal constructor(
                                         currentSessionId = null,
                                     )
                                 }
+                            } else {
+                                // The enabled edge is normally redundant — `start()` sets
+                                // the same fields on its return path. It is not redundant
+                                // after a process death: `ResumeCaptureUseCase` restarts
+                                // capture from inside the service, with no host call to
+                                // set them, and without this a host would read
+                                // `isTracking = false` while the SDK was recording.
+                                _state.update {
+                                    it.copy(
+                                        isTracking = true,
+                                        isCapturing = captureGate.isCapturing,
+                                        currentSessionId = sessions.current()?.id
+                                            ?: it.currentSessionId,
+                                    )
+                                }
                             }
 
                         else -> Unit

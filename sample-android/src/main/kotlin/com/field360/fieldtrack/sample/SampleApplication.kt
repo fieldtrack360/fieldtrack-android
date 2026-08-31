@@ -110,6 +110,21 @@ class SampleApplication : Application() {
                 is TrackerResult.Error ->
                     Log.e(TRACKER_TAG, "ready() failed code=${result.code} message=${result.message}")
             }
+
+            // Re-installed with whatever session is open on disk, and this is the half of
+            // the envelope that was missing. `TrackerViewModel` keeps `session_id` current
+            // while the UI is alive — but the process that most needs it is the one the OS
+            // built to run `SyncWorker` after an OEM kill, where no view model is ever
+            // created and the `installSync()` above therefore ran with `null`. The offline
+            // backlog is exactly the payload that was uploading without a session id.
+            //
+            // After `ready()`, because that is what reports an interrupted session, and the
+            // read is cheap either way. `configure()` is safe to call twice: it replaces
+            // the config, re-registers the trigger and clears a 403 halt.
+            tracker.currentSession()?.let { open ->
+                Log.i(TRACKER_TAG, "re-installing sync for open session ${open.id}")
+                installSync(open)
+            }
         }
     }
 
@@ -323,8 +338,17 @@ class SampleApplication : Application() {
      * **Know what a top-level `session_id` claims.** It labels the whole envelope, and a
      * batch is `pending(batchSize)` — oldest rows first, across *every* unsent session. A
      * device that recorded three sessions offline uploads all three under whatever session
-     * was current at the last `configure()`, and the server has no way to tell. `SyncPoint`
-     * carries no session id of its own, so nothing downstream can correct it.
+     * was current at the last `configure()`, and the server has no way to tell from the
+     * envelope alone.
+     *
+     * Two things below fix that, and both are needed:
+     *
+     *  - `includePointSessionId(true)` stamps every row with the session that recorded it,
+     *    read from the row at encode time. This is the one that is always right.
+     *  - `onCreate` re-runs this with whatever session is open on disk. Without it the
+     *    envelope field is simply absent in the process that matters most — the one the OS
+     *    built to run `SyncWorker` after an OEM kill, where no view model ever exists to
+     *    call this on a session change.
      *
      * ## What this sample sends as `session_id`
      *
@@ -367,6 +391,11 @@ class SampleApplication : Application() {
                     // office — which reads as "sync is broken" rather than as the choice
                     // it is.
                     .requiresUnmeteredNetwork(false)
+                    // Every row carries the session that recorded it. The envelope's
+                    // `session_id` below is still sent and is still right for an online
+                    // device — but a backlog drained after the process was killed can hold
+                    // rows from two drives, and only this field can say which is which.
+                    .includePointSessionId(true)
                     // Top-level envelope fields, alongside the batch's `location` array:
                     //
                     //   { "device_id": "…", "session_id": "…", "location": [ … ] }
@@ -380,7 +409,7 @@ class SampleApplication : Application() {
                     // not guaranteed to belong to one session.
                     .extraParams(
                         buildMap {
-                            put("device_id", "Google pixel 4A")
+                            put("device_id", "${Build.BRAND} + ${Build.DEVICE}")
                             // Omitted rather than sent null while no session is open:
                             // `null` is not a supported extraParams value, and a literal
                             // "none" would be a session id the server could index on.

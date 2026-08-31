@@ -156,6 +156,26 @@ public data class SyncPoint(
      * deliberately so — the mask is the durable storage form, this is the readable one.
      */
     val integrity_signals: List<String> = emptyList(),
+    /**
+     * The id of the session that recorded this point, or `null` when
+     * `SyncConfig.includePointSessionId` is off (the default, and the shape every release
+     * before this one sent).
+     *
+     * **Why a per-row field exists at all.** A host that puts its session id in
+     * `SyncConfig.extraParams` puts it in the *envelope*, and an envelope field describes
+     * the whole batch. That is true for an online device, whose queue drains before each
+     * session ends — and false for exactly the offline backlog this SDK is built to
+     * survive: rows recorded across two drives upload in one batch, under whichever id was
+     * current at the last `configure()`. Worse, `configure()` usually runs from a UI that
+     * is not alive when a killed process's `SyncWorker` drains the queue, so the envelope
+     * field is stale or missing precisely when the backlog is largest.
+     *
+     * This field cannot be any of those things: it is read from the row.
+     *
+     * Serialized as `session_id`, and omitted rather than sent null — `explicitNulls` is
+     * off in [SyncQueue], so a backend that has never seen this key keeps parsing.
+     */
+    val session_id: String? = null,
 )
 
 /**

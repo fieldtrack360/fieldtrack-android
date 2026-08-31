@@ -41,7 +41,9 @@ import com.field360.tracker.domain.repository.DecisionRepository
 import com.field360.tracker.domain.repository.PendingUploadStore
 import com.field360.tracker.domain.repository.SessionRepository
 import com.field360.tracker.domain.repository.TrackPointRepository
+import com.field360.tracker.domain.usecase.CaptureLauncher
 import com.field360.tracker.domain.usecase.ResolveConfigUseCase
+import com.field360.tracker.domain.usecase.ResumeCaptureUseCase
 import com.field360.tracker.domain.usecase.SessionTeardown
 import com.field360.tracker.domain.usecase.StartTrackingUseCase
 import com.field360.tracker.domain.usecase.StopTrackingUseCase
@@ -445,27 +447,59 @@ internal class TrackerGraph private constructor(
         )
     }
 
-    val startTracking: StartTrackingUseCase by lazy {
-        StartTrackingUseCase(
-            sessions = sessions,
+    /**
+     * The launch half of a session, shared by `start()` and the revival path — the mirror
+     * of [sessionTeardown]. See `CaptureLauncher` for the failure it exists to end.
+     */
+    val captureLauncher: CaptureLauncher by lazy {
+        CaptureLauncher(
             ingestor = ingestor,
-            locationSource = locationSource,
             streamController = streamController,
             captureGate = captureGate,
-            teardown = sessionTeardown,
-            providerStateMonitor = providerStateMonitor,
             motionController = motionController,
-            oneShotProvider = oneShotProvider,
-            configStore = configStore,
-            permissions = permissions,
             stepCorroborator = stepCorroborator,
             activityRecognizer = activityRecognizer,
+            gyroTurnMonitor = gyroTurnMonitor,
+            oneShotProvider = oneShotProvider,
             watchdog = watchdog,
             syncScheduler = syncScheduler,
             context = context,
-            events = events,
             scope = scope,
-            gyroTurnMonitor = gyroTurnMonitor,
+        )
+    }
+
+    /**
+     * Restarts capture for a session whose process was killed under it.
+     *
+     * Read by `TrackingService`, which every revival path already ends in — so a wake that
+     * puts the service back now puts the location stream back with it.
+     */
+    val resumeCapture: ResumeCaptureUseCase by lazy {
+        ResumeCaptureUseCase(
+            sessions = sessions,
+            configRepository = config,
+            ingestor = ingestor,
+            launcher = captureLauncher,
+            permissions = permissions,
+            providerStateMonitor = providerStateMonitor,
+            events = events,
+            logger = logger,
+            applyConfig = ::applyConfig,
+        )
+    }
+
+    val startTracking: StartTrackingUseCase by lazy {
+        StartTrackingUseCase(
+            sessions = sessions,
+            locationSource = locationSource,
+            captureGate = captureGate,
+            teardown = sessionTeardown,
+            providerStateMonitor = providerStateMonitor,
+            configStore = configStore,
+            permissions = permissions,
+            context = context,
+            events = events,
+            launcher = captureLauncher,
             applyConfig = ::applyConfig,
         )
     }

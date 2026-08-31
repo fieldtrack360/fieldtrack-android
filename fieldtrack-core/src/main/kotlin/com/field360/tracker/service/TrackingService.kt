@@ -7,6 +7,7 @@ import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.lifecycle.LifecycleService
@@ -83,6 +84,15 @@ public class TrackingService : LifecycleService() {
      */
     private var postedStatusLine: String? = null
 
+    /**
+     * The partial wake lock, or null when [ServiceConfig.wakeLockMs] is 0 or the platform
+     * refused to hand one out.
+     */
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    /** Re-arms [wakeLock] before its timeout expires — see [startWakeLockRenewal]. */
+    private var wakeLockJob: Job? = null
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
 
@@ -127,6 +137,28 @@ public class TrackingService : LifecycleService() {
         supervision?.cancel()
         supervision = lifecycleScope.launch {
             val config = configRepository.load() ?: TrackerConfig()
+
+            // BEFORE anything else in this scope, because everything below supervises a
+            // pipeline this may be the thing that creates.
+            //
+            // Every revival path in the SDK ends in a start command on this service —
+            // `BootReceiver`, `RestoreWorker`, `BackstopWorker`, `reviveServiceIfNeeded`.
+            // None of them could restart capture, because capture is not in the service:
+            // it is the ingestor and the stream controller living in the process, started
+            // from `StartTrackingUseCase` and nowhere else. So an OEM kill — minutes, on
+            // OnePlus and Xiaomi with the screen off — was answered by putting the
+            // notification back over a pipeline that no longer existed, with the watchdog
+            // and the health loop both reporting healthy because the service was up and
+            // the session was open. A no-op whenever the pipeline is already running,
+            // which is every ordinary start command.
+            graph.resumeCapture()
+
+            // Held for the life of the service, not per fix. A location-typed foreground
+            // service does not keep the CPU awake, so on an OEM that sleeps aggressively
+            // the ingest coroutine, the motion tick and the health loop all stall between
+            // fixes — `wakeLockMs` existed to prevent exactly that and was read by
+            // nothing. Zero disables it.
+            startWakeLockRenewal(config.service)
 
             // The one case [promoteToForeground] cannot get right on its own: after the
             // process was killed and the sticky restart brought this service back, the
@@ -229,10 +261,65 @@ public class TrackingService : LifecycleService() {
         }
     }
 
+    /**
+     * Keeps a `PARTIAL_WAKE_LOCK` alive for as long as the service is serving a session.
+     *
+     * **Why a renewal loop rather than one long acquire.** The lock is taken with
+     * [ServiceConfig.wakeLockMs] as its timeout, so a lock leaked by a process that dies
+     * between `onStartCommand` and `onDestroy` releases itself rather than draining the
+     * battery until reboot. A timeout that short then has to be re-armed, and the loop can
+     * only be relied on to run because the lock it renews is what keeps the CPU running —
+     * which is the same reason it is renewed at half the timeout rather than at it.
+     *
+     * **Why this is needed at all.** `foregroundServiceType="location"` keeps the *process*
+     * alive; it does not keep the *CPU* awake. In Doze — and far more aggressively on
+     * OxygenOS and MIUI — the process is frozen between location callbacks, so `delay()` in
+     * the health loop, the motion tick that drives the stop timeout, and the ingest
+     * consumer all stop running on their stated cadence. The host declares the cost by
+     * setting the value; `0` opts out entirely and restores the previous behaviour.
+     */
+    private fun startWakeLockRenewal(config: ServiceConfig) {
+        wakeLockJob?.cancel()
+        if (config.wakeLockMs <= 0L) return
+
+        wakeLockJob = lifecycleScope.launch {
+            while (isActive) {
+                renewWakeLock(config.wakeLockMs)
+                delay(config.wakeLockMs / 2)
+            }
+        }
+    }
+
+    /**
+     * Acquires or re-arms the lock. Never throws: an OEM that refuses `PowerManager`, or a
+     * `WAKE_LOCK` permission stripped by a host's own manifest merge, degrades to the
+     * behaviour that shipped before this existed rather than taking the service down.
+     */
+    private fun renewWakeLock(timeoutMs: Long) {
+        val lock = wakeLock ?: runCatching {
+            getSystemService(PowerManager::class.java)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
+                // Not reference counted, so a re-arm is a re-arm rather than a second
+                // hold that `release()` would then have to be called twice to undo.
+                .apply { setReferenceCounted(false) }
+        }.getOrNull()?.also { wakeLock = it } ?: return
+
+        runCatching { lock.acquire(timeoutMs) }
+    }
+
+    private fun releaseWakeLock() {
+        wakeLockJob?.cancel()
+        wakeLockJob = null
+        val lock = wakeLock ?: return
+        wakeLock = null
+        runCatching { if (lock.isHeld) lock.release() }
+    }
+
     private fun teardown() {
         running = false
         supervision?.cancel()
         supervision = null
+        releaseWakeLock()
         healthLoop.stop()
         // Explicit, and with REMOVE. The platform drops a foreground notification when the
         // service is destroyed, but `teardown` also runs on the ACTION_STOP path *before*
@@ -374,6 +461,13 @@ public class TrackingService : LifecycleService() {
 
         internal const val TAG = "TrackingService"
         internal const val NOTIFICATION_ID = 8_301
+
+        /**
+         * Namespaced with the SDK's package, because a wake-lock tag is what `dumpsys
+         * power` and Play Console's excessive-wakelock report attribute the hold to. A
+         * generic tag makes a battery complaint impossible to trace to whoever caused it.
+         */
+        internal const val WAKE_LOCK_TAG = "fieldtrack:tracking"
         /**
          * Used only when the host named an icon that does not resolve, or named none.
          * The title, text, channel and icon a host DID configure live in [ServiceConfig]

@@ -7,8 +7,6 @@ import com.field360.tracker.TrackingMode
 import com.field360.tracker.capture.CaptureGate
 import com.field360.tracker.capture.FixIngestor
 import com.field360.tracker.capture.LocationStreamController
-import com.field360.tracker.capture.OneShotProvider
-import com.field360.tracker.capture.TurnSource
 import com.field360.tracker.data.location.LocationSource
 import com.field360.tracker.data.repository.ConfigStore
 import com.field360.tracker.domain.model.ErrorCode
@@ -36,10 +34,7 @@ import com.field360.tracker.work.BackstopWorker
 import com.field360.tracker.work.RestoreWorker
 import com.field360.tracker.work.SyncScheduler
 import com.field360.tracker.work.Watchdog
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.launch
 
 /**
  * Opens a session and starts the capture pipeline.
@@ -63,24 +58,19 @@ import kotlinx.coroutines.launch
  */
 public class StartTrackingUseCase internal constructor(
     private val sessions: SessionRepository,
-    private val ingestor: FixIngestor,
     private val locationSource: LocationSource,
-    private val streamController: LocationStreamController,
     private val captureGate: CaptureGate,
     private val teardown: SessionTeardown,
     private val providerStateMonitor: ProviderStateMonitor,
-    private val motionController: MotionController,
-    private val oneShotProvider: OneShotProvider,
     private val configStore: ConfigStore,
     private val permissions: PermissionManager,
-    private val stepCorroborator: StepCorroborator,
-    private val activityRecognizer: ActivityRecognizer,
-    private val watchdog: Watchdog,
-    private val syncScheduler: SyncScheduler,
     private val context: Context,
     private val events: MutableSharedFlow<TrackerEvent>,
-    private val scope: CoroutineScope,
-    private val gyroTurnMonitor: GyroTurnMonitor,
+    /**
+     * Everything that has to come up for a session to record, shared with
+     * [ResumeCaptureUseCase] — see [CaptureLauncher] for why that sharing is the point.
+     */
+    private val launcher: CaptureLauncher,
     /**
      * Applies the parts of the config that are wired rather than passed: the provider
      * selection [LocationSource] routes on, and the engine constants the accuracy meter
@@ -182,118 +172,22 @@ public class StartTrackingUseCase internal constructor(
         }
 
         val session = sessions.open(tag, configStore.encode(config))
-        ingestor.mockPolicy = config.geolocation.mockLocationPolicy
-        ingestor.persistRawFixes = config.persistence.persistRawFixes
-        ingestor.rawRingCapacity = config.persistence.rawRingCapacity
-        ingestor.persistRawPoints = config.persistence.persistRawPoints
-        ingestor.rawPointCapacity = config.persistence.rawPointRingCapacity
-        ingestor.bearingChangeCaptureDeg = config.motion.bearingChangeCaptureDeg
-        ingestor.cornerAnchorCapture = config.motion.cornerAnchorCapture
 
-        // Session-scoped sensor registration. Started here, torn down in stop() — a
-        // pedometer left registered after a session is battery drain with nothing to
-        // show for it, and that is the failure users blame the SDK for (EC-138).
-        if (config.sensors.useStepCorroboration) {
-            stepCorroborator.start(config.sensors)
-            ingestor.stepsSinceLastPoint = stepCorroborator::consumeSteps
-        }
-
-        // Motion transitions drive cadence and the wake paths, but never gate capture.
-        // The upload nudge rides along here because this is the one place that knows a
-        // point was both accepted and stored — which is exactly what `autoSync` means.
-        // Throttled inside the scheduler, and a no-op when no host registered a trigger.
-        ingestor.onAcceptedPoint = { point ->
-            motionController.onAcceptedPoint(point)
-            syncScheduler.onAcceptedPoint()
-        }
-        // The third cadence tier: raw fixes feed turn detection, turn detection feeds the
-        // sampling rate. A callback rather than an injected dependency because the stream
-        // controller already depends on the ingestor (EC-45).
-        ingestor.onTurnBurst = { streamController.setTurning(TurnSource.GNSS_BEARING, it) }
-        wireObservedSpeed(gyroArmed = armGyroTurnPrediction(config))
-        ingestor.start(session, scope)
-        watchdog.reset()
-        oneShotProvider.resetFailures()
-
-        motionController.start(config)
-        streamController.start(config, vehicular = false)
-
-        // Armed **after** the stream, so its first evaluation judges a stream that exists.
-        // A session opened with location switched off is therefore suspended immediately
-        // and resumes on its own when the switch comes back, rather than holding a
-        // registration against a dead provider for the rest of the drive (EC-06, EC-07).
+        // The whole pipeline, in one call, shared with the resume path. Arming the gate is
+        // the last thing it does, which is why `isCapturing` is readable immediately after
+        // this returns: a session opened while location was switched off is already
+        // reported as suspended rather than claiming a capture that is not running.
         //
         // Deliberately not a start() gate: refusing to open a session because the GPS is
         // off would strand a host that starts tracking from a background trigger — the
         // session is the record, and the record should exist with a documented gap in it
         // rather than not exist at all.
-        captureGate.arm(config)
-
-        // Enrichment only: a label on the point and one extra fix at a motion change.
-        // Denial degrades to speed + displacement rather than failing start() (EC-09).
-        if (config.motion.activityRecognition) activityRecognizer.register()
-
-        // The 15-minute safety net feeds the SAME ingestor, so it can never disagree
-        // with the stream about where the user was last seen (SOURCE-AUDIT A3).
-        BackstopWorker.enqueue(context, config.service.backstopIntervalMin)
+        launcher.launch(session, config)
 
         TrackingService.start(context, config.service)
 
         events.tryEmit(TrackerEvent.EnabledChange(enabled = true))
         return TrackerResult.Ok(session)
-    }
-
-    /**
-     * Wires the predictive half of turn-burst sampling, when the device and the config
-     * both allow it (EC-45d).
-     *
-     * Three conditions, and the order they are checked in says what each means.
-     * `turnBurst` off means the host does not want the fast tier at all, so a predictor
-     * for it is moot. `useGyroTurnPrediction` off means the host wants the tier but only
-     * from GNSS — the conservative setting, and the one to reach for if a fleet's battery
-     * budget is tight. A missing gyroscope or gravity source means the device cannot do
-     * it, and that is not an error: `TurnDetector` alone is the behaviour every release
-     * before this one shipped.
-     *
-     * Nothing here registers a sensor. [GyroTurnMonitor] opens the gyroscope on the first
-     * fix reporting vehicular speed and closes it a minute after the last, so a session
-     * spent walking or parked never touches it.
-     *
-     * @return whether the monitor was armed, so [wireObservedSpeed] knows whether the
-     *   speed feed has a second consumer. It must not simply call `onSpeed` regardless:
-     *   that method opens the gyroscope, and calling it on a host that turned gyro
-     *   prediction off would register the sensor it declined.
-     */
-    private fun armGyroTurnPrediction(config: TrackerConfig): Boolean {
-        if (!config.geolocation.turnBurst) return false
-        if (!config.sensors.useGyroTurnPrediction) return false
-        if (!gyroTurnMonitor.isAvailable) return false
-
-        gyroTurnMonitor.onTurning = { turning ->
-            streamController.setTurning(TurnSource.GYROSCOPE, turning)
-            // The same signal, for a different decision: the stream uses it to sample
-            // faster, the corner window uses it as direct evidence that a turn spans the
-            // fix it is holding (EC-45d, EC-45e).
-            ingestor.gyroTurning = turning
-        }
-        gyroTurnMonitor.start()
-        return true
-    }
-
-    /**
-     * Fans every fix's speed out to the two things that need it.
-     *
-     * Wired unconditionally, which is the change: this used to be set inside
-     * [armGyroTurnPrediction] and therefore existed only when a gyroscope was armed. The
-     * cadence tier needs the same signal on every device — a host with `turnBurst` off, or
-     * a phone with no gyroscope, still has a vehicular tier to raise — and without this it
-     * would have had none, leaving the tier permanently off instead of permanently on.
-     */
-    private fun wireObservedSpeed(gyroArmed: Boolean) {
-        ingestor.onObservedSpeed = { speedMps ->
-            streamController.onObservedSpeed(speedMps)
-            if (gyroArmed) gyroTurnMonitor.onSpeed(speedMps)
-        }
     }
 }
 

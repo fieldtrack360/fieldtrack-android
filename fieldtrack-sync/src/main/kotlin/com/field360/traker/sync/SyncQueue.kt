@@ -89,7 +89,10 @@ public class SyncQueue internal constructor(
                         url = config.url,
                         method = config.method,
                         headers = config.headers,
-                        jsonBody = encodeBody(batch.map(::toSyncPoint), config.extraParams),
+                        jsonBody = encodeBody(
+                            points = batch.map { toSyncPoint(it, config.includePointSessionId) },
+                            extraParams = config.extraParams,
+                        ),
                         gzip = config.gzipRequestBody,
                         timeouts = config.timeouts,
                     ),
@@ -169,7 +172,11 @@ public class SyncQueue internal constructor(
         store.clearQueue()
     }
 
-    private fun toSyncPoint(point: TrackPoint) = SyncPoint(
+    /**
+     * @param includeSessionId stamp the row with the session that recorded it. Off gives a
+     *   byte-identical body to every previous release — see [SyncConfig.includePointSessionId].
+     */
+    private fun toSyncPoint(point: TrackPoint, includeSessionId: Boolean) = SyncPoint(
         uuid = point.uuid,
         time = point.timeMs,
         local_date = point.localDate,
@@ -193,6 +200,9 @@ public class SyncQueue internal constructor(
         integrity_signals = IntegritySignal.entries
             .filter { point.integrityFlags and it.mask != 0 }
             .map { it.name },
+        // From the row, never from the config: a backlog drained after a process death can
+        // hold rows from more than one session, and the envelope cannot describe them all.
+        session_id = point.sessionId.takeIf { includeSessionId },
     )
 
     /**

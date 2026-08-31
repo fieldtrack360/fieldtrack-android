@@ -275,17 +275,32 @@ session**. So a per-batch field is only truthful if it is genuinely true of ever
 |---|---|---|
 | `user_id`, `device_id`, an auth token | ✅ | Constant for the install. Every row in every batch shares it. |
 | `app_version`, `platform` | ⚠️ | True of the *uploader*, not necessarily of the row — an old queued row may predate an upgrade. |
-| `session_id` | ❌ for a backlog | A device that recorded three sessions offline uploads all three under whichever session was current at the last `configure()`. |
+| `session_id` | ❌ for a backlog | A device that recorded three sessions offline uploads all three under whichever session was current at the last `configure()`. Use `includePointSessionId` below instead of, or as well as, the envelope field. |
 
-`SyncPoint` carries no session id of its own, so nothing downstream can correct a
-mislabelled envelope. A top-level `session_id` is right when the queue drains before each
-session ends — which for a mostly-online device it effectively does — and wrong for exactly
-the offline backlog this SDK exists to survive.
+A top-level `session_id` is right when the queue drains before each session ends — which
+for a mostly-online device it effectively does — and wrong for exactly the offline backlog
+this SDK exists to survive. There is a second failure with the same cause: `configure()`
+usually runs from a host's UI, and the process that drains a backlog after an OEM killed
+the app has no UI in it. The envelope field is then whatever the host's `Application` set,
+which is typically nothing.
 
-If per-row session attribution matters, do not solve it here. Either drain and confirm
-before closing a session, or carry the id on each point: `TrackPoint.sessionId` is already
-stored on every row, and a custom `SyncTransport` can rewrite the body to hoist it per
-point without changing the SDK.
+#### Per-row session id
+
+```kotlin
+SyncConfig.builder()
+    .url(endpoint)
+    .includePointSessionId(true)   // adds "session_id" to every row
+    .build()
+```
+
+Read from `TrackPoint.sessionId` at encode time, so it cannot be stale and cannot be
+mislabelled by a batch that spans two drives. Serialized as `session_id` on each element of
+`location`, omitted entirely when the flag is off.
+
+**Off by default for wire compatibility, not because it is optional.** With it off the body
+is byte-identical to earlier releases; on an offline-first host, turn it on. The envelope
+field and the row field can coexist — the sample sends both, a human-readable session start
+time in the envelope and the SDK's own id per row.
 
 One point:
 

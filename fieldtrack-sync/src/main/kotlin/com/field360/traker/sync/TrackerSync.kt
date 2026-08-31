@@ -61,6 +61,22 @@ public data class SyncConfig(
     val allowCleartext: Boolean = false,
     val timeouts: SyncTimeouts = SyncTimeouts(),
     val extraParams: Map<String, Any> = emptyMap(),
+    /**
+     * Stamp every uploaded row with the id of the session that recorded it — see
+     * [SyncPoint.session_id].
+     *
+     * **Off by default, and the default is not the safe-looking choice — it is the
+     * compatible one.** With it off the request body is byte-identical to what every
+     * previous release sent, so turning this on is a decision a backend has to be ready
+     * for, not a surprise in a patch release.
+     *
+     * **Turn it on if a batch can ever span two sessions**, which on an offline-first
+     * recorder means: turn it on. A queue that could not drain — no network, or a process
+     * the OEM killed — is still there when the next drive starts, and the envelope's own
+     * `session_id` (if the host sets one in [extraParams]) then describes only whichever
+     * session was current at the last `configure()`.
+     */
+    val includePointSessionId: Boolean = false,
 ) {
 
     /**
@@ -218,6 +234,7 @@ public data class SyncConfig(
         private var allowCleartext: Boolean = false
         private var timeouts: SyncTimeouts = SyncTimeouts()
         private val extraParams = LinkedHashMap<String, Any>()
+        private var includePointSessionId: Boolean = false
 
         /** The whole endpoint. Overrides [baseUrl] and [path] when both are set. */
         public fun url(url: String): Builder = apply { this.url = url }
@@ -269,6 +286,13 @@ public data class SyncConfig(
             apply { extraParams.putAll(params) }
 
         /**
+         * Stamp each uploaded row with its own session id — see
+         * [SyncConfig.includePointSessionId]. Set this on any host that records offline.
+         */
+        public fun includePointSessionId(include: Boolean): Builder =
+            apply { includePointSessionId = include }
+
+        /**
          * @throws IllegalArgumentException if [SyncConfig.validate] reports anything.
          *
          * A **path with no base URL is allowed here**, and only here: it means the base is
@@ -300,6 +324,7 @@ public data class SyncConfig(
             allowCleartext = allowCleartext,
             timeouts = timeouts,
             extraParams = extraParams.toMap(),
+            includePointSessionId = includePointSessionId,
         )
 
         private fun join(base: String?, path: String?): String {
