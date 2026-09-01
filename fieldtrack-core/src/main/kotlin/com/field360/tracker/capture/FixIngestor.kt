@@ -11,6 +11,7 @@ import com.field360.traker.geo.model.Deferred
 import com.field360.traker.geo.model.FilterState
 import com.field360.traker.geo.model.IngestContext
 import com.field360.traker.geo.model.MockPolicy
+import com.field360.traker.geo.model.MotionState
 import com.field360.traker.geo.model.PipelineResult
 import com.field360.traker.geo.model.ProviderSnapshot
 import com.field360.traker.geo.model.Reasons
@@ -133,6 +134,32 @@ internal class FixIngestor(
     var persistRawPoints: Boolean = false
     var rawPointCapacity: Int = 20_000
     var stepsSinceLastPoint: (() -> Int?)? = null
+
+    /**
+     * `MotionConfig.suppressWhileStationary`, wired to `StillnessMonitor.isStill` — or
+     * `null` when the host left the stage off or the device has no accelerometer, which is
+     * also what "the sensors have no opinion" means to the pipeline (EC-142).
+     *
+     * A lambda, like [stepsSinceLastPoint], and for the same reason: this class reads a
+     * field the motion layer maintains, and must not be able to reach into that layer or
+     * start anything there from the ingest path.
+     */
+    var stillnessVeto: (() -> Boolean)? = null
+
+    /**
+     * The motion layer's current state, for the decision log only.
+     *
+     * Pushed rather than pulled, and a plain field rather than a callback, because the one
+     * thing it must not become is a dependency on `MotionController` — capture is never
+     * gated on motion detection (EC-53). `FilterState.motionState` had no writer before
+     * this, so every decision row in the database recorded the `STOPPED` default whatever
+     * the device was doing.
+     *
+     * `@Volatile` for the same reason [gyroTurning] is: written from the motion layer's
+     * consumer coroutine, read on the ingest one, and a stale read costs one row's label.
+     */
+    @Volatile
+    var motionState: MotionState = MotionState.STOPPED
 
     /** `MotionConfig.bearingChangeCaptureDeg`; `0` disables turn capture (EC-45). */
     var bearingChangeCaptureDeg: Int = IngestContext.DEFAULT_BEARING_CHANGE_CAPTURE_DEG
@@ -473,6 +500,12 @@ internal class FixIngestor(
             mockPolicy = mockPolicy,
             odometerMeters = past?.odometerMeters ?: odometerBaseMeters,
             stepsSinceLastPoint = stepsSinceLastPoint?.invoke(),
+            // Read once per fix, like the steps above, and for the same interval: both
+            // witnesses answer "since the last stored point", so the pipeline can hold them
+            // against each other (EC-142). Null when the stage is off — the pipeline's
+            // default, and byte-identical to every fixture recorded before it existed.
+            stillnessVeto = stillnessVeto?.invoke() ?: false,
+            motionState = motionState,
             bearingChangeCaptureDeg = bearingChangeCaptureDeg,
             cornerAnchorCapture = cornerAnchorCapture,
             cadenceTierMs = cadenceTierMs,

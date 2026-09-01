@@ -18,6 +18,7 @@ import com.field360.tracker.domain.model.TrackSession
 import com.field360.tracker.domain.repository.ConfigRepository
 import com.field360.tracker.domain.repository.SessionRepository
 import com.field360.traker.geo.model.MockPolicy
+import com.field360.traker.geo.model.MotionState
 import com.field360.tracker.integrity.IntegrityPolicy
 import com.field360.tracker.motion.DeviceSensors
 import com.field360.tracker.motion.MotionQuality
@@ -27,6 +28,7 @@ import com.field360.tracker.motion.GyroTurnMonitor
 import com.field360.tracker.motion.MotionController
 import com.field360.tracker.motion.SignificantMotionWake
 import com.field360.tracker.motion.StepCorroborator
+import com.field360.tracker.motion.StillnessMonitor
 import com.field360.tracker.permission.PermissionManager
 import com.field360.tracker.permission.ProviderStateMonitor
 import com.field360.tracker.service.TrackingService
@@ -211,6 +213,7 @@ internal class SessionTeardown(
     private val captureGate: CaptureGate,
     private val motionController: MotionController,
     private val stepCorroborator: StepCorroborator,
+    private val stillnessMonitor: StillnessMonitor,
     private val activityRecognizer: ActivityRecognizer,
     private val significantMotion: SignificantMotionWake,
     private val gyroTurnMonitor: GyroTurnMonitor,
@@ -247,6 +250,14 @@ internal class SessionTeardown(
         // Sensors and system-registered wakes come down in the SAME teardown as the
         // location stream. Anything left armed here is silent battery drain (EC-138).
         stepCorroborator.stop()
+        // Unconditional, like the gyroscope below: a config that left the stage off *this*
+        // session says nothing about whether the previous one left an accelerometer
+        // registered. The veto is cleared too, so a session started later with the stage
+        // off cannot inherit a lambda reading a stopped monitor (EC-142).
+        stillnessMonitor.stop()
+        ingestor.stillnessVeto = null
+        motionController.onMotionChange = null
+        ingestor.motionState = MotionState.STOPPED
         // Unconditional, unlike the arming side: a config that disabled prediction *this*
         // session says nothing about whether the previous one left a gyroscope open.
         gyroTurnMonitor.stop()
@@ -400,6 +411,23 @@ public class ResolveConfigUseCase internal constructor(
             else -> resolved
         }
 
+        // A stage the host asked for that this device cannot serve. Turned off here rather
+        // than left to fail open in `StillnessMonitor`, so `Tracker.config` reports what is
+        // actually running — a flag reading `true` while nothing implements it is the
+        // defect this whole feature was written next to (EC-142).
+        val gated = if (effective.motion.suppressWhileStationary && !sensors.accelerometer) {
+            events.tryEmit(
+                TrackerEvent.Diagnostic(
+                    "motion.suppressWhileStationary requires an accelerometer and this device " +
+                        "reports none; the stage is off and stationary points will be filtered " +
+                        "by the acceptance pipeline alone",
+                ),
+            )
+            effective.copy(motion = effective.motion.copy(suppressWhileStationary = false))
+        } else {
+            effective
+        }
+
         // Two settings that must not be able to contradict each other: `security.mockLocation
         // = BLOCK` means the SDK refuses to run on a device with mock locations, so it cannot
         // also be storing mock fixes because `mockLocationPolicy` was left at FLAG. The
@@ -415,14 +443,14 @@ public class ResolveConfigUseCase internal constructor(
         // claiming `debuggable` is the case already covered in `IntegrityProbe`'s KDoc.
         val waiveMock = isDebuggable()
         val guarded = if (!waiveMock &&
-            effective.security.mockLocation == IntegrityPolicy.BLOCK &&
-            effective.geolocation.mockLocationPolicy != MockPolicy.REJECT
+            gated.security.mockLocation == IntegrityPolicy.BLOCK &&
+            gated.geolocation.mockLocationPolicy != MockPolicy.REJECT
         ) {
-            effective.copy(
-                geolocation = effective.geolocation.copy(mockLocationPolicy = MockPolicy.REJECT),
+            gated.copy(
+                geolocation = gated.geolocation.copy(mockLocationPolicy = MockPolicy.REJECT),
             )
         } else {
-            effective
+            gated
         }
 
         repository.save(guarded)

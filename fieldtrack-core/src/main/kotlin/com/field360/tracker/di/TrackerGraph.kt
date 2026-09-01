@@ -86,6 +86,7 @@ import com.field360.tracker.motion.SensorProbe
 import com.field360.tracker.motion.SignificantMotionWake
 import com.field360.tracker.motion.StationaryFence
 import com.field360.tracker.motion.StepCorroborator
+import com.field360.tracker.motion.StillnessMonitor
 import com.field360.tracker.motion.YawRateSource
 import com.field360.tracker.permission.PermissionManager
 import com.field360.tracker.permission.ProviderStateMonitor
@@ -262,6 +263,7 @@ internal class TrackerGraph private constructor(
     val stationaryFence: StationaryFence by lazy { StationaryFence(context, events, logger) }
     val geofenceRegistrar: GeofenceRegistrar by lazy { stationaryFence }
     val stepCorroborator: StepCorroborator by lazy { StepCorroborator(context) }
+    val stillnessMonitor: StillnessMonitor by lazy { StillnessMonitor(context, clock) }
     val yawRateSource: YawRateSource by lazy { GyroscopeYawSource(context) }
     val gyroTurnMonitor: GyroTurnMonitor by lazy {
         GyroTurnMonitor(yawRateSource, clock, logger, constants)
@@ -439,6 +441,7 @@ internal class TrackerGraph private constructor(
             captureGate = captureGate,
             motionController = motionController,
             stepCorroborator = stepCorroborator,
+            stillnessMonitor = stillnessMonitor,
             activityRecognizer = activityRecognizer,
             significantMotion = significantMotion,
             gyroTurnMonitor = gyroTurnMonitor,
@@ -458,6 +461,7 @@ internal class TrackerGraph private constructor(
             captureGate = captureGate,
             motionController = motionController,
             stepCorroborator = stepCorroborator,
+            stillnessMonitor = stillnessMonitor,
             activityRecognizer = activityRecognizer,
             gyroTurnMonitor = gyroTurnMonitor,
             oneShotProvider = oneShotProvider,

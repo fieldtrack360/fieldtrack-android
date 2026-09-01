@@ -606,7 +606,9 @@ feed.
 ```kotlin
 .activityRecognition(true)
 .activityConfidenceMin(75)
-.stopOnStationary(false)          // call stop() automatically on the stop timeout
+.stopOnStationary(false)          // declared but unimplemented — nothing reads it
+.suppressWhileStationary(false)   // drop drift points the accelerometer says never moved
+.stillnessEscapeMin(30)
 .stopTimeoutMin(5)
 .stationaryRadiusM(150f)
 .stationaryGeofenceId("fieldtrack-stationary")
@@ -627,6 +629,47 @@ least 5× the sampling interval or it fires every fix and defeats stationary sup
 entirely; `validate()` checks it (EC-121).
 
 Distinct from `TrackerEvent.Heartbeat`, which is the control-plane liveness signal.
+
+#### Stopping points arriving from a device that is not moving
+
+`suppressWhileStationary` is the answer to the oldest complaint in location tracking: the
+phone is on a desk, nothing is moving, and points keep arriving.
+
+Every other stationary defence in the SDK reasons about *position*, because a GNSS fix
+carries nothing else — wobble guards, the R-penalty, the net-displacement departure
+ladder. That makes them statistical, and a statistical gate needs an escape hatch wide
+enough for a real journey, which is exactly the hatch indoor multipath finds: served by
+fused location, a still phone hops between Wi-Fi and cell centroids, and each hop is a
+plausible-looking displacement with a respectable accuracy circle.
+
+Switching this on adds a witness of a different kind. The accelerometer measures the
+device rather than its estimate of itself, and nothing about a centroid hop can move it.
+
+**It is a veto, never a trigger, and never a single witness.** Four conditions must agree
+before one point is withheld:
+
+| Condition | Why |
+|---|---|
+| The host asked for it | Off by default |
+| The pipeline already read the fix as stationary | Displacement that measured as travel outranks any sensor window |
+| The GNSS chip reports no speed | Doppler is a hardware measurement multipath cannot fabricate; a chip reporting motion wins |
+| The pedometer counted no steps, or is absent | One step withdraws the veto |
+
+And it expires. After `stillnessEscapeMin` (30 minutes by default) the claim lapses for one
+fix, which is judged exactly as it was before the stage existed. That bound is not about
+accuracy — it is so an accelerometer that stops delivering, or a threshold wrong for some
+OEM's part, costs a slow trickle of drift points rather than a silent shift.
+
+Those limits are the reason it is safe to ship. A motion API reporting `STILL` through a
+17-minute drive is a documented failure on this SDK's own target hardware (EC-53), and
+every one of the bounds above exists so that a wrong sensor costs a suppressed drift point
+and never a trip.
+
+Requires an accelerometer. On a device without one the flag is turned off at `ready()` and
+a `Diagnostic` says so — see `motionQuality` in §6.
+
+Rejections show in the decision log as `Reasons.STILLNESS_VETO`, so a host that thinks a
+real point went missing can see exactly which fixes were withheld and why.
 
 ### 5.9 Sensors
 

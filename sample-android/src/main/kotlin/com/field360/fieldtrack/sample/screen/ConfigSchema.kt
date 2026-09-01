@@ -398,15 +398,27 @@ fun configGroups(): List<ConfigGroup> = listOf(
             ),
             bool(
                 "disableStopDetection",
-                "",
+                "declared but unimplemented — nothing in the SDK reads it",
                 { it.motion.disableStopDetection },
                 { c, v -> c.copy(motion = c.motion.copy(disableStopDetection = v)) },
             ),
             bool(
                 "stopOnStationary",
-                "on = the SDK ends the session itself once stationary",
+                "declared but unimplemented — see suppressWhileStationary",
                 { it.motion.stopOnStationary },
                 { c, v -> c.copy(motion = c.motion.copy(stopOnStationary = v)) },
+            ),
+            bool(
+                "suppressWhileStationary",
+                "on = drop drift points the accelerometer says never moved",
+                { it.motion.suppressWhileStationary },
+                { c, v -> c.copy(motion = c.motion.copy(suppressWhileStationary = v)) },
+            ),
+            intField(
+                "stillnessEscapeMin",
+                "how long suppression may last before one fix is let through",
+                { it.motion.stillnessEscapeMin },
+                { c, v -> c.copy(motion = c.motion.copy(stillnessEscapeMin = v)) },
             ),
             intField(
                 "stopTimeoutMin",

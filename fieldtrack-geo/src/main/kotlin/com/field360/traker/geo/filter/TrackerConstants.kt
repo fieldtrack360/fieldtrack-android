@@ -98,6 +98,14 @@ public data class TrackerConstants(
      * net displacement could never accumulate past one fix's worth.
      */
     val persistAdvanceM: Double = 5.0,
+    /**
+     * Net displacement that confirms a departure on a single fix, metres.
+     *
+     * Conditional since EC-142 on the GNSS chip reporting *some* motion. Where it reports
+     * none, displacement is the only evidence in play and its size says nothing — drift is
+     * always able to be a long way from the anchor — so the departure has to be earned on
+     * the [persistDepartCount] ladder instead, which measures persistence rather than size.
+     */
     val persistConfirmNet: Double = 100.0,
     val persistDepartCount: Int = 2,
     val persistMinNet: Double = 40.0,

@@ -205,9 +205,16 @@ class SampleApplication : Application() {
             .activityConfidenceMin(75)
             .snapshotConfidenceMin(50)
             .disableStopDetection(false)
-            // false: a stationary stretch suppresses capture but never ends the session.
-            // true hands that decision to the SDK, and the host stops being told why.
+            // Declared but unimplemented — nothing in the SDK reads either of these. The
+            // behaviour hosts reach for them expecting is `suppressWhileStationary` below.
             .stopOnStationary(false)
+            // The accelerometer veto on stationary drift (EC-142). On here because this is
+            // the diagnostic app and the desk case is exactly what it is for; the SDK
+            // default is off, so a host has to ask for it. It can only ever *drop* a point
+            // the pipeline already read as stationary, and it expires after
+            // `stillnessEscapeMin` so a wedged sensor cannot silence a session.
+            .suppressWhileStationary(true)
+            .stillnessEscapeMin(30)
             .stopTimeoutMin(5)
             .stationaryRadiusM(150f)
             .stationaryGeofenceId(TrackerGeofence.DEFAULT_ID)
@@ -409,7 +416,7 @@ class SampleApplication : Application() {
                     // not guaranteed to belong to one session.
                     .extraParams(
                         buildMap {
-                            put("device_id", "${Build.BRAND} + ${Build.DEVICE}")
+                            put("device_id", "${Build.BRAND}")
                             // Omitted rather than sent null while no session is open:
                             // `null` is not a supported extraParams value, and a literal
                             // "none" would be a session id the server could index on.

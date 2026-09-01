@@ -55,9 +55,16 @@ public class AcceptancePipeline(
         state: FilterState,
         context: IngestContext,
     ): PipelineResult {
+        // The motion layer's verdict, stamped once so every decision row this call
+        // produces carries it. `FilterState.motionState` had no writer at all — it sat at
+        // its `STOPPED` default and was logged as that constant on a motorway and on a
+        // desk alike, which made the decision table's motion column worse than useless.
+        // It is a log field and stays one: nothing below reads it (EC-142).
+        val stamped = state.copy(motionState = context.motionState)
+
         // ── Stage 0 — structural validity (EC-23 … EC-28) ────────────────────
         Validation.check(fix, context.mockPolicy)?.let { reason ->
-            return reject(fix, state, reason, Eval.EMPTY)
+            return reject(fix, stamped, reason, Eval.EMPTY)
         }
 
         // ── Stage 1 — burst ──────────────────────────────────────────────────
@@ -74,11 +81,11 @@ public class AcceptancePipeline(
         if (state.lastFixElapsedNanos != 0L &&
             sinceLastFixNanos in 0 until c.burstMs * NANOS_PER_MILLI
         ) {
-            return reject(fix, state, Reasons.BURST, Eval.EMPTY)
+            return reject(fix, stamped, Reasons.BURST, Eval.EMPTY)
         }
 
         // ── Stage 1 (cont.) — cold start / resume ────────────────────────────
-        var s = state
+        var s = stamped
         if (!s.isInitialised || past == null) {
             if (past == null) {
                 // Genuinely nothing to compare against. Accept unconditionally —
@@ -199,11 +206,25 @@ public class AcceptancePipeline(
         // already wants this fix, its reason is the more informative one to log. It only
         // decides fixes the other branches would have dropped — the corner taken slowly
         // enough to read as neither vehicular nor a walk (EC-45).
+        // Whether non-GNSS hardware is entitled to overrule stage 6 on this fix. Computed
+        // once, because it governs both the branches below and the corner-anchor
+        // counterfactual — a fix the sensors say never happened is not a corner either.
+        val stillnessSuppresses = stillnessSuppresses(eval, context)
+
         val reason = heuristicReason(fix, past, s, eval, distanceMoved, dtSec, looksLikeNlp)
             ?: bearingChangeReason(fix, s, eval, heading, context)
             ?: return heuristicRejection(
                 fix, past, s, eval, context, qTrack, sigma, threshold, predictedDelta, distanceMoved, heading,
+                stillnessSuppresses = stillnessSuppresses,
             )
+
+        // ── Stage 6.5 — stillness veto (EC-142) ──────────────────────────────
+        if (stillnessSuppresses && reason in VETOABLE_REASONS) {
+            // Through the same departure-collapse check the heuristic gate's rejections
+            // take, so the two rejection paths cannot disagree about an unlatched tally.
+            val settled = collapseDeparture(fix, s)
+            return reject(fix, settled, Reasons.STILLNESS_VETO, eval, sigma, threshold)
+        }
 
         // ── Stage 7 — Q/R tuning, persistence, routing ───────────────────────
         return finalise(
@@ -258,14 +279,19 @@ public class AcceptancePipeline(
         predictedDelta: Double,
         distanceMoved: Double,
         heading: Float?,
+        stillnessSuppresses: Boolean,
     ): PipelineResult {
-        val rejected = reject(fix, state, Reasons.HEURISTIC_GATE, eval, sigma, threshold)
+        val settled = collapseDeparture(fix, state)
+        val rejected = reject(fix, settled, Reasons.HEURISTIC_GATE, eval, sigma, threshold)
         if (!context.cornerAnchorCapture) return rejected
+        // Offering the counterfactual would be offering a vertex on a corner the device
+        // never turned. The gate's own rejection stands, with its own reason (EC-142).
+        if (stillnessSuppresses) return rejected
 
         val kept = finalise(
             fix = fix,
             past = past,
-            state = state,
+            state = settled,
             eval = eval,
             context = context,
             reason = Reasons.CORNER_ANCHOR,
@@ -281,6 +307,36 @@ public class AcceptancePipeline(
         return rejected.copy(
             deferred = Deferred(decision = kept.decision, state = kept.state, point = point),
         )
+    }
+
+    /**
+     * Unwinds a departure tally that never became a departure (EC-142).
+     *
+     * Settle detection in [reject] does this for a departure that already *latched*;
+     * nothing did it for one still climbing the ladder, and the gap mattered because of
+     * where the ladder runs. Stage 7-A is reached only by a fix that measured as moving,
+     * so an excursion's outward leg is counted and the drift back to the anchor — which is
+     * unremarkable, and rejected here — is not seen at all. `departCount` and the net
+     * high-water mark therefore survived arbitrarily long stretches of stillness, and two
+     * centroid hops minutes apart satisfied a test written to require two *consecutive*
+     * advancing fixes. That is what stored points from a phone that never left a desk even
+     * after the single-fix confirmation was closed.
+     *
+     * Back inside [TrackerConstants.persistMinNet] of the origin is the unambiguous half
+     * of "wandered out and came back": the excursion ended where it began. Someone paused
+     * at a crossing mid-departure is still out at their high-water mark and keeps their
+     * tally — only a return to the anchor clears it.
+     *
+     * The origin itself is left where it is. This is a rejected fix; it is trustworthy
+     * enough to say the excursion collapsed, which is a fact about the *previous* fixes,
+     * and not trustworthy enough to become the new anchor.
+     */
+    private fun collapseDeparture(fix: TrackFix, state: FilterState): FilterState {
+        if (state.movingMode || state.departCount == 0) return state
+        val origin = state.origin ?: return state
+        val net = Haversine.metres(origin.latitude, origin.longitude, fix.latitude, fix.longitude)
+        if (net >= c.persistMinNet) return state
+        return state.copy(departCount = 0, prevNetMeters = 0f)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -606,6 +662,46 @@ public class AcceptancePipeline(
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Stage 6.5 — stillness veto (EC-142)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * @return true when non-GNSS hardware may overrule stage 6 and drop this fix.
+     *
+     * Every stationary defence above this one is statistical, because position is the only
+     * evidence they have: wobble guards, the R-penalty, the departure ladder. Each
+     * therefore has an escape hatch sized for a real journey, and indoor multipath is
+     * capable of finding them — which is how a phone on a desk keeps producing points.
+     * This is the one gate with evidence of a different kind, so it is the one allowed to
+     * close them.
+     *
+     * The four conditions are a conjunction, and each is here to stop this stage becoming
+     * the incumbent's worst failure — a motion API saying `STILL` through a 17-minute
+     * drive on exactly this SDK's target hardware (EC-53). No single witness can veto:
+     *
+     *  - **The host asked for it.** Off by default; `MotionConfig.suppressWhileStationary`.
+     *  - **The engine's own verdict agrees.** A fix that measured as moving or vehicular is
+     *    never offered to the sensors for a second opinion. Displacement that stage 2 read
+     *    as travel outranks any accelerometer window, always.
+     *  - **The GNSS chip agrees.** Doppler under [TrackerConstants.speedStationaryMax] is a
+     *    hardware measurement multipath cannot fabricate; a chip reporting speed is a chip
+     *    disagreeing, and it wins.
+     *  - **The pedometer agrees, or is absent.** Steps are physical evidence of a walk the
+     *    Doppler often misses indoors (EC-133). One counted step withdraws the veto.
+     *
+     * The producer supplies the fifth: `context.stillnessVeto` is required to be `false`
+     * whenever its own evidence is missing, stale or gapped, and to expire on a bound so a
+     * wedged sensor degrades to the old behaviour rather than silencing the track.
+     */
+    private fun stillnessSuppresses(eval: Eval, context: IngestContext): Boolean {
+        if (!context.stillnessVeto) return false
+        if (eval.isMoving || eval.isVehicular) return false
+        if (!eval.isHardwareStationary) return false
+        if ((context.stepsSinceLastPoint ?: 0) > 0) return false
+        return true
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Stage 6
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -882,7 +978,30 @@ public class AcceptancePipeline(
             if (net > c.persistMinNet && stillAdvancing) {
                 val departCount = s.departCount + 1
                 s = s.copy(departCount = departCount, prevNetMeters = net.toFloat())
-                if (net > c.persistConfirmNet || departCount >= c.persistDepartCount) {
+                // Size alone may confirm a departure outright, but only while the GNSS chip
+                // agrees the device is moving at all. When it reports zero, displacement is
+                // the only evidence in play and size is not a quality of it — a larger
+                // positioning error is simply a larger number, so "it is a long way from
+                // the anchor" is the one thing drift is guaranteed to be able to say.
+                //
+                // Nor can this be rescued with a speed bar. `dtSec` runs from the last
+                // *stored* point, so a run of rejected fixes stretches it, and a 160 m
+                // centroid hop across a 60 s stretch computes as 2.6 m/s — an unremarkable
+                // jog. Displacement over time genuinely cannot tell the two apart; what
+                // can is that a journey keeps going and a hop comes straight back, which is
+                // precisely what the count ladder below measures.
+                //
+                // Without this, one hop latched `movingMode`, `movingMode` switches this
+                // whole ladder off until settle detection unwinds it, and every hop after
+                // it stored as `Vehicular`. That is the "phone on my desk, still collecting
+                // points" report, and it is why the ladder looked like it did nothing.
+                //
+                // Nothing real is lost: a drive reports Doppler and never reaches this
+                // branch at all (EC-39d), a walk the chip *can* see still confirms on one
+                // fix, and a walk indoors that it cannot confirms one fix later on the
+                // count ladder (EC-142).
+                val confirmedBySize = net > c.persistConfirmNet && !eval.isHardwareStationary
+                if (confirmedBySize || departCount >= c.persistDepartCount) {
                     // Latched: a real departure. Fall through and publish.
                     s = s.copy(movingMode = true, settleCount = 0)
                 } else {
@@ -1136,5 +1255,25 @@ public class AcceptancePipeline(
         const val Q_MOVING_ACCURACY_SPLIT = 35f
         const val MOVEMENT_STATUS_HW_TRUST_MAX = 5f
         const val MOVEMENT_STATUS_STEADY_MAX = 0.5f
+
+        /**
+         * The stage-6 reasons a stillness veto may overrule — every one that can *store* a
+         * point out of the stationary branch (EC-142).
+         *
+         * [Reasons.HEARTBEAT] is deliberately absent, and its absence is load-bearing. It
+         * stores nothing anyway: stage 7-B warms the filter on it and returns
+         * [Reasons.HEARTBEAT_SKIPPED]. That warming is the SDK's only self-correcting path
+         * on a device whose wake paths have all failed — a heartbeat fix landing beyond the
+         * stationary radius is what re-declares MOVING within one interval instead of never
+         * (EC-57). Vetoing it would let a stuck accelerometer freeze the filter clock, and
+         * that is the failure mode this whole stage is supposed to be immune to.
+         */
+        val VETOABLE_REASONS: Set<String> = setOf(
+            Reasons.ARRIVAL,
+            Reasons.STATIONARY_RECOVERY,
+            Reasons.BLACKOUT_ARRIVAL,
+            Reasons.WALK_ARRIVAL,
+            Reasons.BEARING_CHANGE,
+        )
     }
 }

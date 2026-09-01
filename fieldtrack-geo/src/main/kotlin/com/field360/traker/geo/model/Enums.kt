@@ -98,6 +98,20 @@ public object Reasons {
     public const val DRIFT_SUPPRESSED: String = "Drift Suppressed"
     public const val HEARTBEAT_SKIPPED: String = "HeartBeat Skipped"
 
+    /**
+     * Dropped because non-GNSS hardware says the device did not move (EC-142).
+     *
+     * Distinct from [HEURISTIC_GATE], which says the fix was *unremarkable*. This one says
+     * the displacement was not travel at all, on evidence the GNSS receiver never saw —
+     * and it is the only rejection in this vocabulary sourced from outside the fix.
+     *
+     * Only ever reached from the stationary branch: a fix the pipeline's own speed or
+     * displacement measures call moving is never vetoed, whatever the sensors think. That
+     * is the whole EC-53 guarantee, and it is what stops this becoming the incumbent's
+     * "activity recognition said STILL, so the drive never happened".
+     */
+    public const val STILLNESS_VETO: String = "Stillness Veto"
+
     public const val HEURISTIC_GATE: String = "Heuristic Gate"
     public const val SESSION_CLOSED: String = "Session Closed"
     public const val MOCK_LOCATION: String = "Mock Location"

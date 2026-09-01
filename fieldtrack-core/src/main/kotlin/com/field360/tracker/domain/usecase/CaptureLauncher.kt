@@ -17,6 +17,7 @@ import com.field360.tracker.motion.ActivityRecognizer
 import com.field360.tracker.motion.GyroTurnMonitor
 import com.field360.tracker.motion.MotionController
 import com.field360.tracker.motion.StepCorroborator
+import com.field360.tracker.motion.StillnessMonitor
 import com.field360.tracker.permission.PermissionManager
 import com.field360.tracker.permission.ProviderStateMonitor
 import com.field360.tracker.sdkLog
@@ -64,6 +65,7 @@ internal class CaptureLauncher(
     private val captureGate: CaptureGate,
     private val motionController: MotionController,
     private val stepCorroborator: StepCorroborator,
+    private val stillnessMonitor: StillnessMonitor,
     private val activityRecognizer: ActivityRecognizer,
     private val gyroTurnMonitor: GyroTurnMonitor,
     private val oneShotProvider: OneShotProvider,
@@ -99,6 +101,17 @@ internal class CaptureLauncher(
             ingestor.stepsSinceLastPoint = stepCorroborator::consumeSteps
         }
 
+        // The fourth witness against stationary drift, and the only one that measures the
+        // device rather than its own estimate of where it is (EC-142). Off unless the host
+        // asked for it; `ResolveConfigUseCase` has already turned the flag off on a device
+        // with no accelerometer, so the availability check here is belt and braces rather
+        // than the decision.
+        val stillnessArmed = config.motion.suppressWhileStationary && stillnessMonitor.isAvailable
+        if (stillnessArmed) {
+            stillnessMonitor.start(config.motion.stillnessEscapeMin)
+            ingestor.stillnessVeto = stillnessMonitor::isStill
+        }
+
         // Motion transitions drive cadence and the wake paths, but never gate capture.
         // The upload nudge rides along here because this is the one place that knows a
         // point was both accepted and stored — which is exactly what `autoSync` means.
@@ -106,7 +119,14 @@ internal class CaptureLauncher(
         ingestor.onAcceptedPoint = { point ->
             motionController.onAcceptedPoint(point)
             syncScheduler.onAcceptedPoint()
+            // Restarts the stillness window on the same boundary the pedometer's tally
+            // restarts on, so both witnesses always describe the same interval.
+            if (stillnessArmed) stillnessMonitor.onPointStored()
         }
+
+        // A label on the decision log, not an input to it. See `FixIngestor.motionState`.
+        ingestor.motionState = motionController.motionState
+        motionController.onMotionChange = { ingestor.motionState = it }
         // The third cadence tier: raw fixes feed turn detection, turn detection feeds the
         // sampling rate. A callback rather than an injected dependency because the stream
         // controller already depends on the ingestor (EC-45).

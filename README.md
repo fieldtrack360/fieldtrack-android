@@ -415,8 +415,10 @@ Builder: `.trackingMode()`, `.provider()`, `.desiredAccuracy()`, `.accuracy()`,
 | `activityRecognitionIntervalMs` | `Long` | `10_000` | AR polling interval |
 | `activityConfidenceMin` | `Int` | `75` | Minimum confidence for a transition |
 | `snapshotConfidenceMin` | `Int` | `50` | Minimum confidence for a snapshot read |
-| `disableStopDetection` | `Boolean` | `false` | Never enter the stationary state |
-| `stopOnStationary` | `Boolean` | `false` | End the session automatically when stationary |
+| `disableStopDetection` | `Boolean` | `false` | **Declared but unimplemented** — nothing in the SDK reads it |
+| `stopOnStationary` | `Boolean` | `false` | **Declared but unimplemented** — nothing in the SDK reads it. Ending a session because the user parked is an application decision the SDK is not entitled to make, which is why it never shipped. For the thing hosts want here, see `suppressWhileStationary` |
+| `suppressWhileStationary` | `Boolean` | `false` | Drop points that only stationary drift explains, when the accelerometer agrees the device has not moved (EC-142). Every other stationary defence reasons about *position*, because a GNSS fix carries nothing else; this one measures whether the device physically moved. **A veto, never a trigger:** it can only remove a point already classified as stationary, is not consulted once displacement or Doppler read as moving, and one counted step withdraws it. Requires an accelerometer — turned off with a `Diagnostic` where there is none |
+| `stillnessEscapeMin` | `Int` | `30` | How long `suppressWhileStationary` may suppress before letting one fix through regardless. The valve: a wedged accelerometer degrades to the previous behaviour instead of silencing the session |
 | `stopTimeoutMin` | `Int` | `5` | Minutes of no movement before STATIONARY |
 | `stationaryRadiusM` | `Float` | `150f` | Radius of the internal stationary wake geofence. Must be > 0 |
 | `stationaryGeofenceId` | `String` | `"trackit-stationary"` | Id of that fence. Must not be blank |
@@ -429,7 +431,8 @@ Builder: `.trackingMode()`, `.provider()`, `.desiredAccuracy()`, `.accuracy()`,
 | `cornerAnchorCapture` | `Boolean` | `true` | Restore a rejected fix once the *next* fix shows a corner turned across it. Bearing-change capture compares against the last **stored** point, so at a corner's apex only half the turn is behind you and the apex is dropped; this holds the rejection for one fix and keeps it if the path bent across it (`Reasons.CORNER_ANCHOR`). Only the heuristic gate's rejections are reconsidered — never impossible speed, poor accuracy or the sigma gate. One fix of latency, and only for fixes that were being discarded |
 
 Builder: `.activityRecognition()`, `.activityRecognitionIntervalMs()`, `.activityConfidenceMin()`,
-`.snapshotConfidenceMin()`, `.disableStopDetection()`, `.stopOnStationary()`, `.stopTimeoutMin()`,
+`.snapshotConfidenceMin()`, `.disableStopDetection()`, `.stopOnStationary()`,
+`.suppressWhileStationary()`, `.stillnessEscapeMin()`, `.stopTimeoutMin()`,
 `.stationaryRadiusM()`, `.stationaryGeofenceId()`, `.stationaryGeofenceOnEnterEvent()`,
 `.stationaryGeofenceOnExitEvent()`, `.motionTriggerDelayMs()`, `.heartbeatIntervalSec()`,
 `.persistHeartbeat()`, `.bearingChangeCaptureDeg()`, `.cornerAnchorCapture()`.

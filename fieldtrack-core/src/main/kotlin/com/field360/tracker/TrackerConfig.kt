@@ -73,6 +73,13 @@ public data class TrackerConfig(
         if (motion.stationaryGeofenceOnExitEvent.isBlank()) {
             add("motion.stationaryGeofenceOnExitEvent must not be blank")
         }
+        // Only when the stage is on: the bound is a safety valve, and a host that never
+        // opens the valve has no reason to be refused start-up over its size. Zero or
+        // negative would mean "never expire", which is the one setting that turns a broken
+        // accelerometer into a silent session (EC-142).
+        if (motion.suppressWhileStationary && motion.stillnessEscapeMin <= 0) {
+            add("motion.stillnessEscapeMin must be > 0 when suppressWhileStationary is on — EC-142")
+        }
         // Only when it will actually be posted: a host that leaves the diagnostic off has
         // no reason to be refused start-up over a string nothing reads.
         if (service.showSyncStatusInNotification && service.syncNotificationText.isBlank()) {
@@ -338,6 +345,12 @@ public data class TrackerConfig(
 
         public fun stopOnStationary(value: Boolean): Builder =
             apply { motion = motion.copy(stopOnStationary = value) }
+
+        public fun suppressWhileStationary(value: Boolean): Builder =
+            apply { motion = motion.copy(suppressWhileStationary = value) }
+
+        public fun stillnessEscapeMin(value: Int): Builder =
+            apply { motion = motion.copy(stillnessEscapeMin = value) }
 
         public fun stopTimeoutMin(value: Int): Builder =
             apply { motion = motion.copy(stopTimeoutMin = value) }
@@ -607,8 +620,65 @@ public data class MotionConfig(
     val activityRecognitionIntervalMs: Long = 10_000,
     val activityConfidenceMin: Int = 75,
     val snapshotConfidenceMin: Int = 50,
+    /**
+     * **Declared, never read.** No component in the SDK consumes it; setting it changes
+     * nothing. Kept so stored config snapshots still deserialise.
+     *
+     * For suppressing points while parked, see [suppressWhileStationary], which is the
+     * behaviour hosts reach for this expecting.
+     */
     val disableStopDetection: Boolean = false,
+    /**
+     * **Declared, never read.** No component in the SDK consumes it; setting it changes
+     * nothing. Kept so stored config snapshots still deserialise.
+     *
+     * Its name says "end the session when the user stops", which is an application
+     * decision the SDK is not entitled to make on the host's behalf — that is why nothing
+     * ever implemented it. For the thing hosts actually want here, which is to stop
+     * *storing points* while parked without touching the session, see
+     * [suppressWhileStationary].
+     */
     val stopOnStationary: Boolean = false,
+    /**
+     * Drop points that only stationary drift explains, when non-GNSS hardware agrees the
+     * device has not moved (EC-142). Off by default.
+     *
+     * The problem it solves is the one every field report describes the same way: the
+     * phone is on a desk, nothing is moving, and points keep arriving. The pipeline's
+     * stationary defences are all statistical — they reason about position, because
+     * position is all a GNSS fix carries — so each has an escape hatch sized for a real
+     * journey, and indoor multipath is capable of finding them. `StillnessMonitor` adds
+     * evidence of a different kind: the accelerometer, which measures whether the device
+     * moved rather than inferring it from where it claims to be.
+     *
+     * **A veto, never a trigger, and never a single witness.** It can only remove a point
+     * the pipeline had already classified as stationary. It is not consulted once
+     * displacement or Doppler say the device is moving, one counted step withdraws it, and
+     * it expires after [stillnessEscapeMin] regardless. Those bounds are the whole reason
+     * it is safe to ship at all: a motion API reporting `STILL` through a 17-minute drive
+     * is a documented failure on this SDK's own target hardware (EC-53), and every one of
+     * them exists so that a wrong sensor costs a suppressed drift point rather than a trip.
+     *
+     * Requires an accelerometer. On a device without one the monitor never asserts
+     * stillness and this flag has no effect, which is also what `MotionQuality.POOR`
+     * means — see `SensorProbe`.
+     */
+    val suppressWhileStationary: Boolean = false,
+    /**
+     * How long [suppressWhileStationary] may keep suppressing before it lets one fix
+     * through regardless, minutes.
+     *
+     * The bound is not about accuracy, it is about failure: an accelerometer that stops
+     * delivering, or a threshold that is wrong for some OEM's sensor, would otherwise
+     * silence the track for the rest of the session with nothing to notice it. On expiry
+     * the veto drops for one fix, the pipeline's own gates judge it as they did before
+     * this stage existed, and the window starts again — so the worst case degrades to the
+     * previous behaviour at a slow cadence instead of to silence.
+     *
+     * Thirty minutes: long enough that a genuinely parked vehicle is not punctuated by
+     * drift points, short enough that a broken sensor shows up within one shift.
+     */
+    val stillnessEscapeMin: Int = 30,
     val stopTimeoutMin: Int = 5,
     val stationaryRadiusM: Float = 150f,
     val stationaryGeofenceId: String = TrackerGeofence.DEFAULT_ID,

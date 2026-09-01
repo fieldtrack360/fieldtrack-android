@@ -89,6 +89,44 @@ public data class IngestContext(
      * byte-identically.
      */
     val providerFlags: Int = ProviderSnapshot.NOT_RECORDED,
+    /**
+     * The motion layer's current verdict, for the decision log only.
+     *
+     * `FilterState.motionState` was never assigned by anything — it defaulted to
+     * [MotionState.STOPPED] and was stamped onto every `FixDecision` and every raw-point
+     * row as that constant, so the one column an investigation reaches for first said the
+     * same word on a motorway as on a desk. The state lives in `MotionController`, which
+     * the engine cannot see, so it arrives here like every other fact the engine cannot
+     * derive.
+     *
+     * **Read by no gate, and it must stay that way.** Motion detection may set the
+     * sampling rate and it may annotate a decision; it may never decide one. A device
+     * reporting `STILL` through a 17-minute drive is a documented failure on this SDK's
+     * own target hardware (EC-53), and a gate reading this field is how that becomes a
+     * lost trip. What *is* allowed to suppress a point is [stillnessVeto], which is a
+     * different claim on different evidence.
+     */
+    val motionState: MotionState = MotionState.STOPPED,
+    /**
+     * Non-GNSS hardware asserts the device has not moved since the last stored point
+     * (EC-142). `false` means "no such assertion", which is what every device without the
+     * sensors, and every host with the stage switched off, produces.
+     *
+     * Supplied by `StillnessMonitor` in `fieldtrack-core` and consumed in exactly one
+     * place: the stationary branch of the acceptance pipeline's stage 6. The engine's own
+     * stationary defences are all statistical — wobble guards, R-penalties, the departure
+     * ladder — because position is the only evidence they have, and each of them therefore
+     * has an escape hatch that indoor multipath can find. This is evidence of a different
+     * kind, and it is allowed to close those hatches.
+     *
+     * **It is a veto, never a trigger.** It can only ever suppress a point the pipeline
+     * had already classified as stationary; it cannot cause one to be stored, and it is
+     * not consulted at all once `isMoving` or `isVehicular` is true. The producer is
+     * required to keep it conservative in the same direction — absent or ambiguous
+     * evidence means `false` — and to bound how long it may stay `true`, so a wedged
+     * sensor degrades to the previous behaviour instead of silencing the track.
+     */
+    val stillnessVeto: Boolean = false,
 ) {
     public companion object {
         /**

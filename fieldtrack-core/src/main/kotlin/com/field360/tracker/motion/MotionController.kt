@@ -63,6 +63,18 @@ internal class MotionController(
 
     val motionState: MotionState get() = state.motion
 
+    /**
+     * Fired on every real transition, for consumers that want the state *labelled* onto
+     * their own output rather than pushed at them.
+     *
+     * The one consumer today is `FixIngestor.motionState`, which stamps it onto each
+     * `FixDecision` so the decision log stops recording the `STOPPED` default for every
+     * row ever written (EC-142). Deliberately a callback out of this class rather than a
+     * read into it: the direction of the dependency is what guarantees the ingest path can
+     * never come to depend on motion detection, which is the invariant EC-53 is about.
+     */
+    var onMotionChange: ((MotionState) -> Unit)? = null
+
     fun start(config: TrackerConfig) {
         this.config = config
         state = MotionStateMachine.State()
@@ -180,6 +192,7 @@ internal class MotionController(
 
         sdkLog { logger.d(TAG, "Motion -> $changedTo") }
         events.tryEmit(TrackerEvent.MotionChange(changedTo, lastPoint))
+        onMotionChange?.invoke(changedTo)
 
         when (changedTo) {
             MotionState.MOVING -> onEnterMoving(active)
