@@ -532,8 +532,8 @@ Builder: `.trackingMode()`, `.provider()`, `.desiredAccuracy()`, `.accuracy()`,
 | `activityRecognitionIntervalMs` | `Long` | `10_000` | AR polling interval |
 | `activityConfidenceMin` | `Int` | `75` | Minimum confidence for a transition |
 | `snapshotConfidenceMin` | `Int` | `50` | Minimum confidence for a snapshot read |
-| `disableStopDetection` | `Boolean` | `false` | Never enter the stationary state |
-| `stopOnStationary` | `Boolean` | `false` | End the session automatically when stationary |
+| `suppressWhileStationary` | `Boolean` | `false` | Drop points that only stationary drift explains, when the **accelerometer** agrees the device has not moved — see [§12.3](#123-points-from-a-device-that-is-not-moving). A veto, never a trigger: it can only remove a point the pipeline already read as stationary, is not consulted once displacement or Doppler read as moving, and one counted step withdraws it. Needs an accelerometer; turned off with a `Diagnostic` where there is none |
+| `stillnessEscapeMin` | `Int` | `30` | How long `suppressWhileStationary` may suppress before letting one fix through regardless. The safety valve — a wedged accelerometer degrades to the previous behaviour instead of silencing a shift |
 | `stopTimeoutMin` | `Int` | `5` | Minutes of no movement before STATIONARY |
 | `stationaryRadiusM` | `Float` | `150f` | Radius of the internal stationary wake geofence. Must be > 0 |
 | `stationaryGeofenceId` | `String` | `"trackit-stationary"` | Id of that fence. Must not be blank |
@@ -546,7 +546,8 @@ Builder: `.trackingMode()`, `.provider()`, `.desiredAccuracy()`, `.accuracy()`,
 | `cornerAnchorCapture` | `Boolean` | `true` | Restore a rejected fix once the *next* fix shows a corner turned across it. Bearing-change capture compares against the last **stored** point, so at a corner's apex only half the turn is behind you and the apex is dropped; this holds the rejection for one fix and keeps it if the path bent across it (`Reasons.CORNER_ANCHOR`). Only the heuristic gate's rejections are reconsidered — never impossible speed, poor accuracy or the sigma gate. One fix of latency, and only for fixes that were being discarded |
 
 Builder: `.activityRecognition()`, `.activityRecognitionIntervalMs()`, `.activityConfidenceMin()`,
-`.snapshotConfidenceMin()`, `.disableStopDetection()`, `.stopOnStationary()`, `.stopTimeoutMin()`,
+`.snapshotConfidenceMin()`, `.suppressWhileStationary()`, `.stillnessEscapeMin()`,
+`.stopTimeoutMin()`,
 `.stationaryRadiusM()`, `.stationaryGeofenceId()`, `.stationaryGeofenceOnEnterEvent()`,
 `.stationaryGeofenceOnExitEvent()`, `.motionTriggerDelayMs()`, `.heartbeatIntervalSec()`,
 `.persistHeartbeat()`, `.bearingChangeCaptureDeg()`, `.cornerAnchorCapture()`.
@@ -557,13 +558,11 @@ Builder: `.activityRecognition()`, `.activityRecognitionIntervalMs()`, `.activit
 |---|---|---|---|
 | `useSignificantMotion` | `Boolean` | `true` | Permission-free, ~zero-power hardware wake for STATIONARY → MOVING |
 | `useStepCorroboration` | `Boolean` | `true` | Step-count veto on stationary drift; confirms indoor walks |
-| `useAccelerometerVeto` | `Boolean` | `true` | Reject "movement" with no accelerometer support |
 | `useBarometer` | `Boolean` | `false` | Use pressure sensor when present |
 | `stepBatchLatencyMs` | `Long` | `60_000` | Step-counter batching latency |
 | `useGyroTurnPrediction` | `Boolean` | `true` | Arm the turn burst from gyroscope yaw rate, ahead of GNSS heading. Needs no permission. The gyroscope is opened only while fixes report vehicular speed and released within a minute of them stopping, so a walking or parked session never touches it. No-op when `geolocation.turnBurst` is off or the device has no gyroscope |
 
-Builder: `.useSignificantMotion()`, `.useStepCorroboration()`, `.useAccelerometerVeto()`,
-`.useGyroTurnPrediction()`,
+Builder: `.useSignificantMotion()`, `.useStepCorroboration()`, `.useGyroTurnPrediction()`,
 `.useBarometer()`, `.stepBatchLatencyMs()`.
 
 ### 5.5 `ServiceConfig`
@@ -699,6 +698,8 @@ Builder: `.maxDaysToPersist()`, `.maxRecords()`, `.persistRawFixes()`, `.rawRing
 - `distanceFilterM > 0`
 - `heartbeatIntervalSec < 5 × (intervalMs / 1000)`
 - `stationaryRadiusM <= 0`, blank `stationaryGeofenceId` / enter / exit event names
+- `stillnessEscapeMin <= 0` while `suppressWhileStationary` is on — checked only when the
+  stage is running, since the bound is a safety valve and zero would mean "never expire"
 - `baseUrl` that is not an absolute URL with a scheme and host
 - `turnBurstIntervalMs <= 0`, or greater than the tier it accelerates
 - `navigationIntervalMs <= 0`, `navigationIntervalMs < navigationFastestIntervalMs`, or
@@ -1419,6 +1420,60 @@ that re-runs `ready()` after granting `ACTIVITY_RECOGNITION` gets a re-evaluated
 which is the recovery path when the cause was a denied permission rather than absent
 hardware.
 
+### 12.3 Points from a device that is not moving
+
+The oldest complaint in location tracking: the phone is on a desk, nothing is moving, and
+points keep arriving.
+
+Every stationary defence in the acceptance pipeline reasons about **position**, because a
+GNSS fix carries nothing else — wobble guards, the measurement-noise penalty, the
+net-displacement departure ladder. That makes them statistical, and a statistical gate needs
+an escape hatch wide enough for a real journey. Indoor multipath is very good at finding
+those hatches: served by fused location, a still phone hops between Wi-Fi and cell centroids,
+and each hop is a plausible-looking displacement with a respectable accuracy circle.
+
+Two things address it, and they are independent.
+
+**The pipeline itself was tightened, and this needs no configuration.** A single fix could
+confirm a departure on net displacement alone, and confirming one latches `movingMode`, which
+switches the departure ladder off until the filter settles — so one 160 m centroid hop bought
+a licence for every hop after it. Size now only confirms a departure while the GNSS chip
+reports *some* motion; where it reports none, displacement is the only evidence in play and
+its size proves nothing, because drift is always able to be a long way from the anchor. A
+second fix closed the tally surviving the drift *back* to the anchor, which let two hops
+minutes apart satisfy a test written to require two consecutive advancing fixes.
+
+**`motion.suppressWhileStationary` adds a witness of a different kind**, and is off by
+default. The accelerometer measures the device rather than its own estimate of itself, and
+nothing about a centroid hop can move it. Four conditions must agree before a single point is
+withheld:
+
+| Condition | Why |
+|---|---|
+| You asked for it | Off by default |
+| The pipeline already read the fix as stationary | Displacement that measured as travel outranks any sensor window |
+| The GNSS chip reports no speed | Doppler is a hardware measurement multipath cannot fabricate; a chip reporting motion wins |
+| The pedometer counted no steps, or is absent | One step withdraws the veto |
+
+And it expires. After `stillnessEscapeMin` (30 minutes by default) the claim lapses for one
+fix, judged exactly as it would have been before the stage existed. That bound is not about
+accuracy — it is so that an accelerometer that stops delivering, or a threshold wrong for
+some OEM's part, costs a slow trickle of drift points rather than a silent shift.
+
+Those limits are why it is safe to switch on. **A motion API reporting `STILL` through a
+17-minute drive is a documented failure on this SDK's target hardware** (OnePlus and Xiaomi
+under battery saver), and every bound above exists so a wrong sensor costs a suppressed drift
+point and never a trip. This is also why it is a veto and never a trigger — nothing here can
+*cause* a point to be stored, and capture is never gated on motion detection.
+
+Suppressed fixes appear in the decision log as `Reasons.STILLNESS_VETO`
+([§16.4](#164-reasons--the-reason-vocabulary-is-api)), so if you think a real point went
+missing you can see exactly which fixes were withheld and why.
+
+Requires an accelerometer. Without one the flag is turned off at `ready()` and a `Diagnostic`
+says so — the same hardware that reaches `MotionQuality.POOR` in
+[§12.1](#121-motion-hardware-and-what-it-can-override).
+
 ---
 
 ## 13. Maps module
@@ -1538,7 +1593,8 @@ is a fallback, never an override.
 | `url` | `String` | — | Full endpoint. Must be `https://` (or `http://` for loopback / with `allowCleartext`) |
 | `method` | `String` | `"POST"` | HTTP method. **`POST`, `PUT` or `PATCH` only** — see below |
 | `headers` | `Map<String, String>` | empty | Sent on every request. **Never exposed back** — they carry your credential |
-| `autoSync` | `Boolean` | `true` | Upload as points arrive. With it off, you call `syncNow()` / `requestSync()` |
+| `autoSync` | `Boolean` | `true` | Upload as points arrive, plus the connectivity and supervision triggers. With it off you call `syncNow()` / `requestSync()` — **except** that closing a session with rows queued always enqueues a drain, because `stop()` tears down every path that could otherwise notice |
+| `persistConfig` | `Boolean` | `true` | Keep an **encrypted** copy of this config so a background upload works in a process your app has not configured. **It persists `headers`, i.e. your credential** — see the note below. Ignored when you supply a custom `SyncTransport` |
 | `batchSize` | `Int` | `100` | Rows per request, 1..1000. Larger = fewer requests but a bigger retry unit |
 | `requiresUnmeteredNetwork` | `Boolean` | `false` | Only upload on Wi-Fi |
 | `gzipRequestBody` | `Boolean` | `false` | Compress the JSON body. Off by default — there is no negotiation for request-body encoding, so a server that does not expect gzip answers 400 |
@@ -1556,8 +1612,39 @@ is a fallback, never an override.
 > `Request.Builder.method(...)`. If you need another one, supply your own `SyncTransport`
 > ([§14.6](#146-custom-transport)) — the interface has no such restriction.
 
+> **`persistConfig` writes your bearer token to disk, encrypted.** This is what makes a
+> background upload survive an OEM kill: `configure()` is your call, and the process
+> `WorkManager` builds to run the upload worker has executed none of your code past
+> `Application.onCreate`. An app that configures after login — in an Activity, once it has a
+> token — previously lost **every** background drain, and the rows waited for the app to be
+> reopened.
+>
+> The blob is sealed with an AES-GCM key held in `AndroidKeyStore`: the key material never
+> enters your process, is not extractable, needs no user authentication (the worker runs with
+> the device locked, which is the point), and **is not included in Android Auto Backup**.
+> That last point is why this is encrypted rather than written like `TrackerConfig`:
+> `android:allowBackup` defaults to `true`, so a plaintext token here would be copied to the
+> user's Google Drive and restored onto a different device. A restored ciphertext is inert
+> and reads as "nothing saved", which is the pre-existing behaviour.
+>
+> The copy is deleted, and the key destroyed, when the configuration goes away and on a
+> 401/403. A live `configure()` always beats the stored copy, so a freshly refreshed token is
+> never replaced by an old one. Restore re-validates before adopting, and restores only the
+> config and the built-in transport — no trigger registration and no connectivity watcher, so
+> a worker process never quietly arms a background listener you did not ask for.
+>
+> **Never stored when you supply your own `SyncTransport`.** It is your code, it cannot be
+> serialised, and restoring without it would fall back to the built-in OkHttp client —
+> different interceptors, possibly no certificate pinning and no token refresh. `configure()`
+> declines to store anything at all in that case and logs why; sending a credential through a
+> transport you did not choose is worse than not sending it.
+>
+> Set `persistConfig = false` if a credential must not reach disk at any strength. The cost is
+> the behaviour every release before this one had: uploads work while your app is alive to
+> configure them, and a cold worker no-ops.
+
 **Builder**: `.url()`, `.baseUrl()`, `.path()`, `.method()`, `.header(name, value)`,
-`.headers(map)`, `.autoSync()`, `.batchSize()`, `.requiresUnmeteredNetwork()`,
+`.headers(map)`, `.autoSync()`, `.persistConfig()`, `.batchSize()`, `.requiresUnmeteredNetwork()`,
 `.gzipRequestBody()`, `.allowCleartext()`, `.timeouts(SyncTimeouts)`,
 `.timeouts(connectMs, readMs, writeMs)`, `.extraParam(name, value)`, `.extraParams(map)`,
 `.build()`, `.buildUnchecked()`.
@@ -1708,6 +1795,28 @@ Recovering from offline has two independent halves, and you need neither of them
 
 The prompt half needs `autoSync = true`; with it off you own the schedule and nothing drains
 unless you call `syncNow()`. Both halves stop after a 401 or 403.
+
+**The durable half needs a config, and a cold process has none.** WorkManager persists the
+*request*, not your `SyncConfig` — and the process it builds to run that request has executed
+none of your code past `Application.onCreate`. `persistConfig`
+([§14.1](#141-syncconfig)) is what lets the worker read the config back; without it the worker
+finds nothing configured and reports done, which is why an app that configures after login used
+to see no background uploads at all.
+
+#### When a session ends
+
+Closing a session with rows still queued enqueues a drain, **whatever `autoSync` says**, as long
+as `configure()` has run.
+
+It is not gated on the flag because `autoSync` is a statement about *cadence* — "not as points
+arrive" — and the end of a session is not an arrival. It is the last moment the SDK is watching
+at all: `stop()` cancels the backstop worker and stops the service the health loop runs in, so
+both supervision paths die with the session. A host that configured an endpoint and set
+`autoSync = false` therefore had nothing scheduled for a shift it recorded offline, and the rows
+waited until it next called `syncNow()` with a network by hand.
+
+`autoSync = false` still means what it says: nothing uploads while the session runs. You get one
+drain when it ends, and WorkManager holds it until the network allows.
 
 **Queue order is FIFO** — oldest row first, across every unsent session, by insertion order rather
 than by any device clock. A backlog that spans a reboot still uploads in the order it was
@@ -2058,6 +2167,12 @@ data class FixDecision(
 
 The numeric fields exist so a `Sigma Gate Outlier` can be argued with.
 
+`motionState` is the motion layer's verdict at the time the fix was judged. **In releases
+before this one it was always `STOPPED`** — the field had no writer anywhere in the SDK, so
+every row ever written recorded the default, on a motorway and on a desk alike. It is now
+stamped for real. It remains a label and nothing more: no gate reads it, because capture is
+never gated on motion detection.
+
 ### 16.4 `Reasons` — the reason vocabulary **is API**
 
 These exact strings appear on `TrackPoint.acceptReason`, `RawPoint.reason` and
@@ -2091,6 +2206,7 @@ These exact strings appear on `TrackPoint.acceptReason`, `RawPoint.reason` and
 | `DEPARTURE_HELD` | `Departure Held` |
 | `DRIFT_SUPPRESSED` | `Drift Suppressed` |
 | `HEARTBEAT_SKIPPED` | `HeartBeat Skipped` |
+| `STILLNESS_VETO` | `Stillness Veto` |
 | `HEURISTIC_GATE` | `Heuristic Gate` |
 | `SESSION_CLOSED` | `Session Closed` |
 | `MOCK_LOCATION` | `Mock Location` |
@@ -2331,12 +2447,19 @@ fire and the runtime waiver already applies.
 | Config changes do nothing | `reset = false` with a persisted config | Set `reset = true` (the default) during development |
 | Very few points while stationary | Working as designed — the data-plane heartbeat warms the filter without storing | Set `persistHeartbeat = true` if you want them stored |
 | Zigzag / drift while stationary | Accuracy ceiling too loose | `AccuracyProfile.STRICT`, or a `CUSTOM` ceiling |
+| Points keep arriving from a phone lying on a desk | Indoor Wi-Fi/cell-centroid hops read as travel. The pipeline's own fix for this needs no configuration and is in the SDK already | Update the SDK first. If points still arrive, turn on `motion.suppressWhileStationary` — the accelerometer veto ([§12.3](#123-points-from-a-device-that-is-not-moving)) |
+| `suppressWhileStationary` set, still storing points | The fix measured as moving, so the veto was never consulted — Doppler or displacement outranks the sensors by design | Read the decision log: a withheld fix says `Stillness Veto`, a stored one names the gate that kept it ([§16.3](#163-layer-3--the-decision-log)) |
+| `suppressWhileStationary` had no effect at all | No accelerometer — the flag is turned off at `ready()` with a `Diagnostic` | Check `tracker.getSensors().accelerometer`. Nothing else to do; the pipeline's own defences still apply |
+| Every `FixDecision.motionState` reads `STOPPED` | Fixed — the field had no writer, so every row recorded the default | Update the SDK ([§16.3](#163-layer-3--the-decision-log)) |
 | Corners drawn as straight chords | Turn fidelity settings off | Keep `turnBurst = true`, `useGyroTurnPrediction = true`, `cornerAnchorCapture = true`, `bearingChangeCaptureDeg = 30`; use `smoothing = HEADING_SPLINE` where the fixes carry a GNSS bearing |
 | Navigation "randomly stops" | 1 Hz stream with no foreground service | `navigationMode` requires `service.foregroundService` — `validate()` enforces it |
 | Tracking ends when the user swipes the app away | `stopOnTerminate = true` | Leave it `false` (the default) |
 | Uploads retry forever | `http://` URL blocked by Android's default network security policy | Use `https://`, or `allowCleartext = true` for a local dev server |
 | Uploads stopped, rows still queued | A 403 halted the queue | Call `sync.configure(...)` again with a working credential |
 | Queue does not drain when the network returns | `autoSync = false`, so only the durable half runs — nothing asks for a drain until the next enqueued work is released | Set `autoSync = true`, or call `syncNow()` from your own connectivity handling |
+| Rows left queued after `stop()` under `autoSync = false` | Fixed — the session-close drain used to fire only when `autoSync` was on, and `stop()` tears down every other path that could notice | Update the SDK. Closing a session now enqueues a drain whenever sync is configured ([§14.4](#when-a-session-ends)) |
+| No background uploads after the OEM kills the app | Your app configures sync after login, so the process WorkManager builds for the worker has no config | Leave `persistConfig = true` (the default) — the worker reads an encrypted copy back ([§14.1](#141-syncconfig)). It is disabled automatically if you supply a custom `SyncTransport` |
+| Background uploads stopped after adding a custom `SyncTransport` | Deliberate: the config is not persisted with one, because a cold worker cannot rebuild your client and the built-in one is not a substitute | Configure sync in `Application.onCreate` so every process has it, including the worker's |
 | `NetworkAvailable` arrives but nothing uploads | The drain ran and failed — the event says a drain was *requested*, not that it succeeded | Read the `HttpResponse` that follows for the reason; a `null` `statusCode` means the request never completed |
 | Backlog uploads in a scrambled order | Fixed — the queue is FIFO by insertion, including across a reboot | Update the SDK; older builds ordered on a monotonic clock that restarts at boot |
 | Tracking stopped and the queue emptied | A 401 tore everything down | Re-authenticate, then `ready()` / `start()` / `configure()` again |

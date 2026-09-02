@@ -88,12 +88,28 @@ sync.configure(
 
 ### 3.2 Triggering
 
-Four paths lead to an upload:
+Five paths lead to an upload:
 
 1. **autoSync (default on).** `configure()` registers a `SyncTrigger` with core. Core fires
-   it when a point is accepted, from its supervision loops when rows are queued or the last
-   upload has gone stale, and once more when a session closes. Each firing calls
-   `requestSync()`.
+   it when a point is accepted, and from its supervision loops when rows are queued or the
+   last upload has gone stale. Each firing calls `requestSync()`.
+1b. **Session close (any configuration).** `configure()` also registers a *session flush*
+   with core, and this one is **not** gated on `autoSync`. When `stop()` closes a session
+   with rows still queued, a drain is enqueued with `REPLACE`.
+
+   Not gated, because `autoSync` is a statement about cadence — "not as points arrive" —
+   and the end of a session is not an arrival. It is the last moment core is watching:
+   `StopTrackingUseCase` cancels the backstop worker and stops the service the health loop
+   runs in, so both supervision paths die with the session. Before this, a host that
+   configured an endpoint and set `autoSync(false)` had a shift recorded offline sit in the
+   database until it next called `syncNow()` with a network by hand.
+
+   `REPLACE` rather than the `KEEP` of `requestSync()`: this fires once per session and core
+   has already checked the queue is non-empty, so there is no burst to defend against —
+   while `KEEP` would silently discard it whenever a previous attempt is sitting in
+   `ENQUEUED`, which is what a request in linear backoff looks like. It also resets
+   `runAttemptCount`, so the shift's rows get a fresh attempt rather than inheriting a
+   backoff grown during the offline stint.
 2. **Connectivity (autoSync only).** `configure()` also registers a
    `ConnectivityManager.registerDefaultNetworkCallback`. When the device returns to a
    *usable* network with rows queued, a drain is requested. See §3.5 — this is the path
@@ -104,6 +120,49 @@ Four paths lead to an upload:
 4. **`syncNow()`.** Drains inline in the caller's coroutine scope and returns the result.
    For user-initiated refresh; an upload started from a `viewModelScope` is cancelled with
    it. Prefer `requestSync()` for anything not user-initiated.
+
+### 3.2b Surviving a cold process (`persistConfig`)
+
+`SyncWorker` opens with `if (!sync.isConfigured) return Result.success()`, and in the process
+WorkManager builds after an OEM kill that used to be the end of it: `configure()` is the host's
+call, and such a process has run no host code past `Application.onCreate`. An app that
+configures after login — in an Activity, once it has a token — therefore lost **every**
+background drain, which is the drain that matters most. Rows stayed queued until the app was
+reopened.
+
+With `persistConfig` on (the default), `configure()` writes the config to app-private storage
+and the worker reads it back before giving up. A live configuration always wins: restore only
+ever fills a vacuum, so a token refreshed this morning is never replaced by last night's.
+
+**The blob contains `headers`, which is where the bearer token is.** It is sealed with an
+AES-GCM key held in `AndroidKeyStore`:
+
+- the key material never enters the app process and is not extractable;
+- no `setUserAuthenticationRequired`, because the worker runs with the device locked — which
+  is the entire point of persisting it;
+- **the key is not included in Android Auto Backup, and `android:allowBackup` defaults to
+  `true`.** That default is the reason this is encrypted at all: a plaintext token here would
+  be copied to the user's Google Drive and restored onto a different device. A restored
+  ciphertext is inert, and the store reports "nothing saved" — the pre-existing behaviour.
+
+Cleared, and the key destroyed, when the configuration goes away and on a 401/403. The 401
+path `await`s the clear rather than launching it: that credential may belong to a user who is
+signing out.
+
+Not persisted, ever:
+
+- **A custom `SyncTransport`.** It is host code. Restoring the config without it would fall
+  back to the built-in OkHttp client — different interceptors, possibly no certificate pinning
+  and no token refresh. `configure()` declines to store anything at all in that case and logs
+  why; sending a credential through a transport the host did not choose is worse than not
+  sending it.
+- Anything at all when `persistConfig = false`. The cost is the old behaviour: uploads work
+  while the app is alive to configure them, and a cold worker no-ops.
+
+Restore re-validates before adopting, and restores only the config and the built-in transport
+— no trigger registration, no connectivity watcher. Those notice moments *during* a session,
+and a worker process quietly arming a network callback would be a background listener the host
+never asked for.
 
 ### 3.3 Draining (`SyncQueue.drain`)
 
@@ -195,7 +254,8 @@ or the next supervision tick (up to fifteen). Details that matter:
   a five-hour delay.
 - **Queue-gated.** The queue depth is read before anything is enqueued: a reconnection
   with an empty queue is the common case and is not worth a worker.
-- **autoSync only.** With `autoSync(false)` the host owns the schedule, and a drain it did
+- **autoSync only** (the connectivity watcher; the session flush of §3.2 1b is not).
+  With `autoSync(false)` the host owns the schedule, and a drain it did
   not ask for is a surprise request against its own credential.
 - **Stopped by 401 and 403.** A halted uploader that still drains on every reconnection is
   the same retry loop by a different door.
@@ -491,7 +551,8 @@ read 30 s, write 20 s — override per-config via `SyncConfig.timeouts`.
 | `url` / `baseUrl` + `path` | — (required) | HTTPS enforced; loopback exempt. `url` wins over `baseUrl`+`path`; relative `path` falls back to `TrackerConfig.baseUrl`. |
 | `method` | `POST` | Must be one of the transport's supported verbs; validated at `configure()`. |
 | `headers` | empty | Auth lives here. Never exposed back via any property. |
-| `autoSync` | `true` | Off → nothing is registered with core; the host owns the schedule. |
+| `autoSync` | `true` | Off → no point/supervision trigger and no connectivity watcher; the host owns the schedule. The session-close flush is registered either way — see §3.2 1b. |
+| `persistConfig` | `true` | Keep an encrypted copy for the cold-process drain — see §3.7. Persists `headers`. Ignored with a custom transport. |
 | `batchSize` | `100` | 1–1000. Larger = fewer requests, but a failure re-sends the whole batch. |
 | `requiresUnmeteredNetwork` | `false` | Wi-Fi-only uploads. |
 | `gzipRequestBody` | `false` | See §5 — enable only with server agreement. |

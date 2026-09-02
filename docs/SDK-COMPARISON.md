@@ -62,8 +62,9 @@ They solve **capture**: get location in the background, cheaply, without the OS 
 | Capability | Incumbent | Tracker | Notes |
 |---|---|---|---|
 | Motion-triggered stop detection | ✅ | ✅ | §3 |
-| `disableStopDetection` | ✅ | ✅ | |
-| `stopOnStationary` | ✅ | ✅ | §3 |
+| `disableStopDetection` | ✅ | ⛔ | Declared but never implemented; deprecated for removal |
+| `stopOnStationary` | ✅ | ⛔ | Declared but never implemented; deprecated for removal. Ending a session on a stop is the host's decision — `suppressWhileStationary` covers the case hosts actually want |
+| Accelerometer veto on stationary drift | ⛔ | ✅ | `suppressWhileStationary` (EC-142). No competing SDK has it |
 | `motionTriggerDelay` (Android) | ✅ | ✅ | |
 | `stopDetectionDelay` | iOS only | ⛔ | Not applicable |
 | `activityRecognitionInterval` | ✅ | ✅ | Default 10 s |
@@ -174,8 +175,10 @@ data class MotionConfig(
     val activityRecognitionIntervalMs: Long = 10_000,      // parity
     val activityConfidenceMin: Int = 75,                   // parity (Android)
     val snapshotConfidenceMin: Int = 50,                   // one-shot seed only
-    val disableStopDetection: Boolean = false,             // parity
-    val stopOnStationary: Boolean = false,                 // parity
+    val disableStopDetection: Boolean = false,             // DEPRECATED — never implemented
+    val stopOnStationary: Boolean = false,                 // DEPRECATED — never implemented
+    val suppressWhileStationary: Boolean = false,          // accelerometer veto (EC-142)
+    val stillnessEscapeMin: Int = 30,                      // its safety valve
     val stopTimeoutMin: Int = 5,                           // parity
     val motionTriggerDelayMs: Long = 0,                    // parity (Android)
     val stationaryRadiusM: Float = 150f,
@@ -384,7 +387,7 @@ Sensors are only registered while a session is active, and unregistered in `stop
 data class SensorConfig(
     val useSignificantMotion: Boolean = true,
     val useStepCorroboration: Boolean = true,
-    val useAccelerometerVeto: Boolean = true,
+    val useAccelerometerVeto: Boolean = true,              // DEPRECATED — never implemented
     val useBarometer: Boolean = false,
     val stepBatchLatencyMs: Long = 60_000,
 )
