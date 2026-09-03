@@ -106,6 +106,10 @@ tink-android = { module = "com.google.crypto.tink:tink-android", version.ref = "
 
 # --- HTTP (sync uses it compileOnly; core links it for the licence check) ---
 okhttp = { module = "com.squareup.okhttp3:okhttp", version.ref = "okhttp" }
+# Never a dependency of ours — declared only so fieldtrack-core can constrain it. A host
+# that brings okhttp-urlconnection (React Native does, for its cookie jar) has to get it
+# at the same version as the okhttp core jar we pull in; see that constraint's comment.
+okhttp-urlconnection = { module = "com.squareup.okhttp3:okhttp-urlconnection", version.ref = "okhttp" }
 retrofit = { module = "com.squareup.retrofit2:retrofit", version.ref = "retrofit" }
 retrofit-converter-gson = { module = "com.squareup.retrofit2:converter-gson", version.ref = "retrofit" }
 okhttp-mockwebserver = { module = "com.squareup.okhttp3:mockwebserver3-junit4", version.ref = "okhttp" }

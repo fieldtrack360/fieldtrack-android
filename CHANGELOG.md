@@ -60,6 +60,18 @@ surfaces that have never shipped. A host upgrading from `1.0.7-alpha2` has nothi
 
 ### Fixed
 
+- **A React Native host crashed on its first cookie-bearing request.** `fieldtrack-core` links
+  OkHttp 5 for the licence check, and OkHttp 5 deleted the internal class
+  `okhttp3.internal.Util`. Gradle's conflict resolution upgrades the `okhttp` module and nothing
+  else, so a host that already had `okhttp-urlconnection` 4.x kept it — and that version's
+  `JavaNetCookieJar` calls the deleted class, taking the app down with
+  `NoClassDefFoundError: Failed resolution of: Lokhttp3/internal/Util;` on a stack naming no
+  FieldTrack code. `fieldtrack-core` now publishes a dependency *constraint* pulling
+  `okhttp-urlconnection` up to the same version as the core jar. We do not depend on that
+  artifact, so this adds nothing to the AAR and is inert in a host that never had it. It is a
+  `required` version, not `strictly`: a host may move the whole OkHttp family past us, only
+  never split it. A host whose build forces OkHttp versions itself — React Native's Gradle
+  plugin can — still has to align the two artifacts on its own side.
 - **A phone lying on a desk kept storing points** (EC-142). Two independent halves of the
   net-displacement departure ladder, both of which had to be closed:
   - **One centroid hop confirmed a departure.** `persistConfirmNet` let a single fix latch

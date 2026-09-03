@@ -87,3 +87,25 @@
     @retrofit2.http.* <methods>;
 }
 -keepattributes RuntimeVisibleAnnotations,AnnotationDefault
+
+# ── deliberately NOT here: anything about OkHttp ─────────────────────────────
+#
+# Recorded because the question comes back every time a host hits
+#
+#     java.lang.NoClassDefFoundError: Failed resolution of: Lokhttp3/internal/Util;
+#         at okhttp3.JavaNetCookieJar.decodeHeaderAsJavaNetCookies(JavaNetCookieJar.kt:81)
+#
+# and reaches for a keep rule. No rule fixes it. `-keep` preserves classes that exist,
+# and OkHttp 5 deleted `okhttp3.internal.Util` outright — it is in no artifact on the
+# classpath, so the rule matches nothing. The cause is a split OkHttp family: this module
+# links OkHttp 5 for the licence check, Gradle's conflict resolution raises the `okhttp`
+# module alone, and a sibling left at 4.x (React Native ships `okhttp-urlconnection`
+# there for its cookie jar) calls into the removed class. The fix is the version
+# constraint in build.gradle.kts, not R8 configuration.
+#
+# `-dontwarn okhttp3.**` is the actively wrong answer and worth naming as such. R8 fails
+# the build on a missing class referenced from kept code, which is the check that catches
+# this split at compile time. OkHttp's own AAR narrows its suppression to
+# `-dontwarn okhttp3.internal.platform.**` precisely so the rest stays loud. Widening it
+# in a host turns a build error into a production crash on the first cookie-bearing
+# request — which is exactly how this one shipped.

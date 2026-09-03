@@ -181,6 +181,30 @@ dependencies {
     implementation(libs.retrofit)
     implementation(libs.retrofit.converter.gson)
 
+    // Pulling OkHttp 5 above is not free for the host. OkHttp 5 deleted the internal
+    // class `okhttp3.internal.Util`, and Gradle's conflict resolution only upgrades the
+    // `okhttp` module itself — every sibling artifact a host already had stays where it
+    // was. React Native ships `okhttp-urlconnection` 4.x, whose `JavaNetCookieJar` calls
+    // straight into that deleted class, so the app dies on its first cookie-bearing
+    // request with a stack that names none of our code:
+    //
+    //     java.lang.NoClassDefFoundError: Failed resolution of: Lokhttp3/internal/Util;
+    //         at okhttp3.JavaNetCookieJar.decodeHeaderAsJavaNetCookies(JavaNetCookieJar.kt:81)
+    //         at com.facebook.react.modules.network.ReactCookieJarContainer.loadForRequest
+    //
+    // A constraint — not a dependency — drags that sibling up to match. We never link
+    // against okhttp-urlconnection ourselves, so this adds nothing to the AAR and stays
+    // inert in a host that does not use it. `required`, deliberately, not `strictly`: a
+    // host is free to move the whole family past us, only never to split it.
+    constraints {
+        implementation(libs.okhttp.urlconnection) {
+            because(
+                "OkHttp 5 removed okhttp3.internal.Util; an okhttp-urlconnection left " +
+                    "at 4.x crashes against the 5.x core jar this module brings in",
+            )
+        }
+    }
+
     implementation(libs.play.services.location)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.coroutines.play.services)

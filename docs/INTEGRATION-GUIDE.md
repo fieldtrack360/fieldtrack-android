@@ -147,6 +147,30 @@ dependencies, because the licence check has to work in a host that brought no HT
 of its own. There is no opt-out, deliberately: a licensing layer an integrator could
 disable by omitting a dependency would not be a licensing layer.
 
+That OkHttp is version 5, and it will win over an older one already in your build — Gradle
+resolves a conflict by taking the highest version. Upgrading `okhttp` on its own is not
+always safe, because OkHttp 5 deleted internal classes that OkHttp 4 siblings call. The one
+that bites in practice is `okhttp-urlconnection`: React Native ships it at 4.x for its
+cookie jar, and 4.x `JavaNetCookieJar` calls the removed `okhttp3.internal.Util`, so the
+first cookie-bearing request dies with
+
+```
+java.lang.NoClassDefFoundError: Failed resolution of: Lokhttp3/internal/Util;
+    at okhttp3.JavaNetCookieJar.decodeHeaderAsJavaNetCookies(JavaNetCookieJar.kt:81)
+```
+
+`fieldtrack-core` publishes a constraint that pulls `okhttp-urlconnection` up to match, so
+an ordinary Gradle build needs nothing from you. If your build forces OkHttp versions
+itself — React Native's Gradle plugin is able to — a `force` beats our constraint and you
+have to align the family yourself:
+
+```kotlin
+implementation(platform("com.squareup.okhttp3:okhttp-bom:5.1.0"))
+```
+
+The rule is the same either way: move every `com.squareup.okhttp3` artifact together, never
+one alone.
+
 ### 1.4 What you do *not* have to add
 
 - **No DI framework.** No Hilt, no `@HiltAndroidApp`, no KSP, no Gradle plugin. The SDK's
