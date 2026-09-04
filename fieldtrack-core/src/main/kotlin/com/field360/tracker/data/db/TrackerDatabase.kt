@@ -18,7 +18,7 @@ import androidx.sqlite.execSQL
         FilterStateEntity::class,
         RawPointEntity::class,
     ],
-    version = 8,
+    version = 9,
     // EC-83: schemas are committed and migrations are explicit. A library that
     // silently wipes its host's data on upgrade is not shippable, so
     // fallbackToDestructiveMigration() is never called anywhere in this module.
@@ -218,6 +218,37 @@ internal abstract class TrackerDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v8 → v9: two fields the filter needed and did not have — delivery liveness, and
+         * the length of the current run of unconditional accuracy rejections.
+         *
+         * Additive and non-destructive, per EC-83. Both defaults are the honest reading of
+         * a row written before the columns existed, and both reproduce the pre-upgrade
+         * behaviour exactly on the first fix after the upgrade:
+         *
+         *  - `lastSeenElapsedNanos = 0` is `FilterState`'s own "nothing seen yet" sentinel.
+         *    The pipeline reads it as an unbounded delivery gap, which is what it assumed
+         *    before the column existed, so the first post-upgrade fix takes the same
+         *    recovery branch it would have taken on v8. A wall-clock-shaped default would
+         *    be far worse than useless here: the column holds `elapsedRealtimeNanos`, which
+         *    restarts at every reboot, and any non-zero guess would claim a delivery that
+         *    belongs to a timeline that no longer exists.
+         *  - `hardRejectRun = 0` says no run is in progress, which is true of a database
+         *    written by a build that could not count one. It costs at most one extra
+         *    rejection before a bridge can be earned, on the session that spans the
+         *    upgrade.
+         */
+        val MIGRATION_8_9: Migration = object : Migration(8, 9) {
+            override fun migrate(connection: SQLiteConnection) {
+                connection.execSQL(
+                    "ALTER TABLE filter_state ADD COLUMN lastSeenElapsedNanos INTEGER NOT NULL DEFAULT 0",
+                )
+                connection.execSQL(
+                    "ALTER TABLE filter_state ADD COLUMN hardRejectRun INTEGER NOT NULL DEFAULT 0",
+                )
+            }
+        }
+
         fun build(context: Context): TrackerDatabase =
             Room.databaseBuilder(
                 context.applicationContext,
@@ -232,6 +263,7 @@ internal abstract class TrackerDatabase : RoomDatabase() {
                     MIGRATION_5_6,
                     MIGRATION_6_7,
                     MIGRATION_7_8,
+                    MIGRATION_8_9,
                 )
                 // WAL so host reads never block the ingestor's writes (EC-85).
                 .setJournalMode(JournalMode.WRITE_AHEAD_LOGGING)

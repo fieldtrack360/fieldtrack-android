@@ -174,6 +174,70 @@ public data class TrackerConstants(
     val accuracyMovingMax: Float = 30f,
     /** Network fixes worse than this are rejected outright (EC-32). */
     val accuracyNlpReject: Float = 25f,
+
+    // ── bounded hard-reject run (EC-139a) ─────────────────────────────────────
+    /**
+     * Consecutive fixes the unconditional accuracy gates may drop before the next one is
+     * admitted as a bridge instead.
+     *
+     * [accuracyMovingMax] and [accuracyNlpReject] are the only gates in this file with no
+     * escape valve — the sigma gate has its forced reset, recovery has its hold, and both
+     * of these simply return. That is correct on hardware that can meet the ceiling, and
+     * on hardware that cannot it means the ceiling has no exit: every fix is dropped for
+     * as long as the conditions last, and the polyline draws one straight chord from the
+     * last fix that met the bar to the next one that does. The chord is not a *better*
+     * answer than coarse points — it is a route the device never took, drawn with no
+     * uncertainty at all, and it is what a field capture on a Redmi A5 and a vivo V2315
+     * produced for kilometres at a time.
+     *
+     * Four is the smallest number that cannot be reached by ordinary noise. Real fix
+     * accuracy is autocorrelated over a few samples — a bus shelter, an underpass, a turn
+     * into an urban canyon — so one, two, even three consecutive poor fixes are a normal
+     * transient the ceiling is right to swallow. A fourth says the device is not having a
+     * bad moment, it is producing this accuracy as a matter of course, and no amount of
+     * further waiting will improve it.
+     *
+     * `0` restores the pre-EC-139a behaviour exactly: unbounded runs, no bridge. It is the
+     * kill switch, and it is the value a fixture harness sets to replay a recording made
+     * before this stage existed.
+     */
+    val maxHardRejectRun: Int = 4,
+    /**
+     * How far a bridged fix may sit from the last stored point, as a multiple of what the
+     * vehicle's **prior** speed could have covered, plus a flat allowance.
+     *
+     * Deliberately the same shape and the same 1.3 as [nlpBypassSpeedFactor], and for the
+     * identical reason: every input is earned from fixes that predate the one being
+     * judged, so a bigger positioning error cannot argue itself into a higher speed and
+     * then use that speed as its own permission (EC-32a). A bridge is an admission that
+     * the fix is imprecise; it must never become an admission that it is unbounded.
+     *
+     * The flat term is larger than the NLP bypass's 60 m because the fix's own error
+     * circle is the thing being tolerated here — a 40 m fix is allowed to be 40 m wrong
+     * about where it is without that counting as travel it could not have made.
+     */
+    val bridgeSpeedFactor: Double = 1.3,
+    val bridgeFlatM: Double = 100.0,
+    /**
+     * The same allowance for the sigma gate's forced reset, and deliberately four times
+     * wider (EC-43a).
+     *
+     * The forced reset is a rescue, not a routine acceptance: the filter has been rejecting
+     * everything and this branch exists so it can never stay wedged. Re-seeding is
+     * therefore unconditional and stays that way. The only question this number answers is
+     * whether the rescue fix also becomes a *vertex*, and the bar for that has to sit well
+     * clear of anything a real vehicle produces — a departure from a stop, a motorway
+     * resume, a long leg after a hold — because a false negative here costs one point and a
+     * false positive draws a kilometre-long spur onto the track.
+     *
+     * 400 m matches [distGpsRecoveryLarge], which is the existing answer elsewhere in this
+     * file to "how far can a thing legitimately have moved when we have no speed to go on".
+     *
+     * Note it must be tighter than stage 3's [speedMaxPhysicalKmph] to mean anything at
+     * all: an envelope wider than the physical-sanity cap is unreachable by construction
+     * and would be a no-op dressed as a guard.
+     */
+    val forcedResetFlatM: Double = 400.0,
     val nlpBypassWindowMs: Long = 10 * 60 * 1000L,
     /**
      * How far a network fix may be from the last one and still be believed, as a

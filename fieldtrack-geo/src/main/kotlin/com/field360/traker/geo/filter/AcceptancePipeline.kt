@@ -67,6 +67,24 @@ public class AcceptancePipeline(
             return reject(fix, stamped, reason, Eval.EMPTY)
         }
 
+        // The run of unconditional accuracy rejections, read from the state as it
+        // arrived and cleared on `seen` below. Clearing it here rather than on each of the
+        // dozen other exit paths is what makes "consecutive" mean consecutive: only the
+        // two gates that own the run write it back, so any other verdict — an accept, a
+        // sigma rejection, a departure hold — ends the run by simply not carrying it
+        // (EC-139a).
+        val priorHardRejectRun = state.hardRejectRun
+
+        // A structurally valid fix was delivered. Recorded here, ahead of every gate that
+        // can drop it, because the question this answers is "is the provider still
+        // producing fixes" and the answer does not depend on what we go on to decide about
+        // this one. `maxOf` keeps it monotonic against a reordered delivery that reached
+        // the pipeline directly (EC-140a).
+        val seen = stamped.copy(
+            lastSeenElapsedNanos = maxOf(stamped.lastSeenElapsedNanos, fix.elapsedRealtimeNanos),
+            hardRejectRun = 0,
+        )
+
         // ── Stage 1 — burst ──────────────────────────────────────────────────
         // Keyed on FIX time, not delivery time. Keying it on delivery is what made
         // the reference collapse an entire batch into one fix (A4/A5, EC-30).
@@ -81,11 +99,11 @@ public class AcceptancePipeline(
         if (state.lastFixElapsedNanos != 0L &&
             sinceLastFixNanos in 0 until c.burstMs * NANOS_PER_MILLI
         ) {
-            return reject(fix, stamped, Reasons.BURST, Eval.EMPTY)
+            return reject(fix, seen, Reasons.BURST, Eval.EMPTY)
         }
 
         // ── Stage 1 (cont.) — cold start / resume ────────────────────────────
-        var s = stamped
+        var s = seen
         if (!s.isInitialised || past == null) {
             if (past == null) {
                 // Genuinely nothing to compare against. Accept unconditionally —
@@ -120,6 +138,26 @@ public class AcceptancePipeline(
         val distanceMoved = Haversine.metres(past.latitude, past.longitude, fix.latitude, fix.longitude)
         val calcSpeed = if (dtSec >= 1f) (distanceMoved / dtSec).toFloat() else 0f
         val heading = headingOf(fix, past, distanceMoved)
+        // How long the provider was actually silent, as opposed to how long the filter has
+        // been stale. Read from `state`, never from `s`: `seen` has already stamped this
+        // fix, so measuring against `s` would answer zero every time. A zero stamp means
+        // nothing has been seen yet — a fresh session, or the far side of a reboot — and
+        // that is honestly an unbounded gap rather than a short one (EC-140a).
+        val sinceSeenNanos = fix.elapsedRealtimeNanos - state.lastSeenElapsedNanos
+        val deliveryGapSec = if (state.lastSeenElapsedNanos == 0L || sinceSeenNanos < 0L) {
+            // Nothing seen yet, or a stamp belonging to a timeline that no longer exists.
+            // Both are an *absence* of evidence that fixes have been arriving, and the
+            // honest reading of that is an unbounded gap — which is exactly the behaviour
+            // that shipped before this term existed. Reading a negative step as "no gap"
+            // would be the opposite: it would silence recovery for the rest of the session
+            // on a device whose clock rewound, which is the one case recovery is for.
+            // `ClockGuard` normally resets the whole state at a reboot boundary before the
+            // pipeline ever sees this, so the guard is a floor under that, not a duplicate
+            // of it (EC-92a, EC-140a).
+            Float.MAX_VALUE
+        } else {
+            sinceSeenNanos.toFloat() / NANOS_PER_SECOND
+        }
 
         // ── Stage 1.5 — network-fix (NLP) authenticity ───────────────────────
         val looksLikeNlp = fix.looksLikeNetworkFix
@@ -127,7 +165,19 @@ public class AcceptancePipeline(
             fix.accuracy > c.accuracyNlpReject &&
             nlpBypass(fix, past, s, dtSec, distanceMoved)
         if (looksLikeNlp && fix.accuracy > c.accuracyNlpReject && !nlpBypassed) {
-            return reject(fix, s, Reasons.NLP_FALLBACK, Eval.EMPTY)
+            // Counted into the same run as stage 3.5, so a device alternating between the
+            // two still reaches the bound — but deliberately never *bridged* here. A fix
+            // stage 3.5 drops has a position the chip computed and an error circle around
+            // it; a network centroid has neither, and admitting one because several
+            // preceded it would hand the polyline exactly the Wi-Fi teleports this gate
+            // exists to catch (EC-32). What rescues the honest case is `looksLikeNetworkFix`
+            // no longer mistaking a GNSS fix for a centroid, not an amnesty here.
+            return reject(
+                fix,
+                s.copy(hardRejectRun = priorHardRejectRun + 1),
+                Reasons.NLP_FALLBACK,
+                Eval.EMPTY,
+            )
         }
 
         // ── Stage 2 — motion-state determination ─────────────────────────────
@@ -152,12 +202,28 @@ public class AcceptancePipeline(
         // fix's own displacement helped decide (see `evaluateMotion`: `effectiveSpeed` folds
         // in `calcSpeed`), so a bigger positioning error buys a looser ceiling. This one is
         // unconditional so that loop cannot close (EC-139).
+        //
+        // Unconditional, but no longer unbounded. The ceiling has always been right about
+        // the individual fix and silent about the run: on hardware whose whole accuracy
+        // distribution sits above it, every fix is dropped and the polyline draws one
+        // chord from the last fix that met the bar to the next one that does. That chord
+        // is not a more accurate answer than a run of coarse points — it is a road the
+        // device never travelled, drawn with no uncertainty at all. So after
+        // `maxHardRejectRun` consecutive drops the next *reachable* fix is admitted and
+        // labelled (EC-139a).
+        var bridged = false
         if ((eval.isVehicular || eval.isMoving) && fix.accuracy > c.accuracyMovingMax && !nlpBypassed) {
-            return reject(fix, s, Reasons.POOR_ACCURACY, eval)
+            val run = priorHardRejectRun + 1
+            bridged = c.maxHardRejectRun > 0 &&
+                run >= c.maxHardRejectRun &&
+                reachable(fix, past, s, dtSec, distanceMoved, c.bridgeFlatM)
+            if (!bridged) {
+                return reject(fix, s.copy(hardRejectRun = run), Reasons.POOR_ACCURACY, eval)
+            }
         }
 
         // ── Stage 4 — tiered recovery (runs BEFORE the sigma gate) ───────────
-        recoveryOutcome(fix, s, eval, distanceMoved, context, past)?.let { return it }
+        recoveryOutcome(fix, s, eval, distanceMoved, context, past, deliveryGapSec)?.let { return it }
         s = s.copy(recoveryPending = null)
 
         // ── Stage 5 — 3-sigma gate + forced reset ────────────────────────────
@@ -189,7 +255,18 @@ public class AcceptancePipeline(
                 val reseeded = KalmanFilter
                     .seed(gated, fix.latitude, fix.longitude, fix.accuracy, fix.elapsedRealtimeNanos)
                     .copy(consecutiveRejectCount = 0)
-                return if (distanceMoved > c.distMinMove) {
+                // The re-seed above is unconditional and stays that way: EC-43's promise
+                // is that the filter can never wedge, and the seed is what keeps it — not
+                // the store. Whether this fix also becomes a *vertex* is the separate
+                // question, and a leg no vehicle could have driven is not one. Two
+                // rejections is all it takes to reach here, so on a device that jumps this
+                // branch was the pipeline's own teleport generator: it re-anchored onto the
+                // outlier and then stored it, which is the "point far away" in the field
+                // reports. The envelope is the vehicular leg test stage 6 already applies,
+                // 45 m/s plus 200 m, so nothing a real drive produces is affected.
+                val legPlausible =
+                    reachable(fix, past, s, dtSec, distanceMoved, c.forcedResetFlatM)
+                return if (distanceMoved > c.distMinMove && legPlausible) {
                     acceptFix(
                         fix, reseeded, Reasons.SIGMA_FORCED_RESET, eval, context, past,
                         sigma, threshold, heading = heading,
@@ -211,12 +288,24 @@ public class AcceptancePipeline(
         // counterfactual — a fix the sensors say never happened is not a corner either.
         val stillnessSuppresses = stillnessSuppresses(eval, context)
 
-        val reason = heuristicReason(fix, past, s, eval, distanceMoved, dtSec, looksLikeNlp)
-            ?: bearingChangeReason(fix, s, eval, heading, context)
-            ?: return heuristicRejection(
-                fix, past, s, eval, context, qTrack, sigma, threshold, predictedDelta, distanceMoved, heading,
-                stillnessSuppresses = stillnessSuppresses,
-            )
+        // A bridged fix has already been judged twice — by stage 3.5's ceiling, which
+        // said no, and by the run bound and reachability envelope, which together
+        // overruled it. Stage 6 asks a different question ("is this fix significant?") and
+        // its answer cannot reinstate a rejection that has already been overruled, so the
+        // label that belongs in the decision log is the one explaining why this fix
+        // survived at all. It is deliberately not `Vehicular`: a stretch plotted from
+        // coarse fixes must never read back as a stretch the device measured well
+        // (EC-139a).
+        val reason = if (bridged) {
+            Reasons.ACCURACY_BRIDGE
+        } else {
+            heuristicReason(fix, past, s, eval, distanceMoved, dtSec, looksLikeNlp)
+                ?: bearingChangeReason(fix, s, eval, heading, context)
+                ?: return heuristicRejection(
+                    fix, past, s, eval, context, qTrack, sigma, threshold, predictedDelta, distanceMoved, heading,
+                    stillnessSuppresses = stillnessSuppresses,
+                )
+        }
 
         // ── Stage 6.5 — stillness veto (EC-142) ──────────────────────────────
         if (stillnessSuppresses && reason in VETOABLE_REASONS) {
@@ -392,6 +481,57 @@ public class AcceptancePipeline(
         return distanceMoved <= reachable
     }
 
+    /**
+     * @return true when a fix some gate has already judged badly is at least *reachable*
+     *   from where the device was and how fast it was going (EC-139a, EC-43a).
+     *
+     * The bound that keeps a rescue from becoming a teleport. Two stages call it, and both
+     * are about to overrule a rejection: the accuracy bridge, which admits that the fix is
+     * imprecise, and the sigma gate's forced reset, which admits that the filter has to be
+     * re-seeded onto something. Neither is entitled to say the device could be *anywhere*.
+     * Without this, the very run that earns a bridge would let the worst fix of that run
+     * through — a 300 m multipath excursion arriving fourth in a row is exactly as eligible
+     * as a 35 m one, and plotting it is the spike this whole change exists to remove.
+     *
+     * **Every input is independent of this fix's own displacement**, which is the rule
+     * [nlpBypass] follows and for the same reason (EC-32a). The filter's velocity is
+     * smoothed across many corrections and cannot be spiked by one bad measurement;
+     * `past.speedMps` belongs to a point already stored. Deriving the speed from the
+     * displacement being judged would make the test self-justifying — a larger error
+     * computes as a higher speed, and a higher speed is precisely the permission being
+     * asked for.
+     *
+     * The GNSS chip's own Doppler is included, and that is *not* a hole in the rule. It is
+     * measured from the carrier frequency shift, not by differencing two positions, so a
+     * wider error circle does not produce a larger speed and the self-justifying loop
+     * cannot close through it. It is also what makes this test work at all on the hardware
+     * that needs it: the first bridge of a session is judged against a filter that has
+     * learned no velocity yet and a `past` seeded by `Init` with none, so without the
+     * Doppler term the flat allowance would be the entire envelope and a drive that has
+     * been rejecting fixes for a minute could never clear it. ([nlpBypass] cannot use the
+     * same term for the plain reason that a network centroid has no Doppler to offer.)
+     *
+     * @param flatAllowanceM the floor under the envelope, which carries a standing start
+     *   where the prior speed is legitimately zero and the device has still moved by the
+     *   time of the next fix. The two callers pass deliberately different values — see
+     *   [TrackerConstants.bridgeFlatM] and [TrackerConstants.forcedResetFlatM].
+     */
+    private fun reachable(
+        fix: TrackFix,
+        past: TrackPoint,
+        state: FilterState,
+        dtSec: Float,
+        distanceMoved: Double,
+        flatAllowanceM: Double,
+    ): Boolean {
+        val priorSpeed = maxOf(
+            KalmanFilter.speedOf(state),
+            past.speedMps,
+            if (fix.hasSpeed) fix.speedMps else 0f,
+        )
+        return distanceMoved <= priorSpeed * dtSec * c.bridgeSpeedFactor + flatAllowanceM
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Stage 2
     // ─────────────────────────────────────────────────────────────────────────
@@ -519,6 +659,7 @@ public class AcceptancePipeline(
      * seeded from hardware only: a heading derived from displacement would span the gap
      * and describe a leg that was never travelled as drawn.
      */
+    @Suppress("LongParameterList")
     private fun recoveryOutcome(
         fix: TrackFix,
         state: FilterState,
@@ -526,6 +667,8 @@ public class AcceptancePipeline(
         distanceMoved: Double,
         context: IngestContext,
         past: TrackPoint,
+        /** Seconds since the provider last delivered a fix, whatever was decided about it. */
+        deliveryGapSec: Float,
     ): PipelineResult? {
         // A held candidate from a previous fix: confirm it, keep holding, or drop it and
         // fall through.
@@ -566,7 +709,22 @@ public class AcceptancePipeline(
             (fix.elapsedRealtimeNanos - state.elapsedNanos).toFloat() / NANOS_PER_SECOND
         val isProcessingGap = processingGapSec > c.signalGapSec
 
-        val recoveryNeeded = fix.accuracy < c.accuracyMedium && (
+        // Recovery is for a blackout, and a blackout means fixes stopped *arriving*. The
+        // filter clock alone cannot tell that apart from fixes arriving and being
+        // rejected, because only an accept advances it — so a run of accuracy rejections
+        // aged the filter past `signalGapSec` and manufactured a gap that never happened.
+        // The cost was not a wasted branch: `RECOVERY_RESET` hard re-anchors and calls
+        // `clearMovement()`, which drops the captured heading (so bearing-change capture
+        // goes blind and the next corner plots as a chord) and restarts the departure
+        // ladder (so the next ~100 m stores nothing). Each manufactured gap therefore made
+        // the next one more likely — the loop behind the field reports of a track that
+        // "jumps and then draws a straight line" (EC-140a).
+        //
+        // On a genuine blackout no fixes arrive, so this term is true whenever the old
+        // condition was, and recovery behaves exactly as it always has.
+        val isDeliveryGap = deliveryGapSec > c.signalGapSec
+
+        val recoveryNeeded = isDeliveryGap && fix.accuracy < c.accuracyMedium && (
             (processingGapSec > c.recoveryTimeoutSec && distanceMoved > c.distRecoveryWakeup) ||
                 (isProcessingGap && eval.isVehicular && distanceMoved > c.distRecoveryVehicular) ||
                 (isProcessingGap && distanceMoved > c.distRecoveryWakeup && fix.accuracy < c.accuracyHigh)
@@ -1100,6 +1258,10 @@ public class AcceptancePipeline(
         val committed = state.copy(
             lastFixElapsedNanos = fix.elapsedRealtimeNanos,
             lastCapturedBearingDeg = heading ?: state.lastCapturedBearingDeg,
+            // Stated here as well as implied by `seen`, because this is the invariant that
+            // matters: a stored point ends the run of unconditional rejections, so the
+            // next bridge has to be earned from scratch (EC-139a).
+            hardRejectRun = 0,
         )
 
         val point = TrackPoint(

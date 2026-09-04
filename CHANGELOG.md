@@ -60,6 +60,45 @@ surfaces that have never shipped. A host upgrading from `1.0.7-alpha2` has nothi
 
 ### Fixed
 
+- **A track that jumped, then drew a straight line, on some devices and not others.** Reported
+  on a Redmi A5 and a vivo V2315 (both Android 15) while a third handset on the same build was
+  flawless. The points were not lost — consecutive stored points were hundreds of metres apart,
+  so the polyline drew a confident chord across a route that was never travelled. Four
+  mechanisms, compounding:
+  - **The moving accuracy ceiling had no bound on the *run*.** Stage 3.5 (`accuracyMovingMax`)
+    and stage 1.5 (`accuracyNlpReject`) were the only gates in the pipeline with no escape
+    valve — the sigma gate has its forced reset, recovery has its hold, these two simply
+    returned. Correct per fix; on hardware whose whole accuracy distribution sits above the
+    ceiling it means every fix is dropped until one happens to dip under the bar, and the gap
+    between them is drawn as a straight line. The run is now bounded by
+    `TrackerConstants.maxHardRejectRun` (4), after which the next fix that is *reachable* from
+    the prior speed is stored as `Reasons.ACCURACY_BRIDGE`. `0` restores the old behaviour
+    exactly (EC-139a).
+  - **Rejected fixes manufactured a signal blackout.** Only an accept advances the filter clock,
+    so a run of rejections aged the filter past `signalGapSec` and recovery re-anchored on a gap
+    that never happened — which via `clearMovement()` dropped the captured heading (bearing-change
+    capture went blind, so the next corner plotted as a chord) and restarted the departure ladder
+    (so the next ~100 m stored nothing). Each manufactured gap made the next one more likely.
+    `FilterState.lastSeenElapsedNanos` now records every fix the pipeline is handed, whatever the
+    verdict, and recovery requires the provider to have actually stopped delivering. On a genuine
+    blackout nothing changes (EC-140a).
+  - **The sigma gate's forced reset stored whatever it re-seeded onto**, needing only to clear a
+    10 m floor. The re-seed stays unconditional — EC-43's "the filter can never wedge" is kept by
+    the seed, not by the store — but the fix now becomes a *vertex* only if the leg is reachable
+    at the speed the device was already going, with a 400 m floor for a standing start (EC-43a).
+  - **`TrackFix.looksLikeNetworkFix` read the Doppler flags alone.** The Unisoc and MediaTek HALs
+    on these handsets clear `hasSpeed`/`hasBearing` on genuine GNSS fixes — cold start, walking
+    pace, weak sky view — so those fixes were judged as Wi-Fi centroids and rejected above 25 m.
+    Altitude is now a third witness: a network centroid has none, a GNSS fix always does. This
+    only ever narrows the classification, and what newly passes is still judged by every gate
+    below it.
+
+  Room schema **8 → 9** (`MIGRATION_8_9`), additive, two `filter_state` columns with defaults
+  that reproduce the pre-upgrade behaviour on the first fix after the upgrade. A device that
+  already met its accuracy ceiling replays byte-identically — asserted directly in
+  `DegradedDeviceTest`, which pins the old behaviour with `maxHardRejectRun = 0` and compares
+  the decision sequences.
+
 - **A React Native host crashed on its first cookie-bearing request.** `fieldtrack-core` links
   OkHttp 5 for the licence check, and OkHttp 5 deleted the internal class
   `okhttp3.internal.Util`. Gradle's conflict resolution upgrades the `okhttp` module and nothing

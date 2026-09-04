@@ -62,8 +62,28 @@ public data class TrackFix(
      * network-derived (WiFi/cell database). Stage 1.5 rejects these above
      * [TrackerConstants.accuracyNlpReject] unless the vehicular bypass applies —
      * they arrive "fresh", so no timestamp gate catches them (EC-32).
+     *
+     * [altitude] is the third witness, and it is what stops the flag test misfiring on
+     * hardware that is telling the truth. The Doppler flags are the *usual* discriminator
+     * because a Wi-Fi centroid has no velocity solution to report — but neither does a
+     * GNSS chip that has a position fix and no velocity yet, and the Unisoc and MediaTek
+     * HALs this SDK runs on clear both flags routinely: on a cold start, at walking pace,
+     * and whenever the constellation drops below a velocity solution. Those fixes were
+     * then judged as Wi-Fi centroids and rejected above 25 m, which is how a device that
+     * was tracking perfectly well produced a run of `NLP Fallback` rejects and a chord
+     * across the map.
+     *
+     * A trilaterated network position has no altitude — the platform's network provider
+     * does not populate one — while a GNSS fix always does, because altitude falls out of
+     * the same four-satellite solution as latitude and longitude. So an altitude present
+     * with the velocity flags clear says "GNSS, no velocity solution", not "Wi-Fi".
+     *
+     * This only ever *narrows* the classification, so nothing that used to pass this gate
+     * now fails it. What newly passes is still judged by every gate below — the moving
+     * accuracy ceiling, the sigma gate and the heuristic branches all remain in front of
+     * it, which is where a genuine Wi-Fi teleport is caught anyway.
      */
-    val looksLikeNetworkFix: Boolean get() = !hasSpeed && !hasBearing
+    val looksLikeNetworkFix: Boolean get() = !hasSpeed && !hasBearing && altitude == null
 
     public companion object {
         public const val UNKNOWN_PROVIDER: String = "unknown"

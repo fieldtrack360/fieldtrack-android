@@ -112,6 +112,28 @@ public object Reasons {
      */
     public const val STILLNESS_VETO: String = "Stillness Veto"
 
+    /**
+     * Stored because the *run* of accuracy rejections had gone on long enough that
+     * rejecting one more would draw a straight line across the route (EC-139a).
+     *
+     * Stage 3.5's ceiling is unconditional by design, and on hardware whose whole accuracy
+     * distribution sits above that ceiling the design has no exit: every fix is dropped,
+     * the run is unbounded, and the next fix that happens to dip under the bar is stored
+     * as a single chord across everything in between. That chord is not a more accurate
+     * track than a run of coarse points — it is a road the device never travelled, drawn
+     * with total confidence.
+     *
+     * So the run is bounded, exactly as the sigma gate's is. This reason means: the fix's
+     * error circle is genuinely too wide to place it precisely, the previous
+     * [TrackerConstants.maxHardRejectRun] fixes were too, and this one is at least
+     * *reachable* from where the vehicle was and how fast it was going. A coarse point on
+     * the road beats a confident line across the buildings beside it.
+     *
+     * Distinguishable in the decision log and in `raw_points`, so a coarse-but-plotted
+     * stretch is never mistaken for a stretch the device measured well.
+     */
+    public const val ACCURACY_BRIDGE: String = "Accuracy Bridge"
+
     public const val HEURISTIC_GATE: String = "Heuristic Gate"
     public const val SESSION_CLOSED: String = "Session Closed"
     public const val MOCK_LOCATION: String = "Mock Location"

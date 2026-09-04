@@ -137,6 +137,16 @@ internal data class FilterStateEntity(
     val velocityEastMps: Float = 0f,
     val covPosVel: Float = 0f,
     val varianceVel: Float = 25f,
+    /**
+     * Monotonic stamp of the last fix the pipeline was handed, whatever it decided.
+     *
+     * `0` = nothing seen yet, which is what a row written before this column existed
+     * honestly says — and it is read as an unbounded delivery gap, i.e. the behaviour
+     * that shipped before it (EC-140a).
+     */
+    val lastSeenElapsedNanos: Long = 0L,
+    /** Consecutive unconditional accuracy rejections. `0` for every pre-v9 row (EC-139a). */
+    val hardRejectRun: Int = 0,
 ) {
     companion object {
         const val SINGLETON_ID: Int = 1

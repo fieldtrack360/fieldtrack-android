@@ -24,6 +24,15 @@ import kotlin.math.sqrt
  *   drives the 10-minute NLP bypass so tunnels and parking garages still track (EC-32).
  * @property consecutiveRejectCount feeds the forced reset — the mechanism that
  *   guarantees the filter can never wedge permanently (EC-43).
+ * @property lastSeenElapsedNanos monotonic stamp of the last structurally valid fix the
+ *   pipeline was *handed*, whatever it decided about it. Deliberately distinct from
+ *   [elapsedNanos], which advances only when a measurement is folded in: the difference
+ *   between the two is precisely "fixes are arriving and being rejected", and that is not
+ *   a signal blackout (EC-140a).
+ * @property hardRejectRun consecutive fixes dropped by the two *unconditional* accuracy
+ *   gates — stage 1.5's network-fix test and stage 3.5's moving ceiling. Neither touches
+ *   [consecutiveRejectCount], which belongs to the sigma gate, so before this field the
+ *   run had no bound and no escape at all (EC-139a).
  * @property origin net-displacement anchor. Movement is only published once net
  *   displacement from here passes the persistence test, which is what kills slow
  *   drift loops (EC-39).
@@ -48,6 +57,8 @@ public data class FilterState(
     val elapsedNanos: Long = 0L,
     val lastHwVehicularNanos: Long = 0L,
     val consecutiveRejectCount: Int = 0,
+    val lastSeenElapsedNanos: Long = 0L,
+    val hardRejectRun: Int = 0,
     val origin: GeoPoint? = null,
     val departCount: Int = 0,
     val prevNetMeters: Float = 0f,
