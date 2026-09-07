@@ -219,6 +219,36 @@ public data class TrackerConstants(
     val bridgeSpeedFactor: Double = 1.3,
     val bridgeFlatM: Double = 100.0,
     /**
+     * How far back the reachability envelope may extrapolate the prior speed, seconds.
+     *
+     * The envelope's speed term is `priorSpeed × Δt`, and `Δt` is measured from the last
+     * **stored** point — not from the last fix. Those are the same number only while
+     * points are being stored, and every path into `reachable` is a path where they have
+     * not been: a reject run is by definition a stretch that stored nothing. Worse, the
+     * run that earns a bridge is bounded ([maxHardRejectRun]) but the silence before it is
+     * not — a heuristic-gate rejection, a stillness veto, a held recovery candidate and a
+     * sigma outlier all decline to store *and* clear the hard-reject run, so `Δt` can carry
+     * twenty minutes of ordinary rejections into the first bridge that follows. At a
+     * vehicular prior speed that is an envelope tens of kilometres wide, which is not a
+     * bound at all: the guard reads as arithmetic while permitting the exact teleport it
+     * was written to stop (a field capture in Delhi plotted a spur onto a street the device
+     * never entered, and a second one at the end of the session).
+     *
+     * A speed is only evidence for as long as it is current. Two minutes is where this SDK
+     * already draws that line — [recoveryHoldMaxSec] abandons a candidate at the same
+     * number, and it sits just above [signalGapSec], beyond which a fix is post-gap and
+     * recovery owns it rather than the bridge. It is also comfortably clear of the
+     * legitimate case: [maxHardRejectRun] fixes at the 12 s vehicular tier is 48 s and at
+     * the 4 s turn-burst tier 16 s, so nothing a normal drive produces is touched. Only the
+     * base 60 s tier can reach the cap, and a bridge across four minutes of unusable fixes
+     * is a guess whichever number is chosen.
+     *
+     * Caps the term, never the flat allowance: a standing start still gets its floor.
+     * `Float.MAX_VALUE` restores the previous unbounded behaviour exactly, and is the value
+     * a fixture harness sets to replay a recording made before this cap existed.
+     */
+    val reachableMaxDtSec: Float = 120f,
+    /**
      * The same allowance for the sigma gate's forced reset, and deliberately four times
      * wider (EC-43a).
      *

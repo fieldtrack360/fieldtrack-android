@@ -78,12 +78,41 @@ public data class TrackFix(
      * the same four-satellite solution as latitude and longitude. So an altitude present
      * with the velocity flags clear says "GNSS, no velocity solution", not "Wi-Fi".
      *
-     * This only ever *narrows* the classification, so nothing that used to pass this gate
-     * now fails it. What newly passes is still judged by every gate below — the moving
-     * accuracy ceiling, the sigma gate and the heuristic branches all remain in front of
-     * it, which is where a genuine Wi-Fi teleport is caught anyway.
+     * The altitude witness only ever *narrows* the classification, so nothing that used to
+     * pass this gate fails it on that account. What newly passes is still judged by every
+     * gate below — the moving accuracy ceiling, the sigma gate and the heuristic branches
+     * all remain in front of it, which is where a genuine Wi-Fi teleport is caught anyway.
+     *
+     * **A zero stamped into the speed field is not a velocity solution.** Reading
+     * [hasSpeed] alone assumes the flag means what the platform documents, and on the fused
+     * provider it does not: a fix fused from a Wi-Fi or cell centroid routinely arrives with
+     * `hasSpeed() == true` and a speed of exactly `0.0`, because the fuser fills the field
+     * rather than leaving it clear. That one stamped zero was enough to make the whole of
+     * stage 1.5 dead code on those handsets — the centroid was never classified as one, so
+     * it faced only the moving accuracy ceiling, which the accuracy bridge and the sigma
+     * gate's forced reset are both entitled to overrule. In a city with the Wi-Fi density of
+     * Delhi that is the dominant source of a point plotted on a street the device never
+     * entered.
+     *
+     * Four witnesses have to agree before a fix is called a centroid on those grounds, and
+     * the conjunction is far narrower than it looks:
+     *
+     *  - **no bearing** and **no altitude**, exactly as above — a stationary GNSS fix still
+     *    carries an altitude, which is what keeps a parked phone out of this branch;
+     *  - **the speed is exactly zero** — the phantom-Doppler failure this SDK also handles
+     *    reports 3–8 m/s, not `0.0` (EC-36), so that case is untouched;
+     *  - **no speed accuracy** — a chip that has computed a velocity, including a genuine
+     *    zero, generally reports its confidence in it; a fuser stamping a placeholder has
+     *    none to report.
+     *
+     * The Unisoc and MediaTek case the altitude witness was added for is likewise untouched:
+     * those HALs clear [hasSpeed] rather than stamping it, so they never reach this branch.
      */
-    val looksLikeNetworkFix: Boolean get() = !hasSpeed && !hasBearing && altitude == null
+    val looksLikeNetworkFix: Boolean
+        get() {
+            val noVelocitySolution = !hasSpeed || (speedMps == 0f && speedAccuracyMps == null)
+            return noVelocitySolution && !hasBearing && altitude == null
+        }
 
     public companion object {
         public const val UNKNOWN_PROVIDER: String = "unknown"

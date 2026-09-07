@@ -191,6 +191,23 @@ public data class TrackOptions @JvmOverloads constructor(
      * obliged to pass through every vertex it is given.
      */
     val simplifyEpsilonM: Double = DEFAULT_SIMPLIFY_EPSILON_M,
+    /**
+     * How much longer than the straight line between two snapped fixes the injected road
+     * path between them may be (EC-101a).
+     *
+     * [snapMaxOffRoadM] governs whether a *point* may be moved onto the road; this governs
+     * whether the road *between* two such points may be drawn. They are different claims
+     * and the second is the larger one — a wrong point is metres wrong, a wrong span is a
+     * confident line down streets nobody drove.
+     * `Double.POSITIVE_INFINITY` restores the pre-EC-101a behaviour exactly.
+     */
+    val snapMaxDetourFactor: Double = DEFAULT_MAX_DETOUR_FACTOR,
+    /**
+     * The flat allowance under [snapMaxDetourFactor], which carries a junction or
+     * roundabout whose chord is nearly zero — the ratio is meaningless as the chord
+     * approaches zero, and that is exactly where the geometry is most worth injecting.
+     */
+    val snapBridgeFlatM: Double = DEFAULT_BRIDGE_FLAT_M,
 ) {
     public companion object {
         /**
@@ -207,6 +224,41 @@ public data class TrackOptions @JvmOverloads constructor(
          * [Smoothing.DEFAULT_SPACING_M] is: `plot.model` must not depend on `plot`.
          */
         public const val DEFAULT_SIMPLIFY_EPSILON_M: Double = 2.0
+
+        /**
+         * 2.5 — how much longer than its chord an injected road span may be (EC-101a).
+         *
+         * A road is longer than its chord by construction, and how much longer is a fact
+         * about shape: a straight runs at 1.0, a bend at up to ~1.6 (a semicircle is π/2),
+         * a one-way system that puts the vehicle round three sides of a block at ~3. 2.5
+         * sits above every ordinary detour and far below the failure it is here for — a
+         * field capture in Delhi injected ~2 km of road between two fixes about 100 m
+         * apart, a factor of twenty, and drew it down streets the device never entered.
+         *
+         * The factor is also, quietly, a speed limit. Two fixes at the 12 s vehicular tier
+         * are ~120 m apart, so this admits a 500 m road path between them and refuses a
+         * 900 m one; 900 m in 12 s is 270 km/h, which no returned geometry should ever be
+         * claiming.
+         *
+         * Mirrored on `Snapper` for the same `plot.model` reason as above; the two must
+         * stay in step.
+         */
+        public const val DEFAULT_MAX_DETOUR_FACTOR: Double = 2.5
+
+        /**
+         * 200 m — the flat allowance under [DEFAULT_MAX_DETOUR_FACTOR] (EC-101a).
+         *
+         * The ratio is meaningless as the chord approaches zero, and the chord approaches
+         * zero in exactly the places whose geometry is most worth injecting. Two fixes on
+         * either side of a roundabout island sit 15 m apart with 150 m of road between them
+         * — a factor of ten, and completely correct. A junction turn, a U-turn at a central
+         * reservation and a hairpin all have the same shape.
+         *
+         * 200 m is an ordinary urban roundabout's circumference with room over it, and it
+         * is still an order of magnitude below the kilometre-scale spurs the bound exists
+         * to refuse.
+         */
+        public const val DEFAULT_BRIDGE_FLAT_M: Double = 200.0
     }
 }
 

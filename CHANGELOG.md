@@ -40,8 +40,34 @@ surfaces that have never shipped. A host upgrading from `1.0.7-alpha2` has nothi
   rather than dropping to the base interval and missing the corner immediately after a junction.
   A committed stop clears the claim, so a drive that ends in a walk does not carry the vehicular
   cadence into the walk.
+- **`TrackOptions.snapMaxDetourFactor` (`2.5`) and `TrackOptions.snapBridgeFlatM` (`200.0`)** — the
+  bound on how much road geometry may be injected between two snapped fixes. Appended to the end of
+  the constructor, so existing positional and `@JvmOverloads` call sites are unaffected. See the
+  road-snap entry under Fixed.
+- **`TrackerConstants.reachableMaxDtSec` (`120f`)** — how far back the accuracy bridge and the sigma
+  gate's forced reset may extrapolate a prior speed. See the reachability entry under Fixed.
 - `docs/MOTION-QUALITY-FINDINGS.md` — the measurements behind the above.
 - Sample app: a config console covering the whole `TrackerConfig` surface, and a status screen.
+- **Sample app: geofence crossing notifications, with a durable record.** A notification on every
+  ENTER/EXIT of a host-registered fence, on its own channel so it can be silenced separately from
+  the SDK's ongoing tracking notification, and a "fence notifications" card on the status screen
+  listing what has been posted. No SDK change — `TrackerEvent.GeofenceEntered`/`GeofenceExited`
+  and `Tracker.getGeofenceEvents()` already carried everything needed; what a user should be
+  *told* about a crossing is a host decision, and the sample now demonstrates making it.
+  - `GeofenceAlertLog` — the host's own record, kept across process death. Separate from the SDK's
+    history on purpose: that store is what happened, this is what the app reacted to, and the SDK
+    trims on its own schedule.
+  - The event is treated as a doorbell, not a payload. `Tracker.events` is `replay = 0` and
+    `GeofenceEntered` carries no timestamp, so every field — including the key that dedupes a
+    crossing — is read back from `getGeofenceEvents()`. A crossing delivered while nothing was
+    subscribed is therefore picked up by the next read rather than lost, and the catch-up path and
+    the live path are the same code.
+  - Collected in `Application.onCreate` via `onSubscription`, not in a view model: `StationaryFenceReceiver`
+    is a manifest receiver, so a fence crossed with the app in a pocket starts the process, and a
+    collector living on a screen would miss exactly the crossings that matter.
+  - The SDK's internal stationary wake fence is recorded but never notified — the motion layer
+    re-arms it at every stop, so notifying on it would bury real fences under a notification per
+    traffic light.
 - **Accelerometer veto on stationary drift** (EC-142) — a third, independent defence against a
   parked device producing points. Every other stationary defence reasons about position, because
   a GNSS fix carries nothing else; this one measures whether the device physically moved, which
@@ -59,6 +85,50 @@ surfaces that have never shipped. A host upgrading from `1.0.7-alpha2` has nothi
   - Turned off automatically, with a `Diagnostic`, on a device with no accelerometer.
 
 ### Fixed
+
+- **A point plotted on a street the device never entered, mid-session and again at the end of
+  it.** Reported from Delhi: the track left the route mid-journey, ran past a school the user
+  never passed, and closed with a green (≥ 20 km/h) spur nobody drove. Two independent holes,
+  either of which is sufficient on its own:
+  - **The reachability envelope extrapolated the prior speed across the entire silence.**
+    `reachable()` — the bound shared by the accuracy bridge and the sigma gate's forced reset —
+    computes `priorSpeed × Δt × 1.3 + flat`, and `Δt` runs from the last *stored* point. Every
+    caller is on a path that stored nothing, and while the run that earns a bridge is bounded
+    (`maxHardRejectRun`), the silence in front of it is not: a heuristic-gate rejection, a
+    stillness veto, a held recovery candidate and a sigma outlier each decline to store *and*
+    clear the hard-reject run. Twenty quiet minutes at a vehicular prior speed therefore produced
+    an envelope kilometres wide — arithmetic that reads as a guard while permitting the exact
+    teleport it was written to stop. The speed term is now capped at
+    `TrackerConstants.reachableMaxDtSec` (120 s); the flat allowance is deliberately outside the
+    cap, so a standing start keeps its floor. `Float.MAX_VALUE` restores the previous behaviour
+    exactly. Nothing a normal drive produces is affected: a full run is 48 s at the 12 s
+    vehicular tier and 16 s at the 4 s turn-burst tier.
+  - **Stage 1.5 was dead code on the fused provider.** `TrackFix.looksLikeNetworkFix` read
+    `hasSpeed` as if the flag meant what the platform documents. It does not on the fused
+    provider: a fix fused from a Wi-Fi or cell centroid routinely arrives with `hasSpeed() ==
+    true` and a speed of exactly `0.0`, because the fuser fills the field rather than leaving it
+    clear. That one stamped zero meant the centroid was never classified as one, so it faced only
+    the moving accuracy ceiling — which the accuracy bridge and the forced reset are both
+    entitled to overrule. In a city with Delhi's Wi-Fi density that is the dominant source of an
+    off-route point. A speed of exactly zero with no reported speed accuracy now counts as *no
+    velocity solution*, alongside the existing no-bearing and no-altitude witnesses. All four
+    must agree, which leaves every neighbouring case untouched: a stationary GNSS fix still
+    carries an altitude, the phantom-Doppler failure reports 3–8 m/s rather than `0.0` (EC-36),
+    and the Unisoc/MediaTek HALs clear `hasSpeed` rather than stamping it.
+  - **The injected road span had no bound but its own index.** `Snapper` fills the leg between
+    two snapped fixes with `road[previousSegment + 1 .. match.segmentIndex]`, and the only test
+    on that span was that the index ran forwards. "Forwards" is an assertion about the matcher:
+    the projection is forward-only and cannot rewind, so wherever the returned geometry doubles
+    back — an out-and-back spur, a roundabout, a stretch the matcher lost and had replaced by raw
+    coordinates — two fixes metres apart project onto segments a kilometre apart and every vertex
+    between them is drawn. That is worse than a chord rather than better: it follows real streets
+    and turns at real junctions, so it reads as a measurement. The span is now bounded by
+    `TrackOptions.snapMaxDetourFactor` (2.5) against the straight line between the two fixes, plus
+    `TrackOptions.snapBridgeFlatM` (200 m) so a junction or roundabout — where the chord approaches
+    zero and the ratio stops meaning anything — keeps its geometry. Refusing the injection does not
+    refuse the snap: both fixes are still within `snapMaxOffRoadM` of the road and keep their
+    projected positions, and the leg draws as the chord between them.
+    `Double.POSITIVE_INFINITY` restores the previous behaviour exactly (EC-101a).
 
 - **A track that jumped, then drew a straight line, on some devices and not others.** Reported
   on a Redmi A5 and a vivo V2315 (both Android 15) while a third handset on the same build was

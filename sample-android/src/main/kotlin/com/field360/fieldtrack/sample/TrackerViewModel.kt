@@ -217,6 +217,16 @@ class TrackerViewModel(
      * the SDK's resolved config back, because `Tracker` exposes no way to.
      */
     private val defaultConfig: TrackerConfig = TrackerConfig(),
+    /**
+     * Geofence crossings this app has notified about, owned by `SampleApplication`.
+     *
+     * A flow rather than a list, and read from the Application rather than rebuilt here,
+     * because the collector that fills it has to outlive every screen — a fence is crossed
+     * with the app in a pocket. The view model only mirrors it into [UiState].
+     */
+    private val geofenceAlerts: StateFlow<List<GeofenceAlert>> = MutableStateFlow(emptyList()),
+    /** Clears the notified-crossing record and pulls the notifications out of the shade. */
+    private val onClearGeofenceAlerts: () -> Unit = {},
 ) : ViewModel() {
 
     /**
@@ -385,6 +395,8 @@ class TrackerViewModel(
         val registeredGeofenceCount: Int = 0,
         val geofenceEventCount: Int = 0,
         val geofences: List<TrackerGeofence> = emptyList(),
+        /** Crossings this app notified about, newest first. See `GeofenceAlertLog`. */
+        val geofenceAlerts: List<GeofenceAlert> = emptyList(),
 
         // ── the config console ──────────────────────────────────────────────
 
@@ -448,6 +460,9 @@ class TrackerViewModel(
             // Application-scoped in the SDK, lifecycle-scoped here: the collector dies
             // with the view model and native state stays the truth (EC-113).
             tracker.events.collect { event -> onEvent(event) }
+        }
+        viewModelScope.launch {
+            geofenceAlerts.collect { alerts -> _state.update { it.copy(geofenceAlerts = alerts) } }
         }
         viewModelScope.launch {
             tracker.state.collect { sdk ->
@@ -1579,6 +1594,19 @@ class TrackerViewModel(
         "OK deleted=$deleted"
     }
 
+    /**
+     * Clears the app's own notified-crossing record, not the SDK's history.
+     *
+     * Deliberately a separate action from [clearTestGeofenceHistory], because they are
+     * separate stores answering separate questions — what the SDK recorded, and what this
+     * app told the user about. Clearing one and silently clearing the other would make the
+     * two indistinguishable, which is the confusion keeping a host-side record avoids.
+     */
+    fun clearGeofenceAlerts() {
+        onClearGeofenceAlerts()
+        captureLog.note("GEOFENCE_ALERTS_CLEAR", "OK")
+    }
+
     private fun runApiCheck(kind: String, block: suspend () -> String) = viewModelScope.launch {
         if (_state.value.apiCheckRunning) return@launch
         _state.update { it.copy(apiCheckRunning = true, apiCheckResult = "$kind running...") }
@@ -1875,6 +1903,8 @@ class TrackerViewModel(
                     // second build of it: the console has to open showing what is actually
                     // running, and two calls to a builder is two chances to disagree.
                     defaultConfig = app.defaultConfig,
+                    geofenceAlerts = app.geofenceAlerts.alerts,
+                    onClearGeofenceAlerts = app::clearGeofenceAlerts,
                 )
             }
         }

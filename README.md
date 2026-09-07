@@ -875,6 +875,8 @@ val track = traker.buildTrack(
 | `bezierCutbackM` | `Double` | `25.0` | Corner cutback distance (BEZIER) |
 | `snapToRoad` | `Boolean` | `true` | Use road geometry if a provider is installed. Costs nothing with no provider |
 | `snapMaxOffRoadM` | `Double` | `80.0` | Beyond this from the returned road, a fix keeps its captured position |
+| `snapMaxDetourFactor` | `Double` | `2.5` | How much longer than its chord an injected road span may be. `Double.POSITIVE_INFINITY` disables the bound |
+| `snapBridgeFlatM` | `Double` | `200.0` | Flat allowance under `snapMaxDetourFactor`; carries a junction or roundabout whose chord is near zero |
 | `polylinePrecision` | `Int` | `6` | Encoded-polyline precision |
 | `speedBandsKmph` | `List<Float>` | `[10f, 20f]` | Thresholds for per-segment speed bands |
 | `arrowMinSegmentM` | `Double` | `60.0` | Minimum segment length to place an arrow |

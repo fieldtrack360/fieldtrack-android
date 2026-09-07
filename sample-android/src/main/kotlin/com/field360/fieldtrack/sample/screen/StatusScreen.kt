@@ -61,6 +61,7 @@ fun StatusScreen(
     onRemoveAllGeofences: () -> Unit = {},
     onReadGeofenceHistory: () -> Unit = {},
     onClearGeofenceHistory: () -> Unit = {},
+    onClearGeofenceAlerts: () -> Unit = {},
 ) {
     val backgroundActionable = state.backgroundStep != TrackerViewModel.BackgroundStep.GRANTED &&
         state.backgroundStep != TrackerViewModel.BackgroundStep.NOT_APPLICABLE
@@ -280,6 +281,68 @@ fun StatusScreen(
                     accent = Hack.Red,
                     modifier = Modifier.fillMaxWidth(),
                 )
+            }
+        }
+
+        // ── fence crossings the app notified about ──────────────────────────
+        //
+        // Deliberately its own card rather than a line on the api-probes one above. The
+        // probe card reports what the SDK *holds*; this reports what the app *told the
+        // user*, and the whole reason the sample keeps a second store is that those two
+        // answers differ — the SDK trims on its own schedule, and a notification the user
+        // saw should not disappear because of it.
+        item {
+            TerminalCard(
+                title = "fence notifications",
+                trailing = "${state.geofenceAlerts.size} crossings",
+                accent = Hack.Amber,
+            ) {
+                if (state.geofenceAlerts.isEmpty()) {
+                    Text(
+                        "no crossings notified yet — add a fence above, then walk or drive out of it",
+                        style = MonoBody.copy(color = Hack.Dim, fontSize = 11.sp),
+                    )
+                } else {
+                    state.geofenceAlerts.take(GEOFENCE_ALERT_ROWS).forEach { alert ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = if (alert.isEnter) "IN " else "OUT",
+                                style = MonoBody.copy(
+                                    // Entering is the quiet event; leaving a fence is what
+                                    // wakes the SDK and what a field run is watching for.
+                                    color = if (alert.isEnter) Hack.Green else Hack.Amber,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                ),
+                            )
+                            Text(
+                                text = alert.geofenceId,
+                                style = MonoBody.copy(fontSize = 11.sp),
+                                modifier = Modifier.weight(1f),
+                            )
+                            Text(
+                                text = clock(alert.crossedAtMs),
+                                style = MonoBody.copy(color = Hack.Dim, fontSize = 11.sp),
+                            )
+                        }
+                    }
+                    if (state.geofenceAlerts.size > GEOFENCE_ALERT_ROWS) {
+                        Text(
+                            "+${state.geofenceAlerts.size - GEOFENCE_ALERT_ROWS} older",
+                            style = MonoBody.copy(color = Hack.Dim, fontSize = 11.sp),
+                        )
+                    }
+                    GhostButton(
+                        text = "clear notifications",
+                        onClick = onClearGeofenceAlerts,
+                        accent = Hack.Red,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
             }
         }
 
@@ -575,6 +638,8 @@ fun tierColor(state: TrackerViewModel.UiState): Color = when (state.permissionTi
 private fun clock(atMs: Long): String =
     SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(atMs))
 
+/** Enough to see a drive's worth of crossings; the rest are counted, not listed. */
+private const val GEOFENCE_ALERT_ROWS = 8
 private const val SESSION_ROWS = 6
 private const val DEVICE_ID_CHARS = 18
 private const val BYTES_PER_KB = 1024

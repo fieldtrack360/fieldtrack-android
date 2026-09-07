@@ -5,6 +5,7 @@ import com.field360.traker.geo.math.Haversine
 import com.field360.traker.geo.model.GeoPoint
 import com.field360.traker.geo.plot.model.PlotPoint
 import com.field360.traker.geo.plot.model.RenderTag
+import com.field360.traker.geo.plot.model.TrackOptions
 
 /**
  * Merges captured points with road geometry fetched from a
@@ -146,11 +147,18 @@ public object Snapper {
      *
      * Off-road and protected points pass through untouched, so a session bookend or a
      * host-inserted marker stays exactly where it was recorded (EC-103).
+     *
+     * @param maxDetourFactor how much longer than the straight line between two snapped
+     *   fixes the road path between them may be. See [DEFAULT_MAX_DETOUR_FACTOR].
+     * @param bridgeFlatM the flat allowance added to that bound, which is what carries a
+     *   junction or a roundabout whose chord is nearly zero. See [DEFAULT_BRIDGE_FLAT_M].
      */
     public fun snap(
         rawPath: List<PlotPoint>,
         road: List<GeoPoint>,
         maxOffRoadM: Double = DEFAULT_MAX_OFF_ROAD_M,
+        maxDetourFactor: Double = DEFAULT_MAX_DETOUR_FACTOR,
+        bridgeFlatM: Double = DEFAULT_BRIDGE_FLAT_M,
     ): List<PlotPoint> {
         if (rawPath.size < 2 || road.size < MIN_ROAD_POINTS) return rawPath
 
@@ -183,9 +191,27 @@ public object Snapper {
             // Both projections sit on the road, so every road vertex strictly between
             // them belongs to the leg: `road[previousSegment + 1 .. match.segmentIndex]`.
             // Landing on the same segment leaves nothing in between.
+            //
+            // "Belongs to the leg" is an assertion about the *matcher*, and it is only ever
+            // as good as the geometry that came back. A forward-only projection cannot
+            // rewind, so where the returned path doubles back on itself — an out-and-back
+            // spur, a roundabout, a stretch the matcher lost and had replaced by raw
+            // coordinates — two fixes a hundred metres apart can project onto segments a
+            // kilometre apart in the list, and this line would then inject every vertex
+            // between them. The result follows real streets, turns at real junctions, and is
+            // a route the device never drove: the third mechanism behind the Delhi capture,
+            // and the only one of the three that draws a road-shaped lie rather than a
+            // chord. Bounded below by how far apart the two fixes actually are (EC-101a).
             val bridgeable = onRoad && previousSegment != NO_MATCH && match.segmentIndex > previousSegment
             if (bridgeable) {
-                out += bridge(road, previousSegment, match.segmentIndex, previousEmitted!!, emitted)
+                val span = bridge(road, previousSegment, match.segmentIndex, previousEmitted!!, emitted)
+                // Refusing the injection is not refusing the snap: both fixes are
+                // individually within `maxOffRoadM` of the road and that judgement stands.
+                // The leg simply draws as the chord between them, which is what it did
+                // before there was a provider at all.
+                if (withinDetour(previousEmitted!!, emitted, span, maxDetourFactor, bridgeFlatM)) {
+                    out += span
+                }
             }
 
             out += emitted
@@ -200,6 +226,45 @@ public object Snapper {
             }
         }
         return out
+    }
+
+    /**
+     * @return true when the road path about to be injected is a plausible way of getting
+     *   from one snapped fix to the next.
+     *
+     * The two fixes are metres apart or they are not; the road between them is bounded by
+     * that and by nothing else in the geometry. A ratio alone cannot be the whole test —
+     * at a junction or a roundabout the chord approaches zero while the road legitimately
+     * runs a hundred metres or more — so the flat allowance carries the small-chord case
+     * and the factor carries everything above it. The same shape as every other envelope
+     * in this SDK, and for the same reason: a bound with no floor rejects the honest case,
+     * a floor with no bound accepts anything.
+     *
+     * Measured along the drawn path — the hop from `from` onto the first injected vertex
+     * and the hop from the last one onto `to` included — because that is the line the user
+     * sees, not the sub-list.
+     */
+    private fun withinDetour(
+        from: PlotPoint,
+        to: PlotPoint,
+        span: List<PlotPoint>,
+        maxDetourFactor: Double,
+        bridgeFlatM: Double,
+    ): Boolean {
+        if (span.isEmpty()) return true
+
+        var length = 0.0
+        var previousLat = from.latitude
+        var previousLng = from.longitude
+        for (vertex in span) {
+            length += Haversine.metres(previousLat, previousLng, vertex.latitude, vertex.longitude)
+            previousLat = vertex.latitude
+            previousLng = vertex.longitude
+        }
+        length += Haversine.metres(previousLat, previousLng, to.latitude, to.longitude)
+
+        val chord = Haversine.metres(from.latitude, from.longitude, to.latitude, to.longitude)
+        return length <= chord * maxDetourFactor + bridgeFlatM
     }
 
     /**
@@ -265,6 +330,24 @@ public object Snapper {
      * road (EC-101).
      */
     public const val DEFAULT_MAX_OFF_ROAD_M: Double = 80.0
+
+    /**
+     * How much longer than the straight line between two snapped fixes the road path
+     * between them may be before the injection is refused (EC-101a).
+     *
+     * Delegated rather than duplicated: the number is argued in
+     * [TrackOptions.DEFAULT_MAX_DETOUR_FACTOR], and `plot` may depend on `plot.model`
+     * even though the reverse is forbidden. `Double.POSITIVE_INFINITY` restores the
+     * unbounded behaviour exactly, and is what a fixture harness sets to replay a track
+     * built before this bound existed.
+     */
+    public const val DEFAULT_MAX_DETOUR_FACTOR: Double = TrackOptions.DEFAULT_MAX_DETOUR_FACTOR
+
+    /**
+     * The flat allowance under [DEFAULT_MAX_DETOUR_FACTOR], and the term that keeps the
+     * bound honest where the ratio cannot be — see [TrackOptions.DEFAULT_BRIDGE_FLAT_M].
+     */
+    public const val DEFAULT_BRIDGE_FLAT_M: Double = TrackOptions.DEFAULT_BRIDGE_FLAT_M
 
     /** A single vertex is a point, not a road; it cannot bridge anything. */
     public const val MIN_ROAD_POINTS: Int = 2

@@ -117,7 +117,13 @@ public object TrackBuilder {
         // sawtooth, and where the road's own geometry has just been injected there is
         // nothing sparse left to hide (API.md §12).
         val snapped = if (options.snapToRoad && roadGeometry is Snapper.RoadGeometry.Snapped) {
-            Snapper.snap(simplified, roadGeometry.path, options.snapMaxOffRoadM)
+            Snapper.snap(
+                simplified,
+                roadGeometry.path,
+                options.snapMaxOffRoadM,
+                options.snapMaxDetourFactor,
+                options.snapBridgeFlatM,
+            )
         } else {
             simplified
         }

@@ -511,10 +511,23 @@ public class AcceptancePipeline(
      * been rejecting fixes for a minute could never clear it. ([nlpBypass] cannot use the
      * same term for the plain reason that a network centroid has no Doppler to offer.)
      *
+     * **The speed term is extrapolated for a bounded time, never for the whole silence.**
+     * `dtSec` runs from the last *stored* point, and every caller here is on a path that
+     * has stored nothing — so it measures how long the track has been silent, not how long
+     * the prior speed has been credible. The two coincide only over a short run. A
+     * heuristic-gate rejection, a stillness veto, a held recovery candidate and a sigma
+     * outlier each decline to store *and* clear the hard-reject run, so the bounded run
+     * that earns a bridge can sit at the end of an unbounded silence, and multiplying a
+     * vehicular speed by it yields an envelope kilometres wide — a guard that reads as
+     * arithmetic while permitting the teleport it exists to stop. Capped at
+     * [TrackerConstants.reachableMaxDtSec], which is above anything the vehicular and
+     * turn-burst tiers can produce across a full run.
+     *
      * @param flatAllowanceM the floor under the envelope, which carries a standing start
      *   where the prior speed is legitimately zero and the device has still moved by the
-     *   time of the next fix. The two callers pass deliberately different values — see
-     *   [TrackerConstants.bridgeFlatM] and [TrackerConstants.forcedResetFlatM].
+     *   time of the next fix. Deliberately outside the cap above, so a standing start keeps
+     *   its floor however long the silence was. The two callers pass deliberately different
+     *   values — see [TrackerConstants.bridgeFlatM] and [TrackerConstants.forcedResetFlatM].
      */
     private fun reachable(
         fix: TrackFix,
@@ -529,7 +542,8 @@ public class AcceptancePipeline(
             past.speedMps,
             if (fix.hasSpeed) fix.speedMps else 0f,
         )
-        return distanceMoved <= priorSpeed * dtSec * c.bridgeSpeedFactor + flatAllowanceM
+        val extrapolationSec = min(dtSec, c.reachableMaxDtSec)
+        return distanceMoved <= priorSpeed * extrapolationSec * c.bridgeSpeedFactor + flatAllowanceM
     }
 
     // ─────────────────────────────────────────────────────────────────────────

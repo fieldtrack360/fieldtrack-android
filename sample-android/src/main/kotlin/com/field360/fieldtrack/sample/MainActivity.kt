@@ -454,6 +454,7 @@ private fun SampleApp(
                     onRemoveAllGeofences = viewModel::removeAllTestGeofences,
                     onReadGeofenceHistory = viewModel::readTestGeofenceHistory,
                     onClearGeofenceHistory = viewModel::clearTestGeofenceHistory,
+                    onClearGeofenceAlerts = viewModel::clearGeofenceAlerts,
                     // Load the session, then jump to the map. openSession() is what
                     // pins every other tab to that id.
                     onOpenSession = { sessionId ->

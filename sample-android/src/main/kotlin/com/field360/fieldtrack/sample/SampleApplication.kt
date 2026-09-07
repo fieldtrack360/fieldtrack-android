@@ -10,6 +10,7 @@ import com.field360.tracker.Tracker
 import com.field360.tracker.TrackerConfig
 import com.field360.tracker.TrackingMode
 import com.field360.tracker.domain.model.TrackSession
+import com.field360.tracker.domain.model.TrackerEvent
 import com.field360.tracker.domain.model.TrackerGeofence
 import com.field360.tracker.domain.model.TrackerResult
 import com.field360.tracker.integrity.IntegrityPolicy
@@ -20,6 +21,7 @@ import com.field360.traker.sync.TrackerSync
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.onSubscription
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import java.time.Duration
@@ -44,6 +46,17 @@ class SampleApplication : Application() {
     val tracker: Tracker by lazy { Tracker.getInstance(this) }
 
     val captureLog: CaptureLog by lazy { CaptureLog(this) }
+
+    /**
+     * Every geofence crossing this app has notified about, kept across process death.
+     *
+     * Application-scoped rather than owned by the view model, and that is load-bearing: a
+     * fence is crossed while the app is in the user's pocket, and the collector that turns
+     * that into a notification has to outlive every screen. See [watchGeofenceCrossings].
+     */
+    val geofenceAlerts: GeofenceAlertLog by lazy { GeofenceAlertLog(this) }
+
+    private val geofenceNotifier: GeofenceNotifier by lazy { GeofenceNotifier(this) }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -100,6 +113,7 @@ class SampleApplication : Application() {
         super.onCreate()
         installRoadSnapping()
         installSync()
+        watchGeofenceCrossings()
         scope.launch {
             val config = defaultConfig
             Log.i(TRACKER_TAG, "ready() config=$config")
@@ -431,6 +445,77 @@ class SampleApplication : Application() {
     }
 
     /**
+     * Turns geofence crossings into notifications, and keeps a record of each one.
+     *
+     * **In `Application.onCreate`, not in a view model.** A fence is crossed with the app
+     * in a pocket, and `StationaryFenceReceiver` inside the SDK is a manifest receiver — so
+     * the system builds this process to deliver the broadcast, runs `onCreate`, and may let
+     * the process die again shortly after. A collector living on a screen would miss every
+     * crossing that matters and catch only the ones the user was already watching.
+     *
+     * **The event is a doorbell, not the payload.** `Tracker.events` is `replay = 0` and
+     * `GeofenceEntered` carries no timestamp, so every field — including the key that stops
+     * a crossing notifying twice — is read back from the SDK's own store. That also makes
+     * the two paths below one path: the catch-up read and the live read run identical code,
+     * and a crossing that arrived while nothing was subscribed is simply picked up by the
+     * next read rather than lost.
+     *
+     * `onSubscription` rather than a read before `collect`, because the gap between those
+     * two statements is exactly the window a broadcast would fall through: it runs after
+     * the subscription is registered, so no crossing can land unheard and unread.
+     */
+    private fun watchGeofenceCrossings() {
+        geofenceNotifier.ensureChannel()
+        scope.launch {
+            tracker.events
+                .onSubscription { drainGeofenceCrossings() }
+                .collect { event ->
+                    if (event is TrackerEvent.GeofenceEntered || event is TrackerEvent.GeofenceExited) {
+                        drainGeofenceCrossings()
+                    }
+                }
+        }
+    }
+
+    /** Reads the SDK's crossing history and notifies whatever this app has not seen yet. */
+    private fun drainGeofenceCrossings() {
+        val crossings = runCatching { tracker.getGeofenceEvents(limit = GEOFENCE_SCAN_LIMIT) }
+            .getOrElse {
+                Log.w(TRACKER_TAG, "geofence history unreadable", it)
+                return
+            }
+
+        geofenceAlerts.record(crossings, System.currentTimeMillis()).forEach { alert ->
+            Log.i(TRACKER_TAG, "geofence ${alert.transition} ${alert.geofenceId} at ${alert.crossedAtMs}")
+            if (isNotifiable(alert)) geofenceNotifier.post(alert)
+        }
+    }
+
+    /**
+     * Whether a crossing is worth interrupting the user for.
+     *
+     * **Every crossing is recorded; only some are notified**, and the one exclusion is the
+     * SDK's own stationary wake fence. That fence is battery plumbing, not a place: the
+     * motion layer drops it around the device every time it stops and tears it down again
+     * when it moves, so a normal drive through traffic crosses it repeatedly. Notifying on
+     * it would bury the fences a host actually registered under a notification per traffic
+     * light, and the crossing is still in the log, in the card and in the capture log for
+     * anyone diagnosing the motion layer itself.
+     *
+     * Compared against the configured id rather than a constant, because
+     * `MotionConfig.stationaryGeofenceId` is a host setting and this app's config console
+     * can change it mid-run.
+     */
+    private fun isNotifiable(alert: GeofenceAlert): Boolean =
+        alert.geofenceId != defaultConfig.motion.stationaryGeofenceId
+
+    /** Clears the notified-crossing record and pulls down anything still in the shade. */
+    fun clearGeofenceAlerts() {
+        geofenceNotifier.cancelAll()
+        geofenceAlerts.clear()
+    }
+
+    /**
      * Road snapping, if `OSRM_BASE_URL` is set in `local.properties`.
      *
      * Blank is the default and a perfectly good configuration: no provider is installed,
@@ -480,6 +565,17 @@ class SampleApplication : Application() {
 
         /** Layer 3: every judged fix in point form, accepted or not. */
         const val PERSIST_RAW_POINTS: Boolean = true
+
+        /**
+         * How far back a crossing scan reads the SDK's geofence history.
+         *
+         * It only has to cover what could have accumulated while this app was not
+         * subscribed — a process death across a drive through several fences, not the whole
+         * store. Reading more costs a bigger decode on every crossing; reading fewer than
+         * the crossings that piled up during an outage would drop the oldest of them,
+         * because the high-water mark advances past everything the scan returned.
+         */
+        const val GEOFENCE_SCAN_LIMIT: Int = 50
     }
 }
 
