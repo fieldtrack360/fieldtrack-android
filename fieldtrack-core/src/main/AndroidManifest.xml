@@ -42,6 +42,22 @@
             </intent-filter>
         </receiver>
 
+        <!--
+          The one revival path that is not a WorkManager job. See ServiceHeartbeat: on a
+          MIUI/HyperOS device left at the default "Restricted" battery setting, JobScheduler
+          does not run the backstop or the restore worker at all (EC-22), and AlarmManager
+          is the independent subsystem that still delivers.
+
+          No SCHEDULE_EXACT_ALARM is declared with it, deliberately and for the same reason
+          REQUEST_IGNORE_BATTERY_OPTIMIZATIONS is not (EC-15): it is Play-policy reviewed,
+          and an SDK must not make that submission decision for its host. The alarm is
+          inexact unless the HOST declares the permission itself, which ServiceHeartbeat
+          detects at runtime.
+        -->
+        <receiver
+            android:name=".service.ServiceHeartbeatReceiver"
+            android:exported="false" />
+
         <receiver
             android:name=".motion.ActivityTransitionReceiver"
             android:exported="false" />

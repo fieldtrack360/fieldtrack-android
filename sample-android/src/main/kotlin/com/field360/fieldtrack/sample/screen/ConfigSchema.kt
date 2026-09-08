@@ -5,6 +5,7 @@ import com.field360.tracker.DesiredAccuracy
 import com.field360.tracker.LocationProviderType
 import com.field360.tracker.TrackerConfig
 import com.field360.tracker.TrackingMode
+import com.field360.tracker.WakeLockPolicy
 import com.field360.tracker.integrity.IntegrityPolicy
 import com.field360.traker.geo.model.MockPolicy
 
@@ -262,7 +263,7 @@ fun configGroups(): List<ConfigGroup> = listOf(
             ),
             longField(
                 "maxUpdateDelayMs",
-                "",
+                "OS batching window; 0 disables batching",
                 { it.geolocation.maxUpdateDelayMs },
                 { c, v -> c.copy(geolocation = c.geolocation.copy(maxUpdateDelayMs = v)) },
             ),
@@ -274,9 +275,15 @@ fun configGroups(): List<ConfigGroup> = listOf(
             ),
             longField(
                 "deliveryStalenessMs",
-                "",
+                "reports late delivery; never drops a fix. 0 = off",
                 { it.geolocation.deliveryStalenessMs },
                 { c, v -> c.copy(geolocation = c.geolocation.copy(deliveryStalenessMs = v)) },
+            ),
+            bool(
+                "waitForAccurateLocation",
+                "off = take the first fix and let the accuracy meter judge it",
+                { it.geolocation.waitForAccurateLocation },
+                { c, v -> c.copy(geolocation = c.geolocation.copy(waitForAccurateLocation = v)) },
             ),
             bool(
                 "adaptiveCadence",
@@ -569,6 +576,12 @@ fun configGroups(): List<ConfigGroup> = listOf(
                 { c, v -> c.copy(service = c.service.copy(backstopIntervalMin = v)) },
             ),
             intField(
+                "serviceHeartbeatMin",
+                "AlarmManager revival, independent of WorkManager. 0 = off",
+                { it.service.serviceHeartbeatMin },
+                { c, v -> c.copy(service = c.service.copy(serviceHeartbeatMin = v)) },
+            ),
+            intField(
                 "deadTrackerMovingMin",
                 "",
                 { it.service.deadTrackerMovingMin },
@@ -582,9 +595,15 @@ fun configGroups(): List<ConfigGroup> = listOf(
             ),
             longField(
                 "wakeLockMs",
-                "",
+                "hold duration; 0 disables the lock whatever the policy",
                 { it.service.wakeLockMs },
                 { c, v -> c.copy(service = c.service.copy(wakeLockMs = v)) },
+            ),
+            choice<WakeLockPolicy>(
+                "wakeLockPolicy",
+                "PER_FIX holds only around a fix; CONTINUOUS is the pre-policy behaviour",
+                { it.service.wakeLockPolicy },
+                { c, v -> c.copy(service = c.service.copy(wakeLockPolicy = v)) },
             ),
             stringField(
                 "notificationTitle",

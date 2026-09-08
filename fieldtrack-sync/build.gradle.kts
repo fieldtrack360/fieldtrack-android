@@ -5,6 +5,8 @@ plugins {
     // AGP 8.x has no built-in Kotlin support — the Kotlin Android plugin must be explicit.
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.serialization)
+    alias(libs.plugins.ksp)
+    alias(libs.plugins.room)
 }
 
 android {
@@ -70,11 +72,31 @@ kotlin {
     }
 }
 
+/**
+ * The log buffer's own schema, exported and versioned exactly like core's.
+ *
+ * A second database rather than a table in core's: the diagnostic channel lives entirely
+ * in this module, and a host that does not depend on `fieldtrack-sync` should not carry a
+ * table it can never write.
+ */
+room {
+    schemaDirectory("$projectDir/schemas")
+}
+
+ksp {
+    arg("room.generateKotlin", "true")
+}
+
 dependencies {
     // Only the public seam from core — never its internals.
     implementation(project(":fieldtrack-core"))
     implementation(libs.androidx.core.ktx)
 
+    // The diagnostic buffer. Durable on purpose: a process the OEM kills mid-drive is the
+    // case these entries exist to explain, and an in-memory buffer loses exactly that.
+    implementation(libs.androidx.room.runtime)
+    implementation(libs.androidx.room.ktx)
+    ksp(libs.androidx.room.compiler)
 
     implementation(libs.androidx.work.runtime.ktx)
     implementation(libs.kotlinx.coroutines.android)
@@ -92,6 +114,9 @@ dependencies {
     testImplementation(libs.okhttp)
     testImplementation(libs.retrofit)
     testImplementation(libs.okhttp.mockwebserver)
+    testImplementation(libs.androidx.room.testing)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.androidx.test.core)
 }
 
 // Publishing — coordinates, POM, sources and javadoc jars. See the script for why it

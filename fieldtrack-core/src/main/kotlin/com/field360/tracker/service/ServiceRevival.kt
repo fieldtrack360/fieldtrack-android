@@ -5,7 +5,6 @@ import android.content.Context
 import com.field360.tracker.TrackerConfig
 import com.field360.tracker.di.TrackerGraph
 import com.field360.tracker.domain.model.TrackerEvent
-import com.field360.tracker.work.RestoreWorker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -26,7 +25,7 @@ import kotlinx.coroutines.launch
  * Called only from those two receivers, and that restriction is load-bearing. Receiving
  * a geofencing or activity-recognition transition is on the API 31+ allowlist for
  * starting a foreground service from the background, so `startForegroundService` is legal
- * on this path and is very nearly the only path where it is. [RestoreWorker] is the
+ * on this path and is very nearly the only path where it is. [ServiceRestorer] is the
  * fallback for the case where the platform disagrees anyway — an OEM with its own rules,
  * or an allowlist window that closed while the disk read below was in flight.
  *
@@ -53,15 +52,21 @@ internal fun BroadcastReceiver.reviveServiceIfNeeded(context: Context) {
             val config = graph.config.load() ?: TrackerConfig()
             if (!config.service.foregroundService) return@launch
 
-            runCatching { TrackingService.start(appContext, config.service) }
-                .onFailure { failure ->
-                    graph.events.tryEmit(
-                        TrackerEvent.Diagnostic(
-                            "wake revival refused (${failure.message}); falling back to RestoreWorker",
-                        ),
-                    )
-                    RestoreWorker.enqueueExpedited(appContext)
-                }
+            // A geofence or activity-transition wake is on the API 31+ allowlist for
+            // starting a foreground service from the background, so this path has a real
+            // chance where most do not — and a fresh budget of fast retries is warranted
+            // for the same reason. Cleared before the attempt, so a refusal below is
+            // counted as this wake's first rather than inheriting an earlier streak.
+            ServiceRestorer.reset()
+
+            if (!TrackingService.start(appContext, config.service)) {
+                graph.events.tryEmit(
+                    TrackerEvent.Diagnostic(
+                        "wake revival refused; falling back to the counted restore path",
+                    ),
+                )
+                ServiceRestorer.request(appContext)
+            }
         } finally {
             pendingResult.finish()
         }

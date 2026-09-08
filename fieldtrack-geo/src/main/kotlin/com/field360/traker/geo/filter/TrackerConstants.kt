@@ -59,7 +59,23 @@ public data class TrackerConstants(
     /** Point-to-point speed above this overrides a stationary hardware reading. */
     val speedGpsTrust: Float = 1.5f,
     val speedVirtuallyStopped: Float = 2.0f,
-    val speedMaxPhysicalKmph: Float = 140f,
+    /**
+     * Point-to-point speed above which the leg is not physically possible and the fix is
+     * dropped as `ImpossibleSpeed` (stage 3).
+     *
+     * Raised from 140, which was not a bound on what a vehicle does — it was a bound on
+     * what a vehicle does *plus no measurement error*. A car at 110-120 km/h already sits
+     * within 20 km/h of the old ceiling, so one multipath spike on one fix computes over it
+     * and the point is lost. Lost at speed, specifically, which is where the samples are
+     * furthest apart and each one carries the most geometry.
+     *
+     * 200 km/h still catches what this gate is for: a Wi-Fi centroid teleport and a
+     * cross-city jump both compute in the thousands. Nothing between 140 and 200 is a
+     * teleport, and the leg is judged twice more afterwards with the filter's own
+     * prediction behind it — the 3-sigma gate, and [vehicularLegSpeedCap] at 45 m/s in
+     * stage 6 — so this ceiling was never the only thing between a jump and the polyline.
+     */
+    val speedMaxPhysicalKmph: Float = 200f,
     val speedHighwayKmph: Float = 45f,
 
     // ── distances, metres ─────────────────────────────────────────────────────

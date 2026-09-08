@@ -178,6 +178,15 @@ internal class RoutingLocationSource(
     override fun isAvailable(): Boolean = sourceFor(selected).isAvailable()
 
     /**
+     * Routed on [selected], not on a config, because the caller tearing a stream down has
+     * no config in hand — and the registration being flushed belongs to whichever source
+     * opened it, which is the one [selected] names.
+     */
+    override suspend fun flush() {
+        sourceFor(selected).flush()
+    }
+
+    /**
      * Config wins where a config is in hand; [selected] is the fallback for the one call
      * that has none. The two can only disagree between a host editing its config and the
      * next `start()`, and preferring the config there is what makes a provider change take

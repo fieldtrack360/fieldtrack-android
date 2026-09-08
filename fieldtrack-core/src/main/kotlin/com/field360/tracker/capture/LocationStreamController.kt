@@ -11,7 +11,11 @@ import com.field360.traker.geo.port.TrackLogger
 import com.field360.tracker.motion.CaptureStream
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Owns the location stream's lifetime and its cadence.
@@ -346,8 +350,37 @@ internal class LocationStreamController(
         val active = config ?: return
         // The single choke point every cadence path funnels through — see [suspended].
         if (suspended) return
-        job?.cancel()
+
+        val outgoing = job
         job = scope.launch {
+            // ── Drain the outgoing registration before tearing it down ───────
+            // `removeLocationUpdates` makes no promise about fixes the OS is still
+            // batching, and this SDK asks for a window of one to two sampling intervals —
+            // so a cadence flip silently discarded up to 30 s of fixes the chip had
+            // already taken. Every flip happens while driving (the vehicular tier dropped
+            // and restored at each stop, the turn burst armed and expired at each corner)
+            // and none happen to a parked phone, which is why the loss read in the field
+            // as "it captures fine until I start moving".
+            //
+            // Ordering is the whole mechanism. The flushed batch is delivered through the
+            // callback the OUTGOING collector still owns, so the flush has to complete
+            // while that collector is alive — after `awaitClose` has run there is no
+            // channel left to receive it. `cancelAndJoin` then guarantees the old request
+            // is gone before the new one is registered, so the two never overlap and no
+            // fix is ingested twice.
+            //
+            // `NonCancellable`, because this teardown is not optional: a second flip
+            // arriving mid-flush cancels this coroutine, and a cancellation that skipped
+            // the join would leak the old registration and leave two streams running for
+            // the rest of the session. Bounded by [FLUSH_TIMEOUT_MS] so a provider that
+            // never completes its flush cannot wedge the restart it is blocking.
+            if (outgoing != null) {
+                withContext(NonCancellable) {
+                    withTimeoutOrNull(FLUSH_TIMEOUT_MS) { runCatching { locationSource.flush() } }
+                    outgoing.cancelAndJoin()
+                }
+            }
+
             // The tier is stamped per fix, at capture: this collector knows exactly
             // which request produced its fixes. Sampling the controller at consume time
             // instead would mislabel queued fixes across a flip and stamp one-shot and
@@ -366,5 +399,12 @@ internal class LocationStreamController(
 
     private companion object {
         const val TAG = "StreamController"
+
+        /**
+         * Ceiling on the pre-teardown flush. Long enough for a provider to hand over a
+         * batch it is already holding, short enough that a provider which never answers
+         * delays one cadence flip rather than stalling capture behind it.
+         */
+        const val FLUSH_TIMEOUT_MS = 2_000L
     }
 }

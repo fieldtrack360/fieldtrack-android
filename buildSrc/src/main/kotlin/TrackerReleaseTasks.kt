@@ -99,6 +99,25 @@ abstract class VerifyReleaseObfuscationTask : DefaultTask() {
             ReleaseArtifact(
                 "sync",
                 listOf(
+                    // The diagnostic channel (docs/APP-LOG-API.md). Listed for the same
+                    // reason the Sync* names are: these are reachable from a kept
+                    // TrackerSync member, and reachable is not kept — R8 shortened them to
+                    // a.class … g.class in the API package until proguard-rules.pro pinned
+                    // them. A host cannot name a renamed class, so this is API loss that
+                    // compiles and only fails at the far end.
+                    "com/field360/traker/sync/LogSyncConfig.class",
+                    "com/field360/traker/sync/LogSyncConfig\$Builder.class",
+                    "com/field360/traker/sync/LogSyncConfig\$Companion.class",
+                    "com/field360/traker/sync/LogSyncQueue.class",
+                    "com/field360/traker/sync/LogSyncQueue\$Result.class",
+                    "com/field360/traker/sync/LogRecord.class",
+                    "com/field360/traker/sync/LogLevel.class",
+                    "com/field360/traker/sync/LogType.class",
+                    "com/field360/traker/sync/LifecyclePhase.class",
+                    "com/field360/traker/sync/LogPayload.class",
+                    "com/field360/traker/sync/LogPayload\$Companion.class",
+                    "com/field360/traker/sync/LogEntryDto.class",
+                    "com/field360/traker/sync/LogEntryDto\$Companion.class",
                     "com/field360/traker/sync/OkHttpSyncTransport.class",
                     "com/field360/traker/sync/OkHttpSyncTransport\$Companion.class",
                     "com/field360/traker/sync/SyncConfig.class",

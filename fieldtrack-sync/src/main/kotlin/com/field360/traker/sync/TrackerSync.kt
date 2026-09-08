@@ -2,13 +2,17 @@ package com.field360.traker.sync
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.os.Build
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
+import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequest
 import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.PeriodicWorkRequest
+import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.field360.tracker.Tracker
@@ -19,10 +23,18 @@ import com.field360.traker.sync.internal.MAX_PARAM_DEPTH
 import com.field360.traker.sync.internal.NetworkMonitor
 import com.field360.traker.sync.internal.NoOpTransport
 import com.field360.traker.sync.internal.SyncService
+import com.field360.traker.sync.data.db.LogDao
+import com.field360.traker.sync.data.db.LogDatabase
 import com.field360.traker.sync.internal.jsonParamOrNull
+import com.field360.traker.sync.internal.newLogRecorder
+import com.field360.traker.sync.internal.newLogSyncQueue
 import java.net.URI
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -363,11 +375,24 @@ public data class SyncConfig(
 public class TrackerSync internal constructor(
     private val context: Context,
     private val queue: SyncQueue,
+    private val logQueue: LogSyncQueue,
+    private val logRecorder: LogRecorder,
+    private val logStore: LogDao,
     private val trackIt: Tracker,
     private val logger: TrackLogger,
     private val artifacts: TrackerArtifacts,
     private val eventSink: MutableSharedFlow<SyncEvent>,
+    private val logEventSink: MutableSharedFlow<SyncEvent>,
 ) {
+
+    /**
+     * For the two fire-and-forget writes this class owns — the decision opt-in reset.
+     *
+     * Deliberately not the caller's scope: `configureLogs` is called from
+     * `Application.onCreate` as often as not, and a database write parked on that thread's
+     * lifetime is a write that does not finish.
+     */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @Volatile
     private var config: SyncConfig? = null
@@ -381,6 +406,23 @@ public class TrackerSync internal constructor(
      */
     @Volatile
     private var haltedReason: String? = null
+
+    @Volatile
+    private var logConfig: LogSyncConfig? = null
+
+    @Volatile
+    private var logTransport: SyncTransport? = null
+
+    /**
+     * The status code that stopped log shipping, or `null`.
+     *
+     * Separate from [haltedReason] and unable to reach it. A credential problem on the
+     * diagnostics endpoint stops diagnostics; it does not stop tracking, does not clear the
+     * point queue, and does not un-configure the points uploader
+     * (SYNC-BACKEND-AND-DASHBOARD.md §11.2).
+     */
+    @Volatile
+    private var logsRejectedWith: Int? = null
 
     /**
      * The prompt half of "upload when the network comes back" — see [NetworkMonitor] for
@@ -511,6 +553,214 @@ public class TrackerSync internal constructor(
         SyncWorker.enqueueNow(context, activeConfig.requiresUnmeteredNetwork)
     }
 
+
+    // ── the log channel ────────────────────────────────────────────────
+
+    /**
+     * What the **log** endpoint said, one event per exchange.
+     *
+     * A second flow rather than a second case on [SyncEvent], for two reasons. Adding a
+     * member to a public sealed interface breaks every exhaustive `when` a host has already
+     * written; and a diagnostics upload failing is a different thing from a positions
+     * upload failing, which a host showing one "last sync" badge should not be forced to
+     * conflate.
+     */
+    public val logEvents: SharedFlow<SyncEvent> = logEventSink.asSharedFlow()
+
+    /** Where diagnostics are going, or `null` if [configureLogs] has not been called. */
+    public val logEndpoint: String? get() = logConfig?.url
+
+    public val isLogSyncConfigured: Boolean get() = logEndpoint != null
+
+    /**
+     * Turns the diagnostic channel on (`docs/APP-LOG-API.md`).
+     *
+     * **Follows the points endpoint.** Called with no argument it derives the URL from the
+     * origin of the [SyncConfig] already in force plus [LogSyncConfig.DEFAULT_PATH],
+     * inherits `device_id` from `SyncConfig.extraParams`, and reuses the points headers,
+     * so the ordinary integration is two lines:
+     *
+     * ```kotlin
+     * sync.configure(SyncConfig.builder().url(".../v1/location/batch").header(name, token)
+     *     .extraParam("device_id", installId).build())
+     * sync.configureLogs()
+     * ```
+     *
+     * Override any of it with a [LogSyncConfig]. Giving this endpoint its **own** credential
+     * is worth the extra line: a 401 on the points URL is destructive by design, and keeping
+     * the two scopes apart is what stops a diagnostics token being able to reach it.
+     *
+     * Independent of [configure] in both directions: either can be set without the other,
+     * and neither can tear the other down.
+     *
+     * @throws IllegalArgumentException if the resolved config does not pass
+     *   [LogSyncConfig.validate]. Resolution happens first, so a blank URL or device id is
+     *   reported only when nothing could complete it.
+     */
+    @JvmOverloads
+    public fun configureLogs(
+        config: LogSyncConfig = LogSyncConfig(),
+        transport: SyncTransport? = null,
+    ) {
+        val resolved = config.resolvedAgainst(this.config, artifacts.baseUrl)
+        val errors = resolved.validate()
+        require(errors.isEmpty()) { "Invalid LogSyncConfig: ${errors.joinToString("; ")}" }
+
+        val first = logConfig == null
+        val startedShippingDecisions = resolved.shipsDecisions && logConfig?.shipsDecisions != true
+
+        logConfig = resolved
+        logTransport = transport ?: this.transport ?: defaultTransport()
+        logsRejectedWith = null
+        // The prompt half of this channel: a WARN or worse asks for a drain rather than
+        // waiting out the heartbeat. Throttled inside the recorder.
+        logRecorder.configure(resolved) { requestLogSync() }
+
+        // The opt-in reset. The SDK writes its decision log whether or not anyone ships it,
+        // so without this the first drain after turning decisions on would upload days of
+        // history: tens of thousands of entries about drives nobody asked to diagnose.
+        if (first || startedShippingDecisions) {
+            scope.launch { runCatching { logQueue.skipExistingDecisions() } }
+        }
+
+        LogSyncWorker.cancel(context)
+        if (resolved.autoSync) {
+            LogSyncWorker.enqueuePeriodic(
+                context = context,
+                requiresUnmetered = resolved.requiresUnmeteredNetwork,
+                intervalMinutes = resolved.uploadIntervalMinutes,
+            )
+        }
+    }
+
+    /**
+     * Stops recording and shipping diagnostics. The buffer is **kept**: entries written
+     * before a host turned the channel off still describe the period they were written in.
+     */
+    public fun disableLogSync() {
+        logConfig = null
+        logTransport = null
+        logRecorder.stop()
+        LogSyncWorker.cancel(context)
+    }
+
+    /**
+     * Records one host line into the diagnostic buffer.
+     *
+     * Fire and forget, and a no-op until [configureLogs] has been called and unless the
+     * level and type pass its filters. Filtering happens here, not at upload time, so a
+     * host that never ships `DEBUG` never stores it either.
+     *
+     * Nothing written here reaches logcat. This is the durable channel: what a process the
+     * OEM killed mid-drive left behind for the next upload, which is the case a live log
+     * cannot cover by definition.
+     *
+     * @param data JSON, an object or an array, as text, or `null`. Anything else is dropped
+     *   rather than sent, because the server's column is structured and one malformed value
+     *   would spoil a batch carrying thirty useful entries.
+     */
+    @JvmOverloads
+    public fun log(
+        level: LogLevel,
+        tag: String,
+        message: String,
+        code: String? = null,
+        data: String? = null,
+    ) {
+        logRecorder.record(level, LogType.MESSAGE, tag, message, code, data)
+    }
+
+    /**
+     * Records a session or service boundary, the entries the points endpoint has no way to
+     * send.
+     *
+     * The SDK records its own boundaries already; this is for a host that has more of them,
+     * such as a shift starting or a job being accepted.
+     *
+     * @param phase one of [LifecyclePhase], or a value of your own.
+     */
+    @JvmOverloads
+    public fun logLifecycle(phase: String, tag: String = "Host") {
+        logRecorder.lifecycle(phase, tag)
+    }
+
+    /**
+     * The diagnostic buffer, newest first: the local view of what is waiting to ship.
+     *
+     * @param sessionId `null` for every session, including the entries that belong to no
+     *   session at all.
+     */
+    @JvmOverloads
+    public suspend fun getLogs(
+        sessionId: String? = null,
+        limit: Int = DEFAULT_LOG_LIMIT,
+        offset: Int = 0,
+    ): List<LogRecord> = logStore.query(sessionId, limit, offset).map { row ->
+        LogRecord(
+            id = row.uid,
+            sessionId = row.sessionId,
+            seq = row.seq,
+            timeMs = row.timeMs,
+            elapsedRealtimeNanos = row.elapsedRealtimeNanos,
+            level = LogLevel.entries.firstOrNull { it.name == row.level } ?: LogLevel.INFO,
+            type = LogType.entries.firstOrNull { it.name == row.type } ?: LogType.MESSAGE,
+            tag = row.tag,
+            code = row.code,
+            message = row.message,
+            data = row.data,
+        )
+    }
+
+    /** Entries waiting to ship. Converted decisions are not counted: they are not stored. */
+    public suspend fun pendingLogCount(): Int = logQueue.pendingCount()
+
+    /**
+     * Ships diagnostics inline. Returns what happened so a host can surface it.
+     *
+     * Runs in the caller's scope. Prefer [requestLogSync] for anything not user-initiated:
+     * diagnostics are not live telemetry and the periodic drain is the intended path.
+     */
+    public suspend fun syncLogsNow(): LogSyncQueue.Result {
+        val active = logConfig
+            ?: return LogSyncQueue.Result.Retry(LogSyncQueue.REASON_NOT_CONFIGURED)
+        val activeTransport = logTransport
+            ?: return LogSyncQueue.Result.Retry(LogSyncQueue.REASON_NO_TRANSPORT)
+        logsRejectedWith?.let { return LogSyncQueue.Result.Rejected(it) }
+
+        val result = logQueue.drain(active, activeTransport)
+        when (result) {
+            is LogSyncQueue.Result.Rejected -> {
+                // Stop the loop; keep everything. Nothing here reaches the point queue.
+                logsRejectedWith = result.statusCode
+                logConfig = null
+                logTransport = null
+                logRecorder.stop()
+                LogSyncWorker.cancel(context)
+            }
+
+            is LogSyncQueue.Result.Shipped ->
+                // Retention is enforced on the way out rather than on a timer: an entry is
+                // only safe to forget once it has actually left the device.
+                runCatching { logQueue.prune(active.retentionHours * MILLIS_PER_HOUR) }
+
+            else -> Unit
+        }
+        return result
+    }
+
+    /** Enqueues a network-constrained one-shot log drain; safe to call often. */
+    public fun requestLogSync() {
+        val active = logConfig ?: return
+        if (logsRejectedWith != null) return
+        LogSyncWorker.enqueue(context, active.requiresUnmeteredNetwork)
+    }
+
+    /** The `Retry-After` path, mirroring [rescheduleAfter] on the points channel. */
+    internal fun rescheduleLogsAfter(delayMs: Long) {
+        val unmetered = logConfig?.requiresUnmeteredNetwork == true
+        LogSyncWorker.enqueueAfter(context, unmetered, delayMs)
+    }
+
     /**
      * Drains inline. Returns what happened so a host can surface it.
      *
@@ -633,19 +883,102 @@ public class TrackerSync internal constructor(
                 extraBufferCapacity = EVENT_BUFFER,
                 onBufferOverflow = BufferOverflow.DROP_OLDEST,
             )
+            // Built eagerly rather than lazily: `configureLogs` is commonly called from
+            // Application.onCreate, and a Room builder is cheap until the first query
+            // opens the file. Nothing here touches the disk yet.
+            val logDao: LogDao = LogDatabase.build(app).logs()
+            val logScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            // Both built through `internal.LogWiring` rather than inline. The lambdas they
+            // close over compile to classes in whichever file writes them, and a synthetic
+            // class written here lands — renamed but un-repackageable — in the published
+            // API package. See that file.
+            val recorder = newLogRecorder(
+                dao = logDao,
+                clock = access.clock,
+                scope = logScope,
+                logger = access.logger,
+                tracker = access.trackIt,
+                events = access.trackIt.events,
+            )
+
+            val logSink = MutableSharedFlow<SyncEvent>(
+                replay = 1,
+                extraBufferCapacity = EVENT_BUFFER,
+                onBufferOverflow = BufferOverflow.DROP_OLDEST,
+            )
+            val logQueue = newLogSyncQueue(
+                dao = logDao,
+                recorder = recorder,
+                tracker = access.trackIt,
+                clock = access.clock,
+                logger = access.logger,
+                appInfo = appInfoOf(app),
+                deviceInfo = deviceInfoOf(),
+                onEvent = { logSink.tryEmit(it) },
+            )
+
             return TrackerSync(
                 context = app,
                 queue = SyncQueue(access.pendingUploads, access.clock, access.logger) {
                     sink.tryEmit(it)
                 },
+                logQueue = logQueue,
+                logRecorder = recorder,
+                logStore = logDao,
                 trackIt = access.trackIt,
                 logger = access.logger,
                 artifacts = access,
                 eventSink = sink,
+                logEventSink = logSink,
             )
         }
 
+        /**
+         * Read once, at construction. `PackageManager` is not free and the answer cannot
+         * change while the process lives — an app update restarts it.
+         */
+        private fun appInfoOf(app: Context): LogAppInfo {
+            val fallback = LogAppInfo(
+                `package` = app.packageName,
+                version = "unknown",
+                build = 0,
+                sdk = SDK_VERSION,
+            )
+            return runCatching {
+                val info = app.packageManager.getPackageInfo(app.packageName, 0)
+                LogAppInfo(
+                    `package` = app.packageName,
+                    version = info.versionName ?: "unknown",
+                    build = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                        info.longVersionCode
+                    } else {
+                        @Suppress("DEPRECATION")
+                        info.versionCode.toLong()
+                    },
+                    sdk = SDK_VERSION,
+                )
+            }.getOrDefault(fallback)
+        }
+
+        private fun deviceInfoOf(): LogDeviceInfo = LogDeviceInfo(
+            manufacturer = Build.MANUFACTURER,
+            model = Build.MODEL,
+            os = Build.VERSION.SDK_INT,
+        )
+
         private const val EVENT_BUFFER = 32
+        private const val MILLIS_PER_HOUR = 3_600_000L
+        private const val DEFAULT_LOG_LIMIT = 200
+
+        /**
+         * Reported to the backend as `app.sdk`, so a fleet mid-rollout is readable.
+         *
+         * Guarded because `BuildConfig` is generated: a consumer that somehow resolves an
+         * older core artifact without the field should ship logs saying "unknown" rather
+         * than not ship them.
+         */
+        private val SDK_VERSION: String =
+            runCatching { com.field360.tracker.BuildConfig.SDK_VERSION }.getOrDefault("unknown")
     }
 }
 
@@ -772,5 +1105,126 @@ internal class SyncWorker(
         }
 
         private const val BACKOFF_SECONDS = 30L
+    }
+}
+
+/**
+ * Ships the diagnostic buffer (SYNC-BACKEND-AND-DASHBOARD.md §11).
+ *
+ * Periodic rather than event-driven, unlike [SyncWorker]. Positions are shipped as soon as
+ * there is a network because a position is worth money to somebody watching a map;
+ * diagnostics are read after the fact, by a human with a ticket open, and waking the radio
+ * for each one would spend the battery this SDK exists to defend. Fifteen minutes is
+ * WorkManager's floor and is also, for this payload, plenty.
+ *
+ * A one-shot path exists for [TrackerSync.requestLogSync] and for a server-sent
+ * `Retry-After`, and runs under its own unique name so it can never cancel the heartbeat.
+ */
+internal class LogSyncWorker(
+    context: Context,
+    params: WorkerParameters,
+) : CoroutineWorker(context, params) {
+
+    override suspend fun doWork(): Result {
+        val sync = TrackerSync.getInstance(applicationContext)
+
+        // Nothing is listening. Reported as done rather than retried, for the same reason
+        // SyncWorker does: a retry parks this unique work in ENQUEUED where every later
+        // request under KEEP is silently dropped.
+        if (!sync.isLogSyncConfigured) return Result.success()
+
+        return when (val result = sync.syncLogsNow()) {
+            is LogSyncQueue.Result.Shipped, LogSyncQueue.Result.Empty -> Result.success()
+            // Terminal for this channel; the halt already happened in syncLogsNow().
+            is LogSyncQueue.Result.Rejected -> Result.failure()
+            is LogSyncQueue.Result.Retry -> reschedule(sync, result)
+        }
+    }
+
+    private fun reschedule(sync: TrackerSync, result: LogSyncQueue.Result.Retry): Result {
+        if (result.reason in NOT_A_FAILURE) return Result.success()
+
+        val delayMs = result.retryAfterMs ?: return Result.retry()
+        sync.rescheduleLogsAfter(delayMs)
+        return Result.success()
+    }
+
+    companion object {
+        /** The heartbeat. Cancelled and re-enqueued by `configureLogs`. */
+        const val PERIODIC_NAME = "fieldtrack-log-sync-periodic"
+
+        /** One-shots — a host asking, or a server's own `Retry-After`. */
+        const val NAME = "fieldtrack-log-sync"
+
+        /**
+         * Reasons that describe this worker's own situation rather than a failed exchange.
+         * None is worth a backoff attempt.
+         */
+        private val NOT_A_FAILURE = setOf(
+            LogSyncQueue.REASON_ALREADY_DRAINING,
+            LogSyncQueue.REASON_NOT_CONFIGURED,
+            LogSyncQueue.REASON_NO_TRANSPORT,
+        )
+
+        fun enqueuePeriodic(context: Context, requiresUnmetered: Boolean, intervalMinutes: Long) {
+            val request = PeriodicWorkRequestBuilder<LogSyncWorker>(
+                intervalMinutes.coerceAtLeast(MIN_INTERVAL_MINUTES),
+                TimeUnit.MINUTES,
+            )
+                .setConstraints(constraintsFor(requiresUnmetered))
+                .setBackoffCriteria(BackoffPolicy.LINEAR, BACKOFF_SECONDS, TimeUnit.SECONDS)
+                .build()
+
+            WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+                PERIODIC_NAME,
+                // UPDATE, not KEEP: a host changing its interval or its network constraint
+                // and getting the previous one silently is the bug this policy exists for.
+                ExistingPeriodicWorkPolicy.UPDATE,
+                request,
+            )
+        }
+
+        fun enqueue(context: Context, requiresUnmetered: Boolean) {
+            WorkManager.getInstance(context)
+                .enqueueUniqueWork(NAME, ExistingWorkPolicy.KEEP, oneShot(requiresUnmetered))
+        }
+
+        /** The `Retry-After` path — REPLACE, so the server's schedule wins. */
+        fun enqueueAfter(context: Context, requiresUnmetered: Boolean, delayMs: Long) {
+            val request = oneShot(requiresUnmetered) {
+                setInitialDelay(delayMs, TimeUnit.MILLISECONDS)
+            }
+            WorkManager.getInstance(context)
+                .enqueueUniqueWork(NAME, ExistingWorkPolicy.REPLACE, request)
+        }
+
+        /**
+         * Both names, because `disableLogSync` means stop — and a one-shot already sitting
+         * in backoff would otherwise fire once more against a channel the host turned off.
+         */
+        fun cancel(context: Context) {
+            val manager = WorkManager.getInstance(context)
+            manager.cancelUniqueWork(PERIODIC_NAME)
+            manager.cancelUniqueWork(NAME)
+        }
+
+        private fun oneShot(
+            requiresUnmetered: Boolean,
+            extras: OneTimeWorkRequest.Builder.() -> Unit = {},
+        ): OneTimeWorkRequest = OneTimeWorkRequestBuilder<LogSyncWorker>()
+            .setConstraints(constraintsFor(requiresUnmetered))
+            .setBackoffCriteria(BackoffPolicy.LINEAR, BACKOFF_SECONDS, TimeUnit.SECONDS)
+            .apply(extras)
+            .build()
+
+        private fun constraintsFor(requiresUnmetered: Boolean): Constraints =
+            Constraints.Builder()
+                .setRequiredNetworkType(
+                    if (requiresUnmetered) NetworkType.UNMETERED else NetworkType.CONNECTED,
+                )
+                .build()
+
+        private const val BACKOFF_SECONDS = 60L
+        private const val MIN_INTERVAL_MINUTES = LogSyncConfig.MIN_INTERVAL_MINUTES
     }
 }

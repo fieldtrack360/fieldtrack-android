@@ -31,6 +31,8 @@ import com.field360.tracker.motion.StepCorroborator
 import com.field360.tracker.motion.StillnessMonitor
 import com.field360.tracker.permission.PermissionManager
 import com.field360.tracker.permission.ProviderStateMonitor
+import com.field360.tracker.service.ServiceHeartbeat
+import com.field360.tracker.service.ServiceRestorer
 import com.field360.tracker.service.TrackingService
 import com.field360.tracker.work.BackstopWorker
 import com.field360.tracker.work.RestoreWorker
@@ -275,6 +277,14 @@ internal class SessionTeardown(
         // tick — up to `healthLoopMs` later — noticed there was nothing to supervise.
         BackstopWorker.cancel(context)
         RestoreWorker.cancel(context)
+
+        // The alarm chain and the retry budget come down with them, and for the same
+        // reason: both exist to put a service back for an open session, and there is about
+        // to be no open session. An alarm left armed would wake the device every fifteen
+        // minutes for the rest of the install to discover that; a stale attempt count would
+        // hand the *next* session's first refusal a delay it did not earn.
+        ServiceHeartbeat.cancel(context)
+        ServiceRestorer.reset()
 
         // Closed BEFORE the service is told to stop, which is the reverse of the original
         // order and the reason a stopped session could come back. Every resurrection path

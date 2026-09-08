@@ -7,7 +7,6 @@ import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.lifecycle.LifecycleService
@@ -16,13 +15,13 @@ import com.field360.tracker.ServiceConfig
 import com.field360.tracker.TrackerConfig
 import com.field360.tracker.sdkLog
 import com.field360.tracker.capture.OneShotProvider
+import com.field360.tracker.data.platform.WakeLockController
 import com.field360.tracker.di.TrackerGraph
 import com.field360.tracker.domain.model.ErrorCode
 import com.field360.tracker.domain.model.TrackerEvent
 import com.field360.tracker.domain.repository.ConfigRepository
 import com.field360.traker.geo.port.TrackLogger
 import com.field360.tracker.motion.MotionController
-import com.field360.tracker.work.RestoreWorker
 import com.field360.tracker.work.UploadQueueStats
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -85,13 +84,15 @@ public class TrackingService : LifecycleService() {
     private var postedStatusLine: String? = null
 
     /**
-     * The partial wake lock, or null when [ServiceConfig.wakeLockMs] is 0 or the platform
-     * refused to hand one out.
+     * The `PARTIAL_WAKE_LOCK` and the policy governing it, owned by the graph rather than
+     * by this service.
+     *
+     * It has to be reachable from the ingest path — [com.field360.tracker.WakeLockPolicy.PER_FIX]
+     * takes the lock when a fix is delivered, and that happens in `FixIngestor`, not here.
+     * The service still owns its *lifecycle*: it configures the policy per start command
+     * and releases on teardown.
      */
-    private var wakeLock: PowerManager.WakeLock? = null
-
-    /** Re-arms [wakeLock] before its timeout expires — see [startWakeLockRenewal]. */
-    private var wakeLockJob: Job? = null
+    private val wakeLocks: WakeLockController get() = graph.wakeLocks
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
@@ -153,12 +154,11 @@ public class TrackingService : LifecycleService() {
             // which is every ordinary start command.
             graph.resumeCapture()
 
-            // Held for the life of the service, not per fix. A location-typed foreground
-            // service does not keep the CPU awake, so on an OEM that sleeps aggressively
-            // the ingest coroutine, the motion tick and the health loop all stall between
-            // fixes — `wakeLockMs` existed to prevent exactly that and was read by
-            // nothing. Zero disables it.
-            startWakeLockRenewal(config.service)
+            // Per start command, so a reconfigure between sessions takes effect without a
+            // process restart. The policy decides how much CPU time this actually buys —
+            // see `WakeLockController`, which is where the hold lives now that PER_FIX
+            // needs it reachable from the ingest path rather than only from here.
+            wakeLocks.configure(config.service, lifecycleScope)
 
             // The one case [promoteToForeground] cannot get right on its own: after the
             // process was killed and the sticky restart brought this service back, the
@@ -261,65 +261,11 @@ public class TrackingService : LifecycleService() {
         }
     }
 
-    /**
-     * Keeps a `PARTIAL_WAKE_LOCK` alive for as long as the service is serving a session.
-     *
-     * **Why a renewal loop rather than one long acquire.** The lock is taken with
-     * [ServiceConfig.wakeLockMs] as its timeout, so a lock leaked by a process that dies
-     * between `onStartCommand` and `onDestroy` releases itself rather than draining the
-     * battery until reboot. A timeout that short then has to be re-armed, and the loop can
-     * only be relied on to run because the lock it renews is what keeps the CPU running —
-     * which is the same reason it is renewed at half the timeout rather than at it.
-     *
-     * **Why this is needed at all.** `foregroundServiceType="location"` keeps the *process*
-     * alive; it does not keep the *CPU* awake. In Doze — and far more aggressively on
-     * OxygenOS and MIUI — the process is frozen between location callbacks, so `delay()` in
-     * the health loop, the motion tick that drives the stop timeout, and the ingest
-     * consumer all stop running on their stated cadence. The host declares the cost by
-     * setting the value; `0` opts out entirely and restores the previous behaviour.
-     */
-    private fun startWakeLockRenewal(config: ServiceConfig) {
-        wakeLockJob?.cancel()
-        if (config.wakeLockMs <= 0L) return
-
-        wakeLockJob = lifecycleScope.launch {
-            while (isActive) {
-                renewWakeLock(config.wakeLockMs)
-                delay(config.wakeLockMs / 2)
-            }
-        }
-    }
-
-    /**
-     * Acquires or re-arms the lock. Never throws: an OEM that refuses `PowerManager`, or a
-     * `WAKE_LOCK` permission stripped by a host's own manifest merge, degrades to the
-     * behaviour that shipped before this existed rather than taking the service down.
-     */
-    private fun renewWakeLock(timeoutMs: Long) {
-        val lock = wakeLock ?: runCatching {
-            getSystemService(PowerManager::class.java)
-                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
-                // Not reference counted, so a re-arm is a re-arm rather than a second
-                // hold that `release()` would then have to be called twice to undo.
-                .apply { setReferenceCounted(false) }
-        }.getOrNull()?.also { wakeLock = it } ?: return
-
-        runCatching { lock.acquire(timeoutMs) }
-    }
-
-    private fun releaseWakeLock() {
-        wakeLockJob?.cancel()
-        wakeLockJob = null
-        val lock = wakeLock ?: return
-        wakeLock = null
-        runCatching { if (lock.isHeld) lock.release() }
-    }
-
     private fun teardown() {
         running = false
         supervision?.cancel()
         supervision = null
-        releaseWakeLock()
+        wakeLocks.release()
         healthLoop.stop()
         // Explicit, and with REMOVE. The platform drops a foreground notification when the
         // service is destroyed, but `teardown` also runs on the ACTION_STOP path *before*
@@ -344,6 +290,10 @@ public class TrackingService : LifecycleService() {
             buildNotification(cachedServiceConfig().also { postedNotification = it }),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
         )
+        // The service is genuinely up, so whatever losing streak got us here is over.
+        // Without this the backoff would carry a previous failure's attempt count into the
+        // next real outage and give it a 4-minute delay it never earned.
+        ServiceRestorer.reset()
         true
     } catch (e: Exception) {
         // Two distinct failures, both real:
@@ -361,11 +311,19 @@ public class TrackingService : LifecycleService() {
         // the very first start command, or a process killed before the first tick at
         // `healthLoopMs`, left the session open with nothing scheduled to bring it back.
         //
-        // Enqueued unconditionally rather than behind a session check. `RestoreWorker`
+        // Through [ServiceRestorer] rather than straight at `RestoreWorker`, because the
+        // direct call was a loop: the worker's only action is to start this service, and
+        // on an app that is not eligible to start a foreground service from the background
+        // — the normal state after an OEM kill on API 31+ — it lands right back here. The
+        // restorer counts the attempts, backs them off, and stands down in favour of the
+        // heartbeat alarm and the backstop rather than spending the expedited quota that
+        // both of those still need.
+        //
+        // Requested unconditionally rather than behind a session check. `RestoreWorker`
         // reads `sessions.current()` at the moment it runs, so a refusal on the way out
         // of a session that has already closed resolves to a no-op there, and
         // `SessionTeardown` cancels the unique work by name regardless.
-        RestoreWorker.enqueueExpedited(applicationContext)
+        ServiceRestorer.request(applicationContext)
         stopSelf()
         false
     }
@@ -463,12 +421,6 @@ public class TrackingService : LifecycleService() {
         internal const val NOTIFICATION_ID = 8_301
 
         /**
-         * Namespaced with the SDK's package, because a wake-lock tag is what `dumpsys
-         * power` and Play Console's excessive-wakelock report attribute the hold to. A
-         * generic tag makes a battery complaint impossible to trace to whoever caused it.
-         */
-        internal const val WAKE_LOCK_TAG = "fieldtrack:tracking"
-        /**
          * Used only when the host named an icon that does not resolve, or named none.
          * The title, text, channel and icon a host DID configure live in [ServiceConfig]
          * and are read from there — duplicating their defaults here is how the two drift.
@@ -478,10 +430,38 @@ public class TrackingService : LifecycleService() {
         public const val ACTION_RESUME: String = "com.field360.tracker.RESUME"
         public const val ACTION_STOP: String = "com.field360.tracker.STOP"
 
-        public fun start(context: Context, config: ServiceConfig) {
-            if (!config.foregroundService) return
+        /**
+         * Issues the start command, and reports whether the platform accepted it.
+         *
+         * **The throw is caught here, not left to each caller.** `startForegroundService`
+         * itself raises `ForegroundServiceStartNotAllowedException` on API 31+ when the app
+         * is not eligible to start one from the background — the refusal does not wait for
+         * [promoteToForeground], because the service is never constructed. Two callers did
+         * not handle that: `RestoreWorker`, where the throw failed the worker outright and
+         * `WorkManager` recorded a `FAILED` job with nothing said about why, and
+         * `BootReceiver`, where it propagated out of a `goAsync` block. Both are exactly
+         * the paths that exist to survive a kill.
+         *
+         * @return false when the start command was refused. Callers that can do something
+         *   about it — retry through [ServiceRestorer], fall through to another layer —
+         *   should; callers on a best-effort path may ignore it.
+         */
+        public fun start(context: Context, config: ServiceConfig): Boolean {
+            if (!config.foregroundService) return false
             val intent = Intent(context, TrackingService::class.java).setAction(ACTION_RESUME)
-            context.startForegroundService(intent)
+            return try {
+                context.startForegroundService(intent)
+                true
+            } catch (e: Exception) {
+                val graph = TrackerGraph.get(context.applicationContext)
+                sdkLog {
+                    graph.logger.w(TAG, "startForegroundService refused: ${e.message}")
+                }
+                graph.events.tryEmit(
+                    TrackerEvent.Error(ErrorCode.FGS_START_REFUSED, e.message.orEmpty()),
+                )
+                false
+            }
         }
 
         /**

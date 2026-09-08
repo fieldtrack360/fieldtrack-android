@@ -28,6 +28,7 @@ import com.field360.tracker.data.platform.AndroidBatteryProbe
 import com.field360.tracker.data.platform.AndroidClock
 import com.field360.tracker.data.platform.BatteryMonitor
 import com.field360.tracker.data.platform.AndroidLogger
+import com.field360.tracker.data.platform.WakeLockController
 import com.field360.tracker.data.repository.ConfigRepositoryImpl
 import com.field360.tracker.data.repository.ConfigStore
 import com.field360.tracker.data.repository.DecisionRepositoryImpl
@@ -174,6 +175,13 @@ internal class TrackerGraph private constructor(
     val logger: TrackLogger by lazy { AndroidLogger() }
 
     /**
+     * The wake lock, held here rather than in `TrackingService` because both ends need it:
+     * the service configures the policy and releases on teardown, and [ingestor] takes the
+     * lock on each delivered fix under `WakeLockPolicy.PER_FIX`.
+     */
+    val wakeLocks: WakeLockController by lazy { WakeLockController(context, logger) }
+
+    /**
      * Every decision constant lives in this one object, which is what makes PLAN.md §3
      * invariant 1 ("no algorithm above fieldtrack-geo") mechanically checkable.
      */
@@ -210,6 +218,7 @@ internal class TrackerGraph private constructor(
 
     /** The one public door fieldtrack-sync uploads through. */
     val pendingUploads: PendingUploadStore by lazy { PendingUploadStoreImpl(pointDao) }
+
 
     /**
      * How deep the upload queue is and when it last drained.
@@ -371,6 +380,7 @@ internal class TrackerGraph private constructor(
             integrityFeed = integrityFeed,
             integrityFlags = { integrityMonitor.flags },
             providerFlags = { providerStateMonitor.snapshotFlags },
+            onFixDelivered = wakeLocks::onFixDelivered,
         )
     }
 
@@ -469,6 +479,8 @@ internal class TrackerGraph private constructor(
             syncScheduler = syncScheduler,
             context = context,
             scope = scope,
+            events = events,
+            logger = logger,
         )
     }
 

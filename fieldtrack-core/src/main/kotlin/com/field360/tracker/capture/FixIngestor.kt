@@ -70,6 +70,16 @@ internal class FixIngestor(
      * and a field read is all it is allowed.
      */
     private val providerFlags: () -> Int = { ProviderSnapshot.NOT_RECORDED },
+    /**
+     * Told that a fix has been delivered, so the CPU can be kept up long enough to judge
+     * it — see `WakeLockController` and `WakeLockPolicy.PER_FIX`.
+     *
+     * A lambda over the controller rather than the controller itself, for the same reason
+     * [integrityFlags] and [providerFlags] are lambdas: this class is on the capture path
+     * and must not gain the ability to reach into a platform service. Defaulted to a no-op
+     * so a test can construct an ingestor without a `PowerManager` behind it.
+     */
+    private val onFixDelivered: () -> Unit = {},
 ) {
 
     /**
@@ -103,6 +113,9 @@ internal class FixIngestor(
     private var turnState = TurnDetector.State()
     private var bursting = false
 
+    /** Monotonic timestamp of the last delivery-lateness report; `0` = none this session. */
+    private var lastDeliveryReportNanos = 0L
+
     /**
      * A heuristic-gate rejection whose fate the *next* fix decides (EC-45e).
      *
@@ -133,6 +146,13 @@ internal class FixIngestor(
     var rawRingCapacity: Int = 5_000
     var persistRawPoints: Boolean = false
     var rawPointCapacity: Int = 20_000
+
+    /**
+     * `GeolocationConfig.deliveryStalenessMs` — the lateness at which a delivered fix is
+     * *reported*, never rejected. `0` switches the report off. See [reportDeliveryLateness].
+     */
+    var deliveryStalenessMs: Long = 0L
+
     var stepsSinceLastPoint: (() -> Int?)? = null
 
     /**
@@ -230,7 +250,55 @@ internal class FixIngestor(
      *   "not a stream fix", never "unknown tier" (SMOOTH-NAV-PLAN Phase 1).
      */
     fun offer(fix: TrackFix, cadenceTierMs: Long? = null) {
+        // Before the send, not after, and on the delivering thread rather than the
+        // consumer's. This runs inside the location callback — the instant the OS itself
+        // woke the CPU to hand the fix over — and the whole point is to hold that window
+        // open long enough for [consume] to run on its own dispatcher. Taking the lock
+        // from the consumer would be taking it after the race it exists to win.
+        onFixDelivered()
         channel.trySend(Queued(fix, cadenceTierMs))
+    }
+
+    /**
+     * How late the OS handed this fix over, measured against the fix's own clock.
+     *
+     * **Reports, never rejects.** Late delivery is the *normal* case with OS batching on —
+     * every member of a batch but the last is late by construction — and dropping them is
+     * the defect this SDK already fixed once, when reading only `LocationResult.lastLocation`
+     * threw away 4-6 fixes per Doze window along with the samples turn geometry needs
+     * (SOURCE-AUDIT A4). A staleness gate would reintroduce that behind a config flag.
+     *
+     * What it answers is the field question that stored points cannot: a gap in a track
+     * looks identical whether the provider stopped producing fixes or produced them and
+     * handed them over a minute later, and the two have different causes and different
+     * fixes. This says which one happened, with the number attached.
+     *
+     * Throttled to one report per [DELIVERY_REPORT_THROTTLE_MS], because the condition it
+     * describes is not a single event — a device that batches hard does it to every fix,
+     * and an unthrottled report would be one diagnostic per fix for the whole session.
+     * `deliveryStalenessMs = 0` switches it off.
+     */
+    private suspend fun reportDeliveryLateness(fix: TrackFix) {
+        val threshold = deliveryStalenessMs
+        if (threshold <= 0L) return
+
+        val latenessMs = (clock.elapsedRealtimeNanos() - fix.elapsedRealtimeNanos) / NANOS_PER_MS
+        // Negative is not an error worth reporting: a fix stamped a hair in the future by a
+        // provider whose clock the SDK does not own is a rounding artefact, not lateness.
+        if (latenessMs < threshold) return
+
+        val nowNanos = clock.elapsedRealtimeNanos()
+        val last = lastDeliveryReportNanos
+        if (last != 0L && (nowNanos - last) / NANOS_PER_MS < DELIVERY_REPORT_THROTTLE_MS) return
+        lastDeliveryReportNanos = nowNanos
+
+        events.emit(
+            TrackerEvent.Diagnostic(
+                "fix delivered ${latenessMs}ms after it was taken (threshold ${threshold}ms); " +
+                    "the provider is producing fixes but the OS is holding them — " +
+                    "lower geolocation.maxUpdateDelayMs to reduce it",
+            ),
+        )
     }
 
     /**
@@ -310,6 +378,7 @@ internal class FixIngestor(
         // delivery is part of that truth — it is exactly what you go looking for when
         // diagnosing this.
         watchdog.onRawFix(fix)
+        reportDeliveryLateness(fix)
         // Before any gate: a mock fix that MockPolicy.REJECT is about to drop is exactly
         // the fix the integrity layer needs to have seen, and a session that stored nothing
         // because every fix was fake must still be able to say so.
@@ -522,5 +591,13 @@ internal class FixIngestor(
     private companion object {
         const val CHANNEL_CAPACITY = 256
         val DATE_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
+        const val NANOS_PER_MS = 1_000_000L
+
+        /**
+         * One delivery-lateness report a minute at most. The condition is a property of the
+         * device's batching, not an event: it applies to every fix in a batch and to every
+         * batch after it, so an unthrottled report is one diagnostic per fix forever.
+         */
+        const val DELIVERY_REPORT_THROTTLE_MS = 60_000L
     }
 }

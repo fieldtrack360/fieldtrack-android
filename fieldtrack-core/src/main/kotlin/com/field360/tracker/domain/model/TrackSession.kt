@@ -185,7 +185,24 @@ public sealed interface TrackerEvent {
     public data class MotionChange(val state: MotionState, val point: TrackPoint?) : TrackerEvent
     public data class ActivityChange(val activity: ActivityType, val confidence: Int) : TrackerEvent
     public data class EnabledChange(val enabled: Boolean) : TrackerEvent
-    public data class ProviderChange(val state: ProviderState) : TrackerEvent
+    /**
+     * Any field of [ProviderState] moved.
+     *
+     * @property state the state now in force.
+     * @property previous the state it replaced, or `null` on the first observation after
+     *   the monitor starts. `null` is not "nothing moved": the initial [ProviderState] is a
+     *   constructor default rather than something the device ever reported, and diffing
+     *   against it would announce a GPS toggle and a permission grant on every launch.
+     *
+     * Carried so a consumer can tell *which* field moved without keeping its own copy. A
+     * GPS provider toggle behind an unchanged master switch emits nothing else — it is not
+     * an outage, so no [LocationServicesChange] — and without this it is indistinguishable
+     * here from a power-save flip.
+     */
+    public data class ProviderChange(
+        val state: ProviderState,
+        val previous: ProviderState? = null,
+    ) : TrackerEvent
     public data class Heartbeat(val atMs: Long) : TrackerEvent
     public data class PowerSaveChange(val enabled: Boolean) : TrackerEvent
 

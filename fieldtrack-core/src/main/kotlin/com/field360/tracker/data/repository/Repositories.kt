@@ -21,6 +21,9 @@ import com.field360.traker.geo.model.Verdict
 import com.field360.traker.geo.port.Clock
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.UUID
 
 internal class TrackPointRepositoryImpl(
@@ -80,9 +83,10 @@ internal class SessionRepositoryImpl(
         // second one being created alongside it (EC-72).
         dao.openSession()?.let { return it.toDomain() }
 
+        val startedAtMs = clock.wallTimeMs()
         val session = TrackSession(
-            id = UUID.randomUUID().toString(),
-            startedAtMs = clock.wallTimeMs(),
+            id = newSessionId(startedAtMs),
+            startedAtMs = startedAtMs,
             startedAtElapsedNanos = clock.elapsedRealtimeNanos(),
             tag = tag,
             configSnapshot = configSnapshot,
@@ -105,6 +109,36 @@ internal class SessionRepositoryImpl(
 
     override suspend fun range(fromMs: Long?, toMs: Long?): List<TrackSession> =
         dao.range(fromMs, toMs).map { it.toDomain() }
+
+    /**
+     * `20260907-143512-1f0c8a2e` — the start time a human can read, then eight random hex
+     * characters.
+     *
+     * A bare UUID told a support engineer reading a log or an exported filename nothing
+     * about *when* the run happened, which is the first thing anyone asks. The timestamp
+     * prefix also makes ids sort chronologically as plain strings.
+     *
+     * The random suffix is not decoration: two sessions can open inside the same second
+     * (a stop/start, a crash recovery), and the id is a primary key that points reference.
+     *
+     * Rendered in the **device's** zone at the moment of the call, so it is readable to
+     * whoever is holding the phone rather than to a server in UTC. That makes it a label,
+     * not a timestamp: it is not unique across a zone change, it never round-trips back to
+     * an instant, and nothing should parse it. [TrackSession.startedAtMs] stays the
+     * authoritative start, and each point still carries its own `timezone` (EC-89).
+     */
+    private fun newSessionId(startedAtMs: Long): String {
+        val stamp = SESSION_ID_FORMAT
+            .withZone(ZoneId.systemDefault())
+            .format(Instant.ofEpochMilli(startedAtMs))
+        return "$stamp-" + UUID.randomUUID().toString().take(SESSION_ID_SUFFIX_LENGTH)
+    }
+
+    private companion object {
+        /** No colons or spaces: session ids land in filenames, log lines and URLs. */
+        val SESSION_ID_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")
+        const val SESSION_ID_SUFFIX_LENGTH = 8
+    }
 }
 
 internal class DecisionRepositoryImpl(

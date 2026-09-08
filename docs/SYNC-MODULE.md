@@ -3,6 +3,10 @@
 How tracked points get from the device's local database to your server: the architecture,
 the upload lifecycle, every failure mode, and how a host application wires it up.
 
+For the **server** side of this contract — the schema, the ingest endpoint, what each status
+code does to the device, and a dashboard that plots the tracks — see
+[`SYNC-BACKEND-AND-DASHBOARD.md`](SYNC-BACKEND-AND-DASHBOARD.md).
+
 ---
 
 ## 1. Design at a glance

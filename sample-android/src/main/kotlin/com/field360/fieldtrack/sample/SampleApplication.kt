@@ -16,6 +16,8 @@ import com.field360.tracker.domain.model.TrackerResult
 import com.field360.tracker.integrity.IntegrityPolicy
 import com.field360.traker.geo.model.MockPolicy
 import com.field360.traker.snap.OsrmSnapProvider
+import com.field360.traker.sync.LogLevel
+import com.field360.traker.sync.LogSyncConfig
 import com.field360.traker.sync.SyncConfig
 import com.field360.traker.sync.TrackerSync
 import kotlinx.coroutines.CoroutineScope
@@ -183,19 +185,50 @@ class SampleApplication : Application() {
             // when a Wi-Fi centroid must never reach the record.
             .provider(LocationProviderType.FUSED)
             .desiredAccuracy(DesiredAccuracy.HIGH)
-            // The accuracy meter. BALANCED is the engine's own 30 m moving ceiling;
-            // STRICT (20 m) trades points for a line that never zigzags.
-            .accuracyProfile(AccuracyProfile.STRICT)
-            // The post-gap re-anchor bar. Left to the profile by default; set here because
-            // the first fix after a blackout decides where every later fix is judged from.
-            .recoveryTrustMeters(15f)
+            // The accuracy meter — and the single most consequential number in this file,
+            // because the ceiling it sets is applied ONLY while the device is moving
+            // (`AcceptancePipeline` stage 3.5). A parked phone never meets it; a driving
+            // one meets it on every fix.
+            //
+            // This was STRICT. 20 m is a defensible bar for a phone carried at walking
+            // pace with a clear sky, and it is not one for a phone in a vehicle: in a
+            // cupholder, in a pocket, behind a metallised windscreen, or on a road with
+            // buildings either side, a fused fix routinely reports 15-40 m. Everything
+            // above the bar was dropped as `PoorAccuracy`, and the only relief is the
+            // bridge after `maxHardRejectRun` (4) consecutive drops — roughly one stored
+            // point per five fixes, which at the 12 s vehicular tier is a point a minute.
+            // That is the "it stops capturing once I'm driving" report.
+            //
+            // BALANCED (30 m) is the engine's own default and is set from field data: on
+            // the reference drive the clean sections ran at 4-8 m and p90 never exceeded
+            // 19.4 m, while every direction reversal sat above 20 m. Vehicle-only work
+            // with a phone that mounts badly can go further with
+            // `AccuracyProfile.CUSTOM` + `maxAccuracyMeters(45f)`.
+            .accuracyProfile(AccuracyProfile.BALANCED)
+            // The post-gap re-anchor bar, raised with the profile it belongs to. Leaving
+            // it at the STRICT 15 m would move the same problem to the fix that matters
+            // most — the first one out of a tunnel or an underpass, which decides where
+            // every later fix is judged from.
+            .recoveryTrustMeters(25f)
             // 15 s / 5 s rather than the SDK's 60 s / 30 s: the sample is a diagnostic and
             // a sparse stream makes every other layer harder to read. intervalMs must stay
             // >= fastestIntervalMs (EC-120).
             .intervalMs(15_000)
             .fastestIntervalMs(5_000)
-            .maxUpdateDelayMs(60_000)
+            // Batching off. It was 60 s, which the tier clamp turns into a 24-30 s window
+            // the OS is entitled to sit on before waking the app — so fixes arrive in
+            // clumps, the turn burst arms after the corner it was meant to sample, and the
+            // live surface lags by half a minute. The controller now flushes the backlog
+            // before every cadence flip, so nothing is *lost* either way; this is about
+            // when the fixes arrive, not whether.
+            .maxUpdateDelayMs(0)
             .maxFixAgeMs(10_000)
+            // Take the first fix as it comes and let the accuracy meter above judge it.
+            // `true` holds the first fix of every request back until the chip reaches its
+            // accuracy target, and the request is rebuilt on every cadence flip — so on a
+            // slow-locking chipset the stall lands at exactly the transitions the faster
+            // tiers exist to sample.
+            .waitForAccurateLocation(false)
             // The three cadence tiers: base above, vehicular once fixes report vehicle
             // speed, turn burst across a corner. They must stay ordered — a burst slower
             // than the tier it accelerates makes turn geometry worse (EC-45).
@@ -387,7 +420,8 @@ class SampleApplication : Application() {
      * halted uploader therefore un-halts at the next session start and retries once.
      */
     fun installSync(session: TrackSession? = null) {
-        val url = BuildConfig.SYNC_URL
+//        val url = BuildConfig.SYNC_URL
+        val url = "https://xt6g2kb5-3000.inc1.devtunnels.ms/v1/location/batch/"
         if (url.isBlank()) return
 
         // `configure()` throws on a config that does not validate — a non-https URL, an
@@ -437,6 +471,30 @@ class SampleApplication : Application() {
                             session?.let { put("session_id", sessionEnvelopeId(it)) }
                         },
                     )
+                    .build(),
+            )
+
+            // The diagnostic channel (`docs/APP-LOG-API.md`), and it has to be asked for:
+            // `configure()` above turns on the POINTS endpoint only. Without this line the
+            // SDK records nothing, `/v1/logs/batch` is never called, and a hole in a track
+            // reaches the dashboard with no reason attached — which is the whole failure
+            // the endpoint exists to prevent.
+            //
+            // No URL, no device id and no credential: all three are derived from the points
+            // config just set, which is what keeps the two channels joined on the same
+            // `device_id`. Idempotent, so the second `installSync()` on a session start
+            // simply replaces it.
+            sync.configureLogs(
+                LogSyncConfig.builder()
+                    // Ship on any entry rather than only on WARN and worse.
+                    //
+                    // A battery decision, taken deliberately here because this app is a
+                    // test harness: somebody toggling GPS wants to see the row on the
+                    // dashboard now, not up to fifteen minutes later. `nudgeCooldownMs`
+                    // still caps it at one drain per 30 s. A fleet app should leave this
+                    // at its WARN default — the SDK now logs a real provider toggle at
+                    // WARN, so the entries that matter arrive promptly either way.
+                    .nudgeLevel(LogLevel.INFO)
                     .build(),
             )
         }.onFailure { failure ->

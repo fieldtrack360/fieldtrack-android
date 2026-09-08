@@ -17,6 +17,8 @@ import com.field360.tracker.di.TrackerGraph
 import com.field360.tracker.domain.model.TrackerEvent
 import com.field360.tracker.domain.model.LicenseAction
 import com.field360.tracker.license.LicenseState
+import com.field360.tracker.service.ServiceHeartbeat
+import com.field360.tracker.service.ServiceRestorer
 import com.field360.tracker.service.TrackingService
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.TimeUnit
@@ -75,17 +77,49 @@ internal class BackstopWorker(
         // recently in the foreground. `TrackingService` reports its own refusal and
         // enqueues a restore, so a refused attempt is not a silent one.
         if (!TrackingService.running && config.service.foregroundService) {
-            runCatching { TrackingService.start(applicationContext, config.service) }
+            // Best-effort and uncounted, deliberately. This tick is one of the two slow
+            // paths `ServiceRestorer` stands down *in favour of*, so routing its failure
+            // back into that budget would let a periodic job exhaust the fast retries the
+            // next real opportunity needs. It simply tries again in fifteen minutes.
+            TrackingService.start(applicationContext, config.service)
         }
+
+        // The heartbeat chain breaks in exactly one way — a tick delivered to a process
+        // that was killed before it re-armed. This is the second thing that can notice,
+        // and unlike `HealthLoop.ensureHeartbeatArmed` it still runs with the service dead.
+        ServiceHeartbeat.schedule(applicationContext, config.service)
 
         // Through OneShotProvider, not the raw source: it carries the timeout, the
         // retry cap and the mutex that stops a coincident activity-transition capture
         // from firing a second concurrent request (EC-17, EC-20).
-        val fix = deps.oneShotProvider.capture(config)
-            ?: return Result.retry() // Linear backoff; a fix may just not be available yet.
+        deps.oneShotProvider.capture(config) ?: return noFix()
 
         return Result.success()
     }
+
+    /**
+     * What to do when the safety net caught nothing.
+     *
+     * `Result.retry()` unconditionally, which is what this was, is a retry storm on exactly
+     * the devices the backstop exists for. A phone indoors, in a pocket, or with GNSS
+     * duty-cycled by the OEM returns nothing for minutes at a time, and each retry is a
+     * fresh `PRIORITY_HIGH_ACCURACY` request with a 30 s budget: at the 30 s linear backoff
+     * that is a near-continuous high-accuracy fix attempt for as long as the device cannot
+     * produce one. On a MIUI/HyperOS device that drain is not merely wasted — it is one of
+     * the things that gets the app killed, so the storm actively causes the failure the
+     * worker is meant to recover from.
+     *
+     * Two retries, then wait for the next period. The 15-minute tick is already the
+     * contract; giving up inside a period costs at most one skipped backstop fix, and a
+     * device that could not produce a fix in three attempts across a minute is not going to
+     * produce one on the fourth.
+     *
+     * `success`, not `failure`: a periodic worker that fails is still rescheduled, but
+     * `FAILED` is also what `HealthLoop.ensureBackstopAlive` treats as a dead worker worth
+     * re-enqueuing, and "the device is indoors" must not read as "the backstop broke".
+     */
+    private fun noFix(): Result =
+        if (runAttemptCount < MAX_FIX_ATTEMPTS - 1) Result.retry() else Result.success()
 
     companion object {
         const val NAME = "fieldtrack-backstop"
@@ -112,6 +146,12 @@ internal class BackstopWorker(
         }
 
         private const val MIN_BACKOFF_SECONDS = 30L
+
+        /**
+         * One-shot attempts per 15-minute period, retries included. Three: the tick itself
+         * and two retries, spanning about a minute and a half of backoff.
+         */
+        private const val MAX_FIX_ATTEMPTS = 3
     }
 }
 
@@ -130,16 +170,56 @@ internal class RestoreWorker(
         val deps = applicationContext.trackItGraph()
         deps.sessions.current() ?: return Result.success()
         val config = deps.config.load() ?: TrackerConfig()
-        TrackingService.start(applicationContext, config.service)
+        // A host running without a foreground service has nothing here to restore, and
+        // `start` returns false for that reason rather than a refusal — checked up front so
+        // the retry path below cannot be fed a configuration choice.
+        if (!config.service.foregroundService) return Result.success()
+
+        // The boolean, not a bare call. `startForegroundService` throws on API 31+ when the
+        // app is not eligible to start one from the background, and an uncaught throw here
+        // failed the worker outright — `WorkManager` recorded FAILED, nothing was emitted,
+        // and the one job whose entire purpose is surviving a kill died silently on the
+        // devices where kills happen. `TrackingService.start` now reports it instead.
+        if (!TrackingService.start(applicationContext, config.service)) {
+            // Back to the counted path, which decides whether another attempt is worth
+            // making at all. Never a bare re-enqueue from here: this worker's only action
+            // is that start, so answering its own failure by scheduling itself is the loop.
+            ServiceRestorer.request(applicationContext)
+        }
         return Result.success()
     }
 
     companion object {
         const val NAME = "fieldtrack-restore"
 
+        /**
+         * The immediate attempt. Reach for it through
+         * [com.field360.tracker.service.ServiceRestorer], never directly — the counting and
+         * the backoff are what stop this from becoming a loop with `promoteToForeground`.
+         */
         fun enqueueExpedited(context: Context) {
             val request = OneTimeWorkRequestBuilder<RestoreWorker>()
                 .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                .setConstraints(Constraints.NONE)
+                .build()
+
+            WorkManager.getInstance(context)
+                .enqueueUniqueWork(NAME, ExistingWorkPolicy.REPLACE, request)
+        }
+
+        /**
+         * A backed-off attempt, for a device that has already refused at least once.
+         *
+         * **Not expedited, and it cannot be**: `WorkManager` rejects a request that combines
+         * `setExpedited` with an initial delay, which is the right rule — expedited means
+         * "run this now" and a delay means the opposite. The distinction carries the whole
+         * intent here. An app that refused a foreground-service start a moment ago is not
+         * eligible *now*; spending an expedited quota slot to be told so again is how the
+         * quota ran out, and the quota is what the next genuine opportunity needs.
+         */
+        fun enqueueDelayed(context: Context, delaySeconds: Long) {
+            val request = OneTimeWorkRequestBuilder<RestoreWorker>()
+                .setInitialDelay(delaySeconds, TimeUnit.SECONDS)
                 .setConstraints(Constraints.NONE)
                 .build()
 

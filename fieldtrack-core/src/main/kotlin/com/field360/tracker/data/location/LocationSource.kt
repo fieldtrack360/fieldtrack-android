@@ -27,6 +27,29 @@ internal interface LocationSource {
     fun stream(config: GeolocationConfig, vehicular: Boolean, turning: Boolean = false): Flow<List<Location>>
     suspend fun oneShot(config: GeolocationConfig): Location?
     fun isAvailable(): Boolean
+
+    /**
+     * Delivers whatever the OS is still holding for the current registration, and returns
+     * once it has been delivered.
+     *
+     * Called by [com.field360.tracker.capture.LocationStreamController] immediately before
+     * it tears a stream down, which it does on **every** cadence flip. Without it the
+     * buffer is simply discarded: `removeLocationUpdates` makes no promise about batched
+     * fixes it has not handed over yet, and this SDK asks for a batch window of one to two
+     * sampling intervals — so a flip could cost up to 30 s of fixes that the chip had
+     * already taken.
+     *
+     * That cost is paid where it hurts most. Cadence flips are not rare and they are not
+     * random: the vehicular tier is dropped and restored at every traffic stop, and the
+     * turn burst arms and expires around every corner. All of them happen while driving,
+     * none of them happen to a parked phone — so the loss reads in the field as "it
+     * captures fine until I start moving".
+     *
+     * Default no-op: only a batching provider has anything to flush.
+     */
+    suspend fun flush() {
+        // No batching by default; nothing is being held.
+    }
 }
 
 internal object LocationRequests {
@@ -54,7 +77,14 @@ internal object LocationRequests {
                 if (config.navigationMode) Priority.PRIORITY_HIGH_ACCURACY else config.desiredAccuracy.toPriority(),
             )
             .setGranularity(Granularity.GRANULARITY_PERMISSION_LEVEL)
-            .setWaitForAccurateLocation(true)
+            // Was hardcoded `true`, which is a good default and a bad constant. Every
+            // cadence flip in `LocationStreamController` tears the request down and
+            // rebuilds it, and each rebuild re-arms the wait — so on hardware with a slow
+            // GNSS lock the first fix after every vehicular/turn-burst transition is
+            // delayed by however long the chip takes to reach its accuracy target. On a
+            // budget chipset in the background that is the difference between a sampled
+            // corner and a missing one. See `GeolocationConfig.waitForAccurateLocation`.
+            .setWaitForAccurateLocation(config.waitForAccurateLocation)
             // EC-119 — 0 by contract. Validated in TrackerConfig, restated here.
             .setMinUpdateDistanceMeters(config.distanceFilterM)
             // Clamped to the tier: a floor slower than the interval it governs would
@@ -92,6 +122,12 @@ internal object LocationRequests {
      */
     fun batchWindowFor(config: GeolocationConfig, intervalMs: Long): Long {
         if (config.navigationMode) return 0
+        // `0` means off, and until now it could not: the `coerceIn` below has a lower bound
+        // of one interval, so every value a host wrote — `0` included — came back as *at
+        // least* `intervalMs` of batching. `maxUpdateDelayMs = 0` is the documented way to
+        // ask for unbatched delivery and it silently did the opposite, which is exactly the
+        // knob to reach for on a device whose background fixes arrive a minute late.
+        if (config.maxUpdateDelayMs <= 0L) return 0
         return config.maxUpdateDelayMs.coerceIn(intervalMs, intervalMs * MAX_BATCH_MULTIPLE)
     }
 
@@ -146,7 +182,23 @@ internal class FusedLocationSource(
             context.mainLooper,
         )
 
+        // Teardown only. The batched backlog is drained by [flush] *before* this runs —
+        // it has to be, because by the time `awaitClose` fires the channel is already
+        // closing and a `trySend` from a late callback would be dropped on the floor.
         awaitClose { client.removeLocationUpdates(callback) }
+    }
+
+    /**
+     * `flushLocations()` delivers the backlog through the callback that is still
+     * registered, and its `Task` completes only once that delivery has happened — which is
+     * what makes awaiting it, rather than firing and forgetting, the whole point.
+     *
+     * Failures are swallowed: this runs on the teardown path of a cadence flip, and a
+     * provider that cannot flush is not a reason to refuse to restart the stream. The cost
+     * of a failure is the batch that would have been lost anyway.
+     */
+    override suspend fun flush() {
+        runCatching { client.flushLocations().await() }
     }
 
     @SuppressLint("MissingPermission")

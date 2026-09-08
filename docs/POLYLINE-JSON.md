@@ -16,7 +16,7 @@ val json = Tracker.exportPolylineJson(
 ```jsonc
 {
   "version": 1,
-  "sessionId": "1f0c8a2e-…",
+  "sessionId": "20260530-091200-1f0c8a2e",   // local start time + random suffix. A label, not a parseable timestamp
   "generatedAtMs": 1785500000000,
   "from": 1785456000000,
   "to": 1785542399000,

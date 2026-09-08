@@ -18,9 +18,11 @@ import com.field360.tracker.motion.GyroTurnMonitor
 import com.field360.tracker.motion.MotionController
 import com.field360.tracker.motion.StepCorroborator
 import com.field360.tracker.motion.StillnessMonitor
+import com.field360.tracker.permission.BackgroundRestrictions
 import com.field360.tracker.permission.PermissionManager
 import com.field360.tracker.permission.ProviderStateMonitor
 import com.field360.tracker.sdkLog
+import com.field360.tracker.service.ServiceHeartbeat
 import com.field360.tracker.work.BackstopWorker
 import com.field360.tracker.work.SyncScheduler
 import com.field360.tracker.work.Watchdog
@@ -73,6 +75,8 @@ internal class CaptureLauncher(
     private val syncScheduler: SyncScheduler,
     private val context: Context,
     private val scope: CoroutineScope,
+    private val events: MutableSharedFlow<TrackerEvent>,
+    private val logger: TrackLogger,
 ) {
 
     /**
@@ -90,6 +94,7 @@ internal class CaptureLauncher(
         ingestor.rawRingCapacity = config.persistence.rawRingCapacity
         ingestor.persistRawPoints = config.persistence.persistRawPoints
         ingestor.rawPointCapacity = config.persistence.rawPointRingCapacity
+        ingestor.deliveryStalenessMs = config.geolocation.deliveryStalenessMs
         ingestor.bearingChangeCaptureDeg = config.motion.bearingChangeCaptureDeg
         ingestor.cornerAnchorCapture = config.motion.cornerAnchorCapture
 
@@ -154,6 +159,28 @@ internal class CaptureLauncher(
         // with the stream about where the user was last seen (SOURCE-AUDIT A3). `KEEP`
         // inside, so re-arming after a revival does not reset its clock.
         BackstopWorker.enqueue(context, config.service.backstopIntervalMin)
+
+        // The other safety net, and the one that matters on the ROMs this SDK loses
+        // sessions to. Everything above rides `JobScheduler`, and an app left at MIUI's
+        // default "Restricted" battery setting does not get jobs run (EC-22); the
+        // heartbeat is an `AlarmManager` chain, which is a different subsystem with
+        // different throttling. Armed here, in the one place both `start()` and every
+        // revival path already converge — see `ServiceHeartbeat`.
+        ServiceHeartbeat.schedule(context, config.service)
+
+        // The opening state of what the OS will let this app do in the background, said
+        // once per session — every `start()` and every revival after a kill.
+        //
+        // This is the first question any background-tracking report has to answer and the
+        // SDK could not previously answer it at all: a device in the `RESTRICTED` standby
+        // bucket runs none of the WorkManager layers above, and from the outside that is
+        // indistinguishable from an SDK defect. Reported, never acted on — every remedy is
+        // a Settings screen, and opening one uninvited is the host's call (PERMISSIONS.md
+        // §5). `HealthLoop` follows the edges from here.
+        BackgroundRestrictions.read(context).let { restrictions ->
+            sdkLog { logger.w(TAG, restrictions.describe()) }
+            events.tryEmit(TrackerEvent.Diagnostic(restrictions.describe()))
+        }
     }
 
     /**
@@ -202,6 +229,10 @@ internal class CaptureLauncher(
             streamController.onObservedSpeed(speedMps)
             if (gyroArmed) gyroTurnMonitor.onSpeed(speedMps)
         }
+    }
+
+    private companion object {
+        const val TAG = "CaptureLauncher"
     }
 }
 

@@ -43,7 +43,28 @@ public class BootReceiver : BroadcastReceiver() {
                 val serviceConfig = config.load()?.service ?: return@launch
                 if (!serviceConfig.startOnBoot) return@launch
                 if (sessions.current() == null) return@launch
-                TrackingService.start(context, serviceConfig)
+                // Checked before the start rather than inferred from its result: a host
+                // running without a foreground service gets `false` back for a reason that
+                // is not a refusal, and must not be handed to the retry path.
+                if (!serviceConfig.foregroundService) return@launch
+
+                // Alarms do not survive a reboot, so the heartbeat chain has to be
+                // re-started here or the one revival layer that does not depend on
+                // `JobScheduler` is gone for the rest of the session. Before the service
+                // start, not after: the start is the thing that can be refused.
+                ServiceHeartbeat.schedule(context, serviceConfig)
+
+                // A fresh boot is a fresh chance, whatever the process that died before it
+                // had spent.
+                ServiceRestorer.reset()
+
+                // On Android 15+ a location-typed foreground service may still be started
+                // from `BOOT_COMPLETED`, but the platform is entitled to refuse it and the
+                // throw used to propagate out of this `goAsync` block. Counted retry
+                // instead — the alarm armed above is the backstop if even that fails.
+                if (!TrackingService.start(context, serviceConfig)) {
+                    ServiceRestorer.request(context)
+                }
             } finally {
                 pendingResult.finish()
             }

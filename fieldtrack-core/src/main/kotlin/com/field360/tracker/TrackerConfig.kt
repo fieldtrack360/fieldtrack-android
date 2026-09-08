@@ -157,6 +157,7 @@ public data class TrackerConfig(
         }
 
         addAll(security.validate())
+
     }
 
     public companion object {
@@ -299,6 +300,47 @@ public data class TrackerConfig(
         public fun maxFixAgeMs(value: Long): Builder =
             apply { geolocation = geolocation.copy(maxFixAgeMs = value) }
 
+        public fun deliveryStalenessMs(value: Long): Builder =
+            apply { geolocation = geolocation.copy(deliveryStalenessMs = value) }
+
+        public fun waitForAccurateLocation(value: Boolean): Builder =
+            apply { geolocation = geolocation.copy(waitForAccurateLocation = value) }
+
+        /**
+         * The latency-over-battery trade for hardware whose background tracking is *late*
+         * rather than absent.
+         *
+         * Three settings, and they are three settings rather than a mode because each is
+         * independently useful and a host may want to undo one of them. Call it before your
+         * own overrides, not after.
+         *
+         *  - `maxUpdateDelayMs = 0` — no OS batching. The default holds fixes for up to a
+         *    full interval before waking the app, which is what makes background points
+         *    arrive in clumps.
+         *  - `waitForAccurateLocation = false` — take the first fix and let the accuracy
+         *    meter judge it, rather than stalling every rebuilt request while the chip
+         *    reaches its accuracy target. `LocationStreamController` rebuilds on every
+         *    cadence change, so this is charged far more often than once per session.
+         *  - `wakeLockMs` doubled — more room for the ingest coroutine to run between fixes
+         *    on a ROM that freezes the process aggressively.
+         *
+         * **Not an OEM detector, deliberately.** Nothing here branches on
+         * `Build.MANUFACTURER`: a device allowlist is wrong the day a ROM ships, and the
+         * behaviour this compensates for is a *setting* (MIUI/HyperOS "Battery saver") that
+         * a user on any device can turn on. The host knows its fleet; the SDK does not.
+         *
+         * Costs battery. It is the right default for a delivery or field-force app whose
+         * users are paid to be tracked, and the wrong one for a background feature the user
+         * did not ask for.
+         */
+        public fun aggressiveOemProfile(): Builder = apply {
+            geolocation = geolocation.copy(
+                maxUpdateDelayMs = 0,
+                waitForAccurateLocation = false,
+            )
+            service = service.copy(wakeLockMs = service.wakeLockMs * 2)
+        }
+
         public fun adaptiveCadence(value: Boolean): Builder =
             apply { geolocation = geolocation.copy(adaptiveCadence = value) }
 
@@ -425,6 +467,9 @@ public data class TrackerConfig(
         public fun backstopIntervalMin(value: Int): Builder =
             apply { service = service.copy(backstopIntervalMin = value) }
 
+        public fun serviceHeartbeatMin(value: Int): Builder =
+            apply { service = service.copy(serviceHeartbeatMin = value) }
+
         public fun deadTrackerMovingMin(value: Int): Builder =
             apply { service = service.copy(deadTrackerMovingMin = value) }
 
@@ -433,6 +478,9 @@ public data class TrackerConfig(
 
         public fun wakeLockMs(value: Long): Builder =
             apply { service = service.copy(wakeLockMs = value) }
+
+        public fun wakeLockPolicy(value: WakeLockPolicy): Builder =
+            apply { service = service.copy(wakeLockPolicy = value) }
 
         public fun notification(title: String, text: String): Builder =
             apply { service = service.copy(notificationTitle = title, notificationText = text) }
@@ -577,9 +625,64 @@ public data class GeolocationConfig(
     val distanceFilterM: Float = 0f,
     val intervalMs: Long = 60_000,
     val fastestIntervalMs: Long = 30_000,
+    /**
+     * How long the OS may hold fixes before delivering them as a batch. **`0` disables
+     * batching**; anything else is clamped to between one and two [intervalMs].
+     *
+     * Batching is a real battery win and a real latency cost, and the cost is what shows up
+     * as "background points arrive in clumps a minute late". At the 60 s default the OS is
+     * entitled to sit on a fix for a full minute before waking the app with it, which is
+     * correct for a shift-logging product and wrong for anything a user watches.
+     *
+     * The `0` case was broken until recently: the clamp had a lower bound of one interval,
+     * so every value including zero came back as at least `intervalMs` and batching could
+     * not be turned off at all except through [navigationMode].
+     */
     val maxUpdateDelayMs: Long = 60_000,
     val maxFixAgeMs: Long = 10_000,
+    /**
+     * Delivery lateness — `now - the fix's own timestamp`, at the moment the SDK receives
+     * it — beyond which the fix is reported as late. `0` disables the report.
+     *
+     * **This is a diagnostic, not a gate. Nothing is dropped for being late**, and that is
+     * deliberate: OS batching makes late delivery the *normal* case, the members of a batch
+     * are late by construction, and discarding them is the defect this SDK already fixed
+     * once — reading only `LocationResult.lastLocation` threw away 4-6 fixes per Doze
+     * window and with them the samples turn geometry depends on (SOURCE-AUDIT A4). A
+     * staleness *drop* would reintroduce that with a config flag on it.
+     *
+     * What it is for is answering the field question this SDK could not previously answer:
+     * "is the device not producing fixes, or is it producing them and handing them over a
+     * minute later?" Those have different causes and different fixes — the first is a dead
+     * or throttled provider, the second is [maxUpdateDelayMs] plus an OEM that batches
+     * harder than it claims — and they are indistinguishable from stored points alone,
+     * because both look like a gap. Lateness beyond this threshold arrives as a throttled
+     * [com.field360.tracker.domain.model.TrackerEvent.Diagnostic] naming the measured lag.
+     *
+     * Declared but read by nothing at all before this: it was config that could not affect
+     * anything, exposed in the sample's own settings screen.
+     */
     val deliveryStalenessMs: Long = 60_000,
+    /**
+     * Whether the fused provider should hold back its first fix until it reaches the
+     * requested accuracy.
+     *
+     * `true` — the default and the behaviour that shipped when this was hardcoded — trades
+     * time-to-first-fix for quality. That trade is charged more often than it looks:
+     * `LocationStreamController` rebuilds the location request on every cadence change, and
+     * each rebuild re-arms the wait. On a device with a slow GNSS lock, every
+     * vehicular-tier and turn-burst transition therefore starts with a stall, which is
+     * exactly where the extra samples were wanted.
+     *
+     * `false` takes the first fix as it comes and lets [accuracy] judge it, which is what
+     * the accuracy meter is for. Pair it with `maxUpdateDelayMs = 0` on hardware whose
+     * background tracking is late rather than absent — see the
+     * [Builder.aggressiveOemProfile] preset.
+     *
+     * Ignored by the `LocationManager` providers ([LocationProviderType.GPS_ONLY] and
+     * friends): the platform API has no equivalent, so those always behave as `false`.
+     */
+    val waitForAccurateLocation: Boolean = true,
     /** 12 s while vehicular — the biggest turn-fidelity win short of a routing API (EC-45). */
     val adaptiveCadence: Boolean = true,
     val vehicularIntervalMs: Long = 12_000,
@@ -783,9 +886,43 @@ public data class ServiceConfig(
     val watchdogIntervalMs: Long = 60_000,
     val watchdogThrottleMs: Long = 900_000,
     val backstopIntervalMin: Int = 15,
+    /**
+     * Cadence of the `AlarmManager` heartbeat that restores the service after an OEM kill,
+     * minutes. `0` disables it.
+     *
+     * The one revival path that is not a `WorkManager` job. Every other layer in
+     * [com.field360.tracker.service] §7 of PERMISSIONS.md that can act with the process
+     * dead — [backstopIntervalMin], the restore worker — rides `JobScheduler`, and a
+     * MIUI/HyperOS app left at the default *Restricted* battery setting does not get jobs
+     * run at all (EC-22). `AlarmManager` is a separate subsystem with separate throttling,
+     * so this keeps working when that one setting has switched the others off.
+     *
+     * Fifteen minutes because that is what `setAndAllowWhileIdle` will actually honour in
+     * Doze — the platform rate-limits an app's while-idle alarms to roughly one per Doze
+     * maintenance window, so asking for one a minute buys nothing and costs the wakeups
+     * that do land. Matching [backstopIntervalMin] is deliberate on top of that: the two
+     * are meant to be interchangeable, so that losing either leaves the same worst-case
+     * recovery time rather than a much longer one.
+     *
+     * See [com.field360.tracker.service.ServiceHeartbeat] for what the host can do to make
+     * this path stronger — declaring `SCHEDULE_EXACT_ALARM` itself upgrades the alarm to
+     * exact, which on API 31+ is also what makes it eligible to start the foreground
+     * service. The SDK does not declare that permission on a host's behalf (EC-15).
+     */
+    val serviceHeartbeatMin: Int = 15,
     val deadTrackerMovingMin: Int = 30,
     val deadTrackerStationaryMin: Int = 60,
     val wakeLockMs: Long = 20_000,
+    /**
+     * How long the `PARTIAL_WAKE_LOCK` is held. See [WakeLockPolicy]; [wakeLockMs] is the
+     * duration either way, and `0` there still disables the lock whatever this says.
+     *
+     * Defaults to [WakeLockPolicy.PER_FIX], which is a **behaviour change** from the
+     * continuous hold that shipped before it. The continuous hold worked and was also one
+     * of the reasons MIUI/HyperOS killed the app holding it; see [WakeLockPolicy.CONTINUOUS]
+     * to restore it.
+     */
+    val wakeLockPolicy: WakeLockPolicy = WakeLockPolicy.PER_FIX,
     val notificationTitle: String = "Tracking active",
     val notificationText: String = "Recording your location",
     val notificationChannelId: String = "trackit_tracking",
@@ -893,6 +1030,51 @@ public enum class TrackingMode {
 }
 
 public enum class DesiredAccuracy { HIGH, BALANCED, LOW }
+
+/**
+ * How long the SDK holds a `PARTIAL_WAKE_LOCK` while a session is open.
+ *
+ * A location-typed foreground service keeps the *process* alive but does not keep the *CPU*
+ * awake, so without a lock the ingest coroutine, the motion tick and the health loop all
+ * stall between fixes on a device that sleeps aggressively. The question this answers is
+ * how much of that to buy, given that the buying is itself visible to the OEM power
+ * managers deciding what to kill.
+ */
+public enum class WakeLockPolicy {
+    /**
+     * No wake lock. Equivalent to `wakeLockMs = 0`, and the honest choice for a host whose
+     * cadence is slow enough that Doze deferral does not matter.
+     */
+    NONE,
+
+    /**
+     * **Default.** Take the lock for `wakeLockMs` on each delivered fix and let the timeout
+     * release it.
+     *
+     * Holds the CPU exactly where the work is — long enough to run the acceptance pipeline
+     * and write the row — and lets the device sleep in between. At the 60 s default cadence
+     * with the 20 s default hold that is roughly a third of the wall clock, falling further
+     * as the tier slows.
+     *
+     * What it gives up: `HealthLoop` and the motion tick run on coroutine timers, not
+     * alarms, so between fixes they can drift late by however long the device stays down.
+     * That is survivable because the recovery paths that must not drift are not timers —
+     * the heartbeat is an `AlarmManager` chain and the backstop is a periodic job.
+     */
+    PER_FIX,
+
+    /**
+     * Hold the lock for the whole session, re-armed at half [ServiceConfig.wakeLockMs].
+     *
+     * The behaviour that shipped before the policy existed. It keeps every timed loop on
+     * its stated cadence, and it is also the setting most likely to get the host app killed
+     * by an OEM power manager and flagged for excessive wakeups in Play Console — a
+     * sustained partial wake lock is among the loudest signals either one reads. Choose it
+     * when supervision cadence genuinely matters more than that, and expect the battery
+     * line in the review.
+     */
+    CONTINUOUS,
+}
 
 /**
  * Which hardware the fixes come from.

@@ -16,7 +16,101 @@ Everything below is on `motion_fallback` and not yet tagged. The last release is
 fallback layer are both *new* in this range, so the API adjustments listed under Changed are to
 surfaces that have never shipped. A host upgrading from `1.0.7-alpha2` has nothing to edit.
 
+### Upgrading from a released build
+
+`fieldtrack-core`'s database goes **v8 -> v9**. Every published tag from `v1.0.2` to `1.0.8`
+ships v8, so that is the step a device in the field actually takes; `MIGRATION_8_9` is
+additive (two `filter_state` columns, both defaulting to `0`) and is registered in
+`addMigrations`. Older installs still upgrade — the chain is unbroken back to v1 and
+`fallbackToDestructiveMigration()` is never called, so no host loses a recorded track.
+
+`fieldtrack-sync` creates a **second, separate** database, `fieldtrack-logs-<package>.db`,
+at version 1. It has never shipped, so no install has the file and there is nothing to
+migrate; Room creates it on the first entry written after `configureLogs()`. A host that
+never calls `configureLogs()` never gets the file.
+
+New: `TrackerDatabaseMigrationTest` seeds a real database from each **committed schema
+export** — its own DDL, indices, `room_master_table` identity and `user_version` — then
+opens it through the shipped `TrackerDatabase.build(context)` and lets Room run the chain
+and validate the result. It covers every exported version, and a companion case fails if a
+`@Database(version = ...)` bump ever lands without its export committed beside it.
+
 ### Added
+
+- **Session logs — a diagnostic channel with its own endpoint, in `fieldtrack-sync`.**
+  Points answer *where the device was*; this answers *why there is nothing there*. Off by
+  default, and entirely inside the optional sync artifact — `fieldtrack-core` carries no
+  logging code and no log table, so a host that does not depend on `fieldtrack-sync` pays
+  nothing. Server contract: [`docs/APP-LOG-API.md`](docs/APP-LOG-API.md); design:
+  [`docs/SYNC-BACKEND-AND-DASHBOARD.md` §11](docs/SYNC-BACKEND-AND-DASHBOARD.md#11-session-logs).
+  - `TrackerSync.configureLogs(LogSyncConfig, SyncTransport?)` — **follows the points
+    endpoint**. Called with no argument it derives the URL from the origin of the
+    `SyncConfig` already in force plus `v1/logs/batch`, inherits `device_id` from
+    `SyncConfig.extraParams`, and reuses the points headers. Sending a different
+    `device_id` would produce two unrelated datasets, so inheriting it is the default.
+  - `TrackerSync.log(level, tag, message, code, data)`, `logLifecycle(phase, tag)`,
+    `getLogs(sessionId, limit, offset)`, `pendingLogCount()`, `syncLogsNow()`,
+    `requestLogSync()`, `disableLogSync()`, `logEvents`, `logEndpoint`,
+    `isLogSyncConfigured`.
+  - `LogSyncConfig` (+ `Builder`), `LogRecord`, `LogLevel`, `LogType`, `LifecyclePhase`,
+    `LogSyncQueue`, `LogPayload` / `LogEntryDto` — all in `com.field360.traker.sync`.
+  - **Its own Room database**, `fieldtrack-logs-<package>.db`, created only when
+    `configureLogs()` is called. A separate file from the one holding positions, which is
+    what makes a credential failure on the log endpoint structurally unable to reach a
+    stored point.
+  - **Prompt drain on a severe entry.** The channel is a 15-minute `LogSyncWorker`
+    heartbeat, except that an entry at `LogSyncConfig.nudgeLevel` (`WARN` by default) asks
+    for an upload straight away, throttled to one per `nudgeCooldownMs` (30 s). A burst
+    inside that window is deferred to its end rather than dropped, so entries written after
+    the first upload do not wait out the heartbeat. `nudgeLevel(null)` disables it.
+  - Filtering happens at **record** time, not upload time: it keeps the buffer a strict
+    FIFO the uploader settles with one cursor, and stops a device storing what it will
+    never send.
+  - Two behaviours that are deliberately the **inverse** of the points queue: a
+    permanently-rejected 4xx batch (`413` over the endpoint's 500-entry ceiling included)
+    is dropped rather than retried forever, and a 401/403 stops log shipping while keeping
+    the buffer. Nothing on this channel can reach `Tracker.stop()`, the point queue, or a
+    row of `track_point`.
+  - `LogType.DECISION` is read from the SDK's existing decision log through
+    `Tracker.getDecisions` and converted at send time, tracked by a per-session watermark
+    — never mirrored into a second table. ~29 000 entries per device per shift; enable it
+    for a named device with a ticket open, not for a fleet. The first `configureLogs` that
+    enables it moves the watermark to the newest row, so an opt-in ships the next drive
+    rather than the last three days.
+  - **A provider toggle is a `warn`, so it drains promptly.** `ProviderChange` used to be
+    logged at `info` unconditionally, which put it below `nudgeLevel` and left a GPS toggle
+    sitting in the buffer for up to `uploadIntervalMinutes`. It is now `warn` when a provider
+    or the location master switch actually moved, carries the transition as a `code`
+    (`GPS_OFF` / `GPS_ON` / `NETWORK_OFF` / `NETWORK_ON` / `LOCATION_OFF` / `LOCATION_ON`)
+    and the `previous_gps` / `previous_network` / `previous_enabled` fields in `data`. A
+    power-save, airplane or permission field moving stays at `info` — each already has an
+    entry of its own. The first observation after start is a starting position rather than a
+    transition and is never raised.
+  - **A missing log endpoint costs one request per process, not one per heartbeat.**
+    `404`, `405` and `501` now halt this channel the way `401`/`403` already did — buffer
+    kept, positions untouched, recovery on the next `configureLogs()`. They are statements
+    about the endpoint rather than about the bytes just sent, so dropping a batch and
+    retrying at the next heartbeat would discard the host's diagnostics forever to be told
+    the same thing. `503` stays retryable, as `docs/APP-LOG-API.md` documents it.
+  - **Release packaging.** `proguard-rules.pro` now pins the log API — `LogSyncConfig` (+
+    `Builder`, `Companion`), `LogSyncQueue`, `LogRecord`, `LogLevel`, `LogType`,
+    `LifecyclePhase`, `LogPayload`, `LogAppInfo`, `LogDeviceInfo`, `LogEntryDto` — and
+    `verifyReleaseObfuscation` now requires them. Being reachable from a kept `TrackerSync`
+    member is not being kept: R8 shortened all of them to `a.class`…`g.class`, could not
+    repackage them out of a package holding pinned classes, and the release build failed the
+    obfuscation audit. A published AAR built without these would also have left a host
+    unable to name `LogSyncConfig`. `consumer-rules.pro` is unchanged and still empty — the
+    host-side pass is covered by Room's, WorkManager's and kotlinx-serialization's own
+    consumer rules.
+  - The Room log store moved from `sync.internal.db` to `sync.data.db`, and the
+    `TrackerSync.build` lambdas that construct the recorder and the queue moved to
+    `sync.internal.LogWiring`. Both are packaging, not behaviour: Room pins its database
+    class by name and `sync.internal.**` is on the release audit's forbidden list, while a
+    lambda written inside the API package becomes a synthetic class R8 renames but cannot
+    move out of it. `fieldtrack-core` places its own Room classes and integrity internals
+    the same way for the same reason. The exported schema moved with it —
+    `fieldtrack-sync/schemas/com.field360.traker.sync.data.db.LogDatabase/1.json`.
+  - **No change to `fieldtrack-core`'s database.** The schema stays at v9.
 
 - **Upload-status notification** — a diagnostic that puts the live upload queue on the ongoing
   foreground notification, readable with the host app dead. Off by default and meant to stay off
@@ -29,6 +123,14 @@ surfaces that have never shipped. A host upgrading from `1.0.7-alpha2` has nothi
     rather than blanked, so a typo shows up as itself. Refreshed on the `watchdogIntervalMs` tick.
   - The line is posted only while sync is actually configured, so a queue depth with no endpoint
     is never reported as a backlog.
+- **`TrackerEvent.ProviderChange.previous`** — the `ProviderState` this change replaced, or
+  `null` on the first observation after the monitor starts. Appended with a default, so every
+  existing `ProviderChange(state)` construction and `event.state` read is unaffected. It exists
+  because a GPS provider toggle behind an unchanged master switch emits no other event, and was
+  previously indistinguishable from a power-save flip without a consumer keeping its own copy of
+  the last snapshot. `null` is deliberate rather than a gap: the initial `ProviderState` is a
+  constructor default, and diffing against it would announce a GPS toggle and a permission grant
+  on every launch.
 - **`SyncEvent.NetworkAvailable(queued)`** — emitted when the device returns to a usable network
   *and* rows are queued. A reconnection with an empty queue is silent.
 - **`TrackerState.motionQuality` and `TrackerState.effectiveTrackingMode`** — what the motion

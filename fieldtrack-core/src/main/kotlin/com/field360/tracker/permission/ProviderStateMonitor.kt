@@ -153,7 +153,10 @@ internal class ProviderStateMonitor(
         if (next == previous && !first) return
 
         _state.value = next
-        events.tryEmit(TrackerEvent.ProviderChange(next))
+        // `previous` is withheld on the first look for the same reason the edge reports
+        // below are: it is a constructor default there, and a consumer diffing against it
+        // reads a GPS toggle that never happened. See `TrackerEvent.ProviderChange`.
+        events.tryEmit(TrackerEvent.ProviderChange(next, previous.takeUnless { first }))
 
         // Nothing transitioned — this is the first look at the device, and the "previous"
         // value it would be compared against is a constructor default. `CaptureGate` acts
