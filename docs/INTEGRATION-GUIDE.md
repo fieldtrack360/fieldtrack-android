@@ -38,12 +38,13 @@ every public method, every event and callback.
 12. [Battery and sensors](#12-battery-and-sensors)
 13. [Maps module](#13-maps-module)
 14. [Sync module — upload to your backend](#14-sync-module--upload-to-your-backend)
-15. [Snap module — road matching](#15-snap-module--road-matching)
-16. [Diagnostics](#16-diagnostics)
-17. [Java interop](#17-java-interop)
-18. [ProGuard / R8](#18-proguard--r8)
-19. [Device integrity](#19-device-integrity)
-20. [Troubleshooting](#20-troubleshooting)
+15. [Log module — diagnostics to your backend](#15-log-module--diagnostics-to-your-backend)
+16. [Snap module — road matching](#16-snap-module--road-matching)
+17. [Diagnostics](#17-diagnostics)
+18. [Java interop](#18-java-interop)
+19. [ProGuard / R8](#19-proguard--r8)
+20. [Device integrity](#20-device-integrity)
+21. [Troubleshooting](#21-troubleshooting)
 
 ---
 
@@ -140,7 +141,7 @@ Retrofit 3 requires OkHttp 5 — they are versioned together, not independently.
 
 You can skip both entirely by supplying your own `SyncTransport` (see
 [§14.6](#146-custom-transport)) or your own `RoadSnapProvider` (see
-[§15](#15-snap-module--road-matching)).
+[§16](#16-snap-module--road-matching)).
 
 **`fieldtrack-core` is different.** It links Retrofit, OkHttp, Gson and Tink as real
 dependencies, because the licence check has to work in a host that brought no HTTP client
@@ -466,7 +467,7 @@ tracker.ready(config)
 | `service` | `ServiceConfig` | defaults | Foreground service, notification, survival |
 | `persistence` | `PersistenceConfig` | defaults | Retention and diagnostic storage |
 | `sensors` | `SensorConfig` | defaults | Hardware motion assists |
-| `security` | `SecurityConfig` | defaults | Device-integrity policy — accessibility, developer mode, hooking frameworks, clock tampering, mock-location apps ([§19](#19-device-integrity)). Waived entirely in debuggable builds |
+| `security` | `SecurityConfig` | defaults | Device-integrity policy — accessibility, developer mode, hooking frameworks, clock tampering, mock-location apps ([§20](#20-device-integrity)). Waived entirely in debuggable builds |
 | `license` | `String?` | `null` | Release license token. Never persisted |
 | `baseUrl` | `String?` | `null` | Scheme + host for uploads, e.g. `https://api.example.com`. Core never opens a socket; `fieldtrack-sync` resolves a relative path against it |
 | `reset` | `Boolean` | `true` | `true` — this config is applied on top of factory defaults. `false` — the persisted config wins and this object is **ignored after the first launch**; only `setConfig()` changes anything after that. **Leave `true` during development** |
@@ -866,7 +867,7 @@ lifecycleScope.launch {
 | `MotionChange` | `state: MotionState`, `point: TrackPoint?` | `STOPPED ⇄ MOVING ⇄ STOP_PENDING ⇄ STATIONARY` |
 | `ActivityChange` | `activity: ActivityType`, `confidence: Int` | Activity recognition transition |
 | `EnabledChange` | `enabled: Boolean` | Location services toggled |
-| `ProviderChange` | `state: ProviderState` | GPS toggle, permission change, granularity change, battery saver |
+| `ProviderChange` | `state: ProviderState`, `previous: ProviderState?` | GPS toggle, permission change, granularity change, battery saver. `previous` is the snapshot this one replaced — diff the two to find which field moved. `null` on the first reading after `ready()`, which is a starting position rather than a transition |
 | `PermissionChange` | `previous: PermissionTier`, `current: PermissionTier`, `accuracy: LocationAccuracy` | The location grant moved, in either direction — revoke, re-grant, all-the-time→while-using, precise→approximate |
 | `LocationServicesChange` | `enabled: Boolean`, `state: ProviderState` | The GPS/location master switch was toggled. Both directions, including the recovery |
 | `CaptureSuspended` | `reason: ErrorCode`, `message: String` | Capture stopped but the session is **still open**: permission revoked, or every provider off |
@@ -876,7 +877,7 @@ lifecycleScope.launch {
 | `BatteryChange` | `battery: BatteryInfo` | Plug, unplug, low, okay — and drift the capture path notices |
 | `GeofenceAdded` / `GeofenceRemoved` | `geofence` / `geofenceId` | Registry changed |
 | `GeofenceEntered` / `GeofenceExited` | `geofence: TrackerGeofence` | A fence was crossed |
-| `IntegrityChange` | `report: IntegrityReport` | The device-integrity flag set changed — transitions only, not every check ([§19](#19-device-integrity)) |
+| `IntegrityChange` | `report: IntegrityReport` | The device-integrity flag set changed — transitions only, not every check ([§20](#20-device-integrity)) |
 | `SessionInterrupted` | `session: TrackSession` | `ready()` found a session left open by a crash or force-stop — you decide what to do |
 | `Diagnostic` | `message: String` | Informational |
 | `Error` | `code: ErrorCode`, `message: String` | Anything the SDK wants you to know about |
@@ -1012,7 +1013,7 @@ data class TrackPoint(
     val batteryPct: Int? = null,
     val isCharging: Boolean? = null,
     val extras: String? = null,
-    val integrityFlags: Int = 0,         // device-integrity bitmask at capture — see §19.4
+    val integrityFlags: Int = 0,         // device-integrity bitmask at capture — see §20.4
     val providerFlags: Int = 0,          // location-subsystem snapshot at capture — see below
     val acceptReason: String,            // the Reasons vocabulary
 )
@@ -1493,7 +1494,7 @@ point and never a trip. This is also why it is a veto and never a trigger — no
 *cause* a point to be stored, and capture is never gated on motion detection.
 
 Suppressed fixes appear in the decision log as `Reasons.STILLNESS_VETO`
-([§16.4](#164-reasons--the-reason-vocabulary-is-api)), so if you think a real point went
+([§17.4](#174-reasons--the-reason-vocabulary-is-api)), so if you think a real point went
 missing you can see exactly which fixes were withheld and why.
 
 Requires an accelerometer. Without one the flag is turned off at `ready()` and a `Diagnostic`
@@ -1594,6 +1595,10 @@ ArrowIcons.puck(sizePx = 56, color = Color.rgb(26, 115, 232))
 `fieldtrack-core` **never opens a socket**. `fieldtrack-sync` does. An app that does not depend
 on it gets an offline-first SDK with no network code linked at all.
 
+The module carries two independent channels: **positions**, below, and **diagnostics**
+([§15](#15-log-module--diagnostics-to-your-backend)) — separately configured, separately
+credentialed, and unable to affect one another. This section is the first.
+
 ```kotlin
 val sync = TrackerSync.getInstance(context)   // @JvmStatic, idempotent, paired with Tracker.getInstance
 
@@ -1620,12 +1625,12 @@ is a fallback, never an override.
 | `method` | `String` | `"POST"` | HTTP method. **`POST`, `PUT` or `PATCH` only** — see below |
 | `headers` | `Map<String, String>` | empty | Sent on every request. **Never exposed back** — they carry your credential |
 | `autoSync` | `Boolean` | `true` | Upload as points arrive, plus the connectivity and supervision triggers. With it off you call `syncNow()` / `requestSync()` — **except** that closing a session with rows queued always enqueues a drain, because `stop()` tears down every path that could otherwise notice |
-| `persistConfig` | `Boolean` | `true` | Keep an **encrypted** copy of this config so a background upload works in a process your app has not configured. **It persists `headers`, i.e. your credential** — see the note below. Ignored when you supply a custom `SyncTransport` |
 | `batchSize` | `Int` | `100` | Rows per request, 1..1000. Larger = fewer requests but a bigger retry unit |
 | `requiresUnmeteredNetwork` | `Boolean` | `false` | Only upload on Wi-Fi |
 | `gzipRequestBody` | `Boolean` | `false` | Compress the JSON body. Off by default — there is no negotiation for request-body encoding, so a server that does not expect gzip answers 400 |
 | `allowCleartext` | `Boolean` | `false` | Permit an `http://` URL. Local development only. Loopback hosts (`localhost`, `127.0.0.1`, `::1`, `10.0.2.2`) are already exempt |
 | `timeouts` | `SyncTimeouts` | 5 s / 30 s / 20 s | Applied by the built-in transport; ignored by a custom one |
+| `includePointSessionId` | `Boolean` | `false` | Stamp every uploaded point with the session that recorded it (`session_id` on each row of `location`). The envelope's `session_id` describes a whole batch, and a backlog drained after a process kill can hold rows from two drives — this is the only field that says which is which. Off by default, so the body stays byte-identical to every previous release. **Set it on any host that records offline** |
 | `extraParams` | `Map<String, Any>` | empty | Merged into the **top level** of every request body, alongside the `location` array — see [§14.1.1](#1411-extraparams--your-own-body-fields) |
 
 > **`method` accepts `POST`, `PUT` or `PATCH`, and nothing else.** The built-in transport
@@ -1638,41 +1643,23 @@ is a fallback, never an override.
 > `Request.Builder.method(...)`. If you need another one, supply your own `SyncTransport`
 > ([§14.6](#146-custom-transport)) — the interface has no such restriction.
 
-> **`persistConfig` writes your bearer token to disk, encrypted.** This is what makes a
-> background upload survive an OEM kill: `configure()` is your call, and the process
-> `WorkManager` builds to run the upload worker has executed none of your code past
-> `Application.onCreate`. An app that configures after login — in an Activity, once it has a
-> token — previously lost **every** background drain, and the rows waited for the app to be
-> reopened.
+> **The SDK stores nothing about this config, so call `configure()` from
+> `Application.onCreate`.** Your credential never reaches disk — but neither does the rest
+> of the config, and that has a consequence worth planning for: `WorkManager` persists the
+> upload *request*, not your `SyncConfig`, and the process the OS builds to run that request
+> has executed none of your code past `Application.onCreate`. A host that configures only
+> after login, in an Activity, leaves every such process unconfigured — the worker finds
+> nothing, reports done, and the rows wait for the app to be reopened.
 >
-> The blob is sealed with an AES-GCM key held in `AndroidKeyStore`: the key material never
-> enters your process, is not extractable, needs no user authentication (the worker runs with
-> the device locked, which is the point), and **is not included in Android Auto Backup**.
-> That last point is why this is encrypted rather than written like `TrackerConfig`:
-> `android:allowBackup` defaults to `true`, so a plaintext token here would be copied to the
-> user's Google Drive and restored onto a different device. A restored ciphertext is inert
-> and reads as "nothing saved", which is the pre-existing behaviour.
->
-> The copy is deleted, and the key destroyed, when the configuration goes away and on a
-> 401/403. A live `configure()` always beats the stored copy, so a freshly refreshed token is
-> never replaced by an old one. Restore re-validates before adopting, and restores only the
-> config and the built-in transport — no trigger registration and no connectivity watcher, so
-> a worker process never quietly arms a background listener you did not ask for.
->
-> **Never stored when you supply your own `SyncTransport`.** It is your code, it cannot be
-> serialised, and restoring without it would fall back to the built-in OkHttp client —
-> different interceptors, possibly no certificate pinning and no token refresh. `configure()`
-> declines to store anything at all in that case and logs why; sending a credential through a
-> transport you did not choose is worse than not sending it.
->
-> Set `persistConfig = false` if a credential must not reach disk at any strength. The cost is
-> the behaviour every release before this one had: uploads work while your app is alive to
-> configure them, and a cold worker no-ops.
+> Configure with whatever you have at launch and call `configure()` again when the token
+> arrives. It is safe to call repeatedly: it replaces the config, re-registers the trigger,
+> and clears a 403 halt.
 
 **Builder**: `.url()`, `.baseUrl()`, `.path()`, `.method()`, `.header(name, value)`,
-`.headers(map)`, `.autoSync()`, `.persistConfig()`, `.batchSize()`, `.requiresUnmeteredNetwork()`,
+`.headers(map)`, `.autoSync()`, `.batchSize()`, `.requiresUnmeteredNetwork()`,
 `.gzipRequestBody()`, `.allowCleartext()`, `.timeouts(SyncTimeouts)`,
-`.timeouts(connectMs, readMs, writeMs)`, `.extraParam(name, value)`, `.extraParams(map)`,
+`.timeouts(connectMs, readMs, writeMs)`, `.includePointSessionId()`,
+`.extraParam(name, value)`, `.extraParams(map)`,
 `.build()`, `.buildUnchecked()`.
 
 `baseUrl` and `path` are joined with exactly one `/` regardless of which side carries it.
@@ -1784,6 +1771,11 @@ lifecycleScope.launch {
 `events` is a `SharedFlow` with `replay = 1`, so a screen opened after a background drain sees
 the last event rather than a blank panel.
 
+`TrackerSync` also carries the log channel — `configureLogs`, `log`, `logLifecycle`,
+`getLogs`, `syncLogsNow`, `requestLogSync`, `logEvents` and their state. Those are listed in
+[§15.3](#153-the-log-api-on-trackersync), because none of them does anything until you turn
+that channel on.
+
 ### 14.4 Terminal failure semantics
 
 | Status | Behaviour |
@@ -1824,10 +1816,11 @@ unless you call `syncNow()`. Both halves stop after a 401 or 403.
 
 **The durable half needs a config, and a cold process has none.** WorkManager persists the
 *request*, not your `SyncConfig` — and the process it builds to run that request has executed
-none of your code past `Application.onCreate`. `persistConfig`
-([§14.1](#141-syncconfig)) is what lets the worker read the config back; without it the worker
-finds nothing configured and reports done, which is why an app that configures after login used
-to see no background uploads at all.
+none of your code past `Application.onCreate`. Nothing is read back from disk, so if
+`configure()` has not run in that process the worker finds nothing configured and reports
+done, and the rows stay queued until your app is next opened. **Configure in
+`Application.onCreate`** ([§14.1](#141-syncconfig)), and call `configure()` again later if a
+login changes the credential.
 
 #### When a session ends
 
@@ -1945,8 +1938,8 @@ so one call cannot hold the queue through an unbounded backlog.
 | `detected_activity_start_time` | number | yes | Epoch ms when that activity began; `0` when unknown |
 | `battery_percentage` | string | no | 0–100 **as a string**, e.g. `"62"`. Absent when the platform will not say |
 | `is_charging` | boolean | no | Plugged in or full. Absent — **not `false`** — when the platform will not say |
-| `is_mock` | boolean | yes | The fix was flagged as mock by the OS. Android-only concept. Whether mock points are sent at all depends on policy — see [§19.2](#192-policy) |
-| `integrity_flags` | number | yes | Device-integrity bitmask at capture. `0` = nothing observed. Bit values are frozen — see [§19.4](#194-on-the-wire-and-in-storage) |
+| `is_mock` | boolean | yes | The fix was flagged as mock by the OS. Android-only concept. Whether mock points are sent at all depends on policy — see [§20.2](#202-policy) |
+| `integrity_flags` | number | yes | Device-integrity bitmask at capture. `0` = nothing observed. Bit values are frozen — see [§20.4](#204-on-the-wire-and-in-storage) |
 | `integrity_signals` | array of string | yes | The same information by name, for rules that prefer strings to bits. `[]` when nothing was observed |
 
 > **`detected_activity_type` is not a capture gate and should not be one server-side
@@ -2069,7 +2062,412 @@ sealed interface SyncResponse {
 
 ---
 
-## 15. Snap module — road matching
+## 15. Log module — diagnostics to your backend
+
+**Optional, off by default, and in the same artifact as [§14](#14-sync-module--upload-to-your-backend).**
+Nothing below happens until you call `configureLogs()`, and an app that never calls it pays
+no network, no database file and no battery.
+
+Points answer *where the device was*. They cannot answer *why there is nothing there*. A
+track with a twenty-minute hole in it is unreadable on its own — and every plausible cause
+is on the phone, not on your server:
+
+| On the device | What your dashboard sees without logs |
+|---|---|
+| Battery optimiser killed the service | a track that stops |
+| Location downgraded to "approximate" | a track that gets vague |
+| `ACCESS_FINE_LOCATION` denied on first run | **no device at all** |
+| A fix rejected by the accuracy gate | a straight line where the road bends |
+| The process crashed | a track that stops |
+
+This channel makes those durable. `tracker.events` ([§7.1](#71-trackerevent--the-event-flow))
+is a live notification that exists only while something is collecting it; the case you most
+need explained — a process an OEM killed mid-drive — is exactly the case where nobody was.
+
+### 15.1 Turning it on
+
+Two lines. `configureLogs()` **follows the points endpoint** you already configured:
+
+```kotlin
+val sync = TrackerSync.getInstance(context)
+
+sync.configure(
+    SyncConfig.builder()
+        .baseUrl(BuildConfig.API_BASE_URL)
+        .path("v1/location/batch")
+        .header("Authorization", "Bearer $token")
+        .extraParam("device_id", installId)
+        .build()
+)
+
+sync.configureLogs()          // -> <same origin>/v1/logs/batch
+```
+
+Called with no argument it derives the URL from the origin of the `SyncConfig` in force plus
+`v1/logs/batch`, inherits `device_id` from `SyncConfig.extraParams`, and reuses the points
+headers.
+
+> **`device_id` must be the same string on both channels.** That join — a hole in a track,
+> next to the reason for it — is the whole point. Two spellings of the same phone produce
+> two unrelated datasets. Inheriting it is the default for that reason.
+
+Override any of it with a `LogSyncConfig`:
+
+```kotlin
+sync.configureLogs(
+    LogSyncConfig.builder()
+        .path("internal/diagnostics")               // or .url("https://logs.example.com/v1/logs/batch")
+        .header("Authorization", "Bearer $logToken")  // its own credential — recommended
+        .level(LogLevel.INFO)
+        .uploadIntervalMinutes(15)
+        .build()
+)
+```
+
+**Give this endpoint its own credential.** A 401 on the *points* URL is destructive by
+design — it stops tracking and clears the queue ([§14.4](#144-terminal-failure-semantics)).
+A 401 here only stops log shipping. Keeping the scopes apart is what stops a diagnostics
+mistake reaching the point queue.
+
+`configureLogs()` is idempotent and safe to call on every launch — call it right after
+`configure()`, in `Application.onCreate`. It throws `IllegalArgumentException` if the
+resolved config does not validate, so wrap it the same way you wrap `configure()`.
+
+**The two channels are independent in both directions.** Either can be set without the
+other, neither can tear the other down, and no log failure can reach `Tracker.stop()`, the
+upload queue, or a stored position.
+
+### 15.2 `LogSyncConfig`
+
+Every field has a default derived from the points endpoint, so the common call passes
+nothing.
+
+| Field | Type | Default | What it does |
+|---|---|---|---|
+| `url` | `String` | derived | Full endpoint. Blank means "resolve it" — an absolute `url` here, else a bare `path` against `TrackerConfig.baseUrl`, else the points URL's origin plus `v1/logs/batch` |
+| `deviceId` | `String` | inherited | Blank inherits `SyncConfig.extraParams["device_id"]`. Set it only if you genuinely need a different id — you almost certainly do not |
+| `method` | `String` | `"POST"` | `POST`, `PUT` or `PATCH`, same restriction as [§14.1](#141-syncconfig) |
+| `headers` | `Map<String, String>` | inherited | Empty inherits the points headers. **Never exposed back** |
+| `autoSync` | `Boolean` | `true` | Run the periodic drain. With it off you call `syncLogsNow()` / `requestLogSync()` yourself |
+| `level` | `LogLevel` | `INFO` | Minimum severity **recorded**. Filtering happens when the entry is written, not when it is sent, so a device set to `INFO` never stores a `DEBUG` line |
+| `types` | `Set<LogType>` | `EVENT, LIFECYCLE, MESSAGE` | Which kinds are recorded and shipped. `DECISION` is absent on purpose — read its row in [§15.6](#156-logrecord-and-its-enums) before adding it |
+| `bufferCapacity` | `Int` | `5000` | Rows kept on the device. Oldest evicted first, shipped or not — a bounded buffer that refused to drop unsent rows would be unbounded on exactly the device that cannot reach a server. The resulting gap in `seq` is reported, never hidden |
+| `retentionHours` | `Int` | `72` | How long a **shipped** entry is kept before pruning. Queued entries are never pruned by age |
+| `batchSize` | `Int` | `200` | Entries per request, 1..500. The server answers `413` above its own ceiling and the SDK drops that batch rather than retrying it |
+| `requiresUnmeteredNetwork` | `Boolean` | `false` | Only upload on Wi-Fi |
+| `gzipRequestBody` | `Boolean` | **`true`** | On by default here, unlike `SyncConfig`. Log bodies are repetitive prose and compress around 8:1 |
+| `allowCleartext` | `Boolean` | `false` | Permit `http://`. Local development only; loopback is already exempt |
+| `timeouts` | `SyncTimeouts` | 5 s / 30 s / 20 s | Applied by the built-in transport |
+| `uploadIntervalMinutes` | `Long` | `15` | Periodic drain cadence. **15 is WorkManager's floor** and the config rejects less |
+| `nudgeLevel` | `LogLevel?` | `WARN` | The severity that earns a **prompt** drain instead of waiting for the heartbeat. `null` disables it — see below |
+| `nudgeCooldownMs` | `Long` | `30000` | Shortest gap between two prompt drains. A burst inside the window is **deferred to its end, not dropped** |
+| `extraParams` | `Map<String, Any>` | empty | Merged into the top level of the body, beside `logs`. Cannot use `logs`, `device_id`, `session_id`, `app`, `device` or `uploaded_at` — the envelope owns those |
+
+**`nudgeLevel` is what makes an incident arrive in seconds rather than in fifteen minutes.**
+The channel is otherwise a quarter-hourly heartbeat, which is right for the volume and wrong
+for the entries somebody is waiting on — a GPS toggle, a permission revocation, a capture
+suspension. Those are `WARN` or above and are released early, throttled to one drain per
+`nudgeCooldownMs`. Lowering it to `INFO` is a battery decision, not a diagnostics one: on a
+busy device that is a radio wake every cooldown window.
+
+### 15.3 The log API on `TrackerSync`
+
+| Member | Signature | Notes |
+|---|---|---|
+| `configureLogs` | `fun configureLogs(config: LogSyncConfig = LogSyncConfig(), transport: SyncTransport? = null)` | Turns the channel on. Idempotent. Throws `IllegalArgumentException` on a config that cannot be resolved |
+| `disableLogSync` | `fun disableLogSync()` | Stops recording and shipping. **The buffer is kept** — entries written before you turned it off still describe the period they were written in, and still ship if the channel comes back |
+| `logEndpoint` | `val logEndpoint: String?` | Where diagnostics go, or `null` if unconfigured — or if the endpoint refused the channel. Headers are deliberately not exposed |
+| `isLogSyncConfigured` | `val isLogSyncConfigured: Boolean` | Derived from `logEndpoint`. **Do not cache it** — a refusal clears configuration with no involvement from you |
+| `log` | `fun log(level: LogLevel, tag: String, message: String, code: String? = null, data: String? = null)` | Records one host line as a `MESSAGE`. Fire and forget; a no-op until `configureLogs()` and unless the level and type pass its filters |
+| `logLifecycle` | `fun logLifecycle(phase: String, tag: String = "Host")` | Records a boundary of your own — a shift starting, a job accepted. `phase` is a `LifecyclePhase` constant or your own string |
+| `getLogs` | `suspend fun getLogs(sessionId: String? = null, limit: Int = 200, offset: Int = 0): List<LogRecord>` | The device buffer, newest first. `null` means every session, including entries belonging to none |
+| `pendingLogCount` | `suspend fun pendingLogCount(): Int` | Entries waiting to ship |
+| `requestLogSync` | `fun requestLogSync()` | Enqueues a network-constrained one-shot drain. Safe to call often. No-op once the endpoint has refused the channel |
+| `syncLogsNow` | `suspend fun syncLogsNow(): LogSyncQueue.Result` | Drains inline in the caller's scope. Prefer `requestLogSync()` for anything not user-initiated — diagnostics are read after the fact |
+| `logEvents` | `val logEvents: SharedFlow<SyncEvent>` | One event per completed log exchange. Replay 1 |
+
+`logEvents` is a **second** flow rather than a second case on `SyncEvent`, so a screen showing
+one "last sync" badge is never forced to conflate a diagnostics upload failing with a
+positions upload failing.
+
+### 15.4 What the SDK records without being asked
+
+Once configured, the SDK writes its own `TrackerEvent` stream into the buffer. You do not
+subscribe to anything:
+
+| Recorded as | Level | From |
+|---|---|---|
+| `Error` | `ERROR` | Any `TrackerEvent.Error` — permission revoked, location disabled, storage full |
+| `CaptureSuspended` | `WARN` | Capture stopped while the session stayed open |
+| `CaptureResumed` | `INFO` | Capture re-armed |
+| `PermissionChange` | `WARN` | The grant moved, in either direction |
+| `LocationServicesChange` | `WARN` off, `INFO` on | The device stopped or started being able to locate at all |
+| `ProviderChange` | **`WARN`** on a provider or master-switch toggle, `INFO` otherwise | A GPS toggle behind an unchanged master switch emits nothing else, so it is logged at `WARN` and earns a prompt drain. A power-save, airplane or permission field moving stays `INFO` — each already has its own entry |
+| `PowerSaveChange` | `INFO` | Battery saver on/off |
+| `IntegrityChange` | `WARN` with a blocking signal, else `INFO` | The device-integrity flag set changed |
+| `MotionChange`, `ActivityChange` | `DEBUG` | Motion state and activity transitions |
+| `GeofenceEntered` / `GeofenceExited` | `INFO` | A fence was crossed |
+| `EnabledChange` | `INFO`, `LIFECYCLE` | Session start and stop — **the only place a session boundary reaches your server** |
+| `SessionInterrupted` | `WARN`, `LIFECYCLE` | `ready()` found a session left open by a crash |
+
+**Deliberately not recorded:** `Location` (that is what the points endpoint is for),
+`LocationRejected` (already in the SDK's decision log and read from there at send time — see
+`LogType.DECISION`), and `Heartbeat`, `BatteryChange` and the licence answers (volume, with
+nothing a reader would act on).
+
+A provider transition also carries a filterable `code` — `GPS_OFF`, `GPS_ON`,
+`NETWORK_OFF`, `NETWORK_ON`, `LOCATION_OFF`, `LOCATION_ON` — plus `previous_gps`,
+`previous_network` and `previous_enabled` in its `data`.
+
+### 15.5 Writing your own lines
+
+```kotlin
+sync.log(
+    level = LogLevel.WARN,
+    tag = "Dispatch",
+    message = "Job 8842 accepted with no route",
+    code = "NO_ROUTE",
+    data = """{"job_id":"8842","stop_count":0}""",
+)
+
+sync.logLifecycle(LifecyclePhase.SESSION_START, tag = "Shift")
+```
+
+`data` must be a JSON **object or array as text**, or `null`. Anything else is dropped —
+the entry is still stored, but without the payload — because the server's column is
+structured and one malformed value would spoil a batch carrying thirty useful entries.
+
+> **Redaction is yours.** Whatever you pass to `log()` is stored on disk and uploaded. A log
+> line is the easiest place in any system to leak a token.
+
+Nothing written here reaches logcat. This is the durable channel, which is the whole point:
+a live log cannot cover the process that was killed.
+
+### 15.6 `LogRecord` and its enums
+
+What `getLogs()` returns, and the shape the endpoint receives:
+
+```kotlin
+data class LogRecord(
+    val id: String,                    // SHA-1("<sessionId>:<seq>:<type>:<elapsedRealtimeNanos>"), 40 hex
+    val sessionId: String?,            // null for an entry that belongs to no session
+    val seq: Long,                     // monotonic per session AND per type, from 0
+    val timeMs: Long,                  // device wall clock — display only
+    val elapsedRealtimeNanos: Long,    // monotonic since boot — the ordering key
+    val level: LogLevel,
+    val type: LogType,
+    val tag: String,                   // subsystem: "CaptureGate", "ProviderState", your own
+    val code: String?,                 // ErrorCode name, event name, or a Reasons string
+    val message: String,
+    val data: String?,                 // JSON object or array as text
+)
+```
+
+`id` is deterministic, so a batch that reached the server and lost its response is re-sent
+whole and **collides instead of duplicating**. Retrying is free by design.
+
+`sessionId` is `null` for an entry emitted between sessions — a boot, a service start, a
+config change. That is a real answer, not a gap: bucketing a boot-time entry under whichever
+session happened to be current at upload time would make it lie.
+
+`seq` gaps are **data, not errors**. The buffer is bounded; a device logging for six hours
+offline drops its oldest entries, and the gap is what says so. A silent gap would read as
+"nothing happened", which is the one thing it does not mean.
+
+| `LogLevel` | |
+|---|---|
+| `DEBUG` | Motion and activity transitions, and the decision log |
+| `INFO` | Default. Provider and battery context, session boundaries |
+| `WARN` | Something a person has to act on: a permission moved, a provider toggled, capture suspended |
+| `ERROR` | Any `TrackerEvent.Error` |
+
+`LogLevel.admits(minimum)` is public if you want to pre-filter your own lines the same way
+the recorder does.
+
+| `LogType` | Volume | Notes |
+|---|---|---|
+| `EVENT` | low | The `TrackerEvent` stream, flattened |
+| `LIFECYCLE` | very low | Session and service boundaries. **Advisory** — this channel is lossy, so annotate a session with it, never treat it as the sole truth for the session's bounds |
+| `MESSAGE` | yours | `log()` |
+| `DECISION` | **~29 000 per device per 8-hour shift** | Why each fix was accepted or rejected, with the arithmetic. Off by default. Turn it on for a **named device with a ticket open**, never for a fleet — and note it is only recorded at `DEBUG`. It is read from the SDK's existing decision log at send time rather than written twice, and the first `configureLogs()` that enables it skips everything already recorded, so an opt-in ships the next drive rather than the last three days |
+
+`LifecyclePhase` holds the `phase` strings a `LIFECYCLE` entry carries in its `data`:
+`session_start`, `session_stop`, `session_interrupted`, `service_start`, `service_stop`,
+`process_start`, `boot_completed`, `config_changed`.
+
+### 15.7 Results and failure semantics
+
+```kotlin
+sealed interface LogSyncQueue.Result {
+    data class Shipped(val count: Int) : Result
+    data object Empty : Result
+    data class Retry(val reason: String, val retryAfterMs: Long? = null) : Result
+    data class Rejected(val statusCode: Int) : Result
+}
+```
+
+| Status | Behaviour |
+|---|---|
+| **2xx** | Stored. `duplicates` in the response are entries the server already held — not an error |
+| **401 / 403** | **Terminal for this channel, non-destructive.** Log shipping halts, the buffer is kept, tracking and the point queue are untouched |
+| **404 / 405 / 501** | **There is no endpoint here.** Same halt: every later batch would collect the same answer, so the SDK stops asking rather than discarding your diagnostics a batch at a time. This is the case where your backend has not implemented the endpoint at all — it costs one request per process and nothing else |
+| **413** | Over the server's 500-entry ceiling. The batch is **dropped**, not retried — it will never be accepted |
+| **Other 4xx** | Permanently unacceptable. Batch dropped, drain moves on |
+| **503 / timeout / no response** | Transient. Entries stay buffered and retry with backoff. `Retry-After` is honoured |
+
+**This is the inverse of the points queue, on purpose.** For a position, dropping is data
+loss and a retry loop is the lesser evil; for a log, a poison batch that blocks the buffer
+forever costs battery and buys nothing.
+
+Recovery from any halt is the next `configureLogs()` — which, if you call it in
+`Application.onCreate` as recommended, means the next process start picks up an endpoint you
+deployed in the meantime, with the buffer intact.
+
+`Retry("already draining")`, `Retry("log sync not configured")` and `Retry("no transport")`
+describe the SDK's own situation rather than a failed exchange. None is an upload error.
+
+### 15.8 The wire format
+
+```
+POST <logEndpoint>
+Content-Type: application/json; charset=utf-8
+Content-Encoding: gzip
+Authorization: <your header>
+```
+
+```jsonc
+{
+  "device_id":   "8f14e45f-ceea-467a-9c1a-2b0a1e1f9c31",  // SAME id as the points envelope
+  "uploaded_at": 1719400123456,                           // device wall clock at send
+
+  // Constant for the life of a process, so it rides the batch rather than every entry.
+  "app":    { "package": "com.acme.field", "version": "3.4.1", "build": 3401, "sdk": "1.0.8" },
+  "device": { "manufacturer": "samsung", "model": "SM-A546E", "os": 34 },
+
+  "logs": [
+    {
+      "id":            "3f1a…",                     // 40 hex, the dedupe key
+      "session_id":    "20260907-143512-1f0c8a2e",  // per row, authoritative; null is legal
+      "seq":           1482,
+      "elapsed_nanos": "918273645000000",           // a STRING — see below
+      "time":          1719400000000,
+      "level":         "warn",                      // debug | info | warn | error
+      "type":          "event",                     // event | decision | message | lifecycle
+      "tag":           "ProviderState",
+      "code":          "GPS_OFF",
+      "message":       "GPS off",
+      "data":          { "gps": false, "network": true, "previous_gps": true }
+    }
+  ]
+}
+```
+
+**`elapsed_nanos` travels as a string.** The count passes 2^53 after 104 days of uptime and
+a JSON number rounds silently past that. Order on it, never on `time` — the wall clock can
+jump backwards mid-session; `elapsedRealtimeNanos` cannot.
+
+Expected response:
+
+```jsonc
+{ "accepted": 487, "duplicates": 13, "rejected": 0, "batch_id": "lb_01J8…" }
+```
+
+Only two things get an entry rejected server-side, and both are structural: a missing `id`
+(the dedupe key) and a missing or non-numeric `elapsed_nanos` (the ordering key). Everything
+else should be coerced rather than refused — a log line that cannot be stored perfectly is
+still worth storing imperfectly.
+
+`data` is type-specific and should be stored **verbatim and unvalidated**. The useful field
+is the one nobody modelled in advance.
+
+| `type` | Shape of `data` |
+|---|---|
+| `event` | The flattened `TrackerEvent` — e.g. `{"gps":false,"network":true,"enabled":true,"permission":"FULL","previous_gps":true}` |
+| `decision` | `{"verdict":"REJECT","reason":"NLP Fallback","latitude":23.02,"longitude":72.57,"accuracy":48.0,"sigma":6.4,"threshold":4.0,"distance_moved_m":287.4,"effective_speed_mps":23.9,"motion_state":"MOVING","point_uuid":"…"}` — `point_uuid` only when the verdict is `ACCEPT` |
+| `lifecycle` | `{"phase":"session_start"}` |
+| `message` | Whatever you passed. May be `{}` |
+
+### 15.9 Table structure
+
+**On the device.** The buffer is a second Room database, `fieldtrack-logs-<yourPackage>.db`,
+created only when `configureLogs()` is called and kept **separate from the file holding
+positions** — which is what makes a credential failure on the log endpoint structurally
+unable to reach a stored point. It is private to the SDK and has no public schema; read it
+through `getLogs()` and `pendingLogCount()`, never by opening the file.
+
+**On your backend**, two tables. This is the shape the endpoint above implies; column types
+are PostgreSQL and translate directly.
+
+`session_logs` — one row per entry:
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `text` **PK** | The 40-hex `id` from the entry. Being the primary key is what makes an at-least-once re-send collide instead of duplicating |
+| `device_id` | `text` | From the envelope, or from your credential. **The join to your points data** |
+| `session_id` | `text` **null** | Per-row value wins, then the envelope's, then `null`. Nullable is required, not optional |
+| `seq` | `bigint` | Per session **and per type**. Gaps are eviction, not loss of integrity |
+| `elapsed_nanos` | `bigint` | Arrives as a string; store as 64-bit. **Order on this** |
+| `time` | `timestamptz` | Device wall clock. Display only |
+| `received_at` | `timestamptz` | Your clock, at insert. What you page by |
+| `level` | `text` | `debug` / `info` / `warn` / `error`. Coerce an unknown value to `info` rather than rejecting |
+| `type` | `text` | `event` / `decision` / `message` / `lifecycle`. Coerce an unknown value to `message` |
+| `tag` | `text` | ≤ 64 chars |
+| `code` | `text` **null** | ≤ 64 chars. **The column a week of one device's logs gets grouped by** — index it |
+| `message` | `text` | ≤ 4096 chars. Truncate, do not reject |
+| `data` | `jsonb` **null** | Verbatim, never validated |
+| `batch_id` | `text` | The batch it arrived in |
+
+Useful indexes: `(device_id, received_at desc)`, `(session_id, elapsed_nanos)`, and
+`(device_id, code)`.
+
+`log_batches` — one row per HTTP exchange, **written whatever the outcome**, including the
+`413`s and the auth failures:
+
+| Column | Type | Notes |
+|---|---|---|
+| `batch_id` | `text` **PK** | Returned to the device as `batch_id` |
+| `device_id` | `text` | |
+| `received_at` | `timestamptz` | |
+| `status_code` | `int` | What you answered |
+| `entry_count` | `int` | What arrived |
+| `accepted` / `duplicates` / `rejected` | `int` | What you did with them |
+| `error` | `text` **null** | Why, when there was one |
+| `gzip` | `boolean` | Whether the body was compressed |
+| `app_package` / `app_version` / `app_build` / `sdk_version` | `text` / `text` / `bigint` / `text` | From the envelope's `app` |
+| `device_manufacturer` / `device_model` / `device_os` | `text` / `text` / `int` | From the envelope's `device` |
+
+Keep it separate from your point-ingest audit trail so a log flood is visible without
+polluting it. The per-batch `app` and `device` metadata lives here rather than on every
+entry — it is the same 200 bytes on each one otherwise, and it is what a "works on my
+device" ticket is actually about.
+
+**No row in `log_batches` at all** means the request never reached your handler: a 404, a
+network failure, or it never left the device. **A row** means `status_code`, `rejected` and
+`error` say exactly what happened.
+
+### 15.10 What it costs, and what to leave off
+
+| | |
+|---|---|
+| Entries per request | `batchSize`, default 200, hard ceiling 500 |
+| Requests | one per `uploadIntervalMinutes` (default 15), plus one per `nudgeCooldownMs` when a `WARN` lands |
+| Body | gzipped by default, roughly 8:1 |
+| Device storage | `bufferCapacity` rows, default 5000, oldest evicted |
+| Device retention | shipped entries pruned after `retentionHours` (default 72); queued entries are never pruned by age |
+
+Defaults are sized for a fleet: `INFO`, no `DECISION`, a quarter-hourly drain. That is a few
+kilobytes per device per shift.
+
+**`LogType.DECISION` is the one to think about.** It is the same order of volume as
+`track_point` and the rows are wider. Enable it for one device while a ticket is open, and
+turn it off again — a `DEBUG` flag set during a ticket and never cleared is how one device
+ends up shipping 29 000 rows a day for a year.
+
+If you never want the channel at all, do nothing: it is off until `configureLogs()`.
+
+---
+
+## 16. Snap module — road matching
 
 Optional. With no provider installed, `buildTrack()` never leaves the device and never emits a
 `snap_unavailable` warning.
@@ -2099,7 +2497,7 @@ guarantee. Point this at your own deployment.
 It **degrades per chunk, never wholesale**: a trace split across ten requests does not lose the
 nine that succeeded because the tenth was rate-limited.
 
-### 15.1 Writing your own provider
+### 16.1 Writing your own provider
 
 ```kotlin
 interface RoadSnapProvider {
@@ -2124,11 +2522,11 @@ The 80 m `snapMaxOffRoadM` guard means a parallel service road can never relocat
 
 ---
 
-## 16. Diagnostics
+## 17. Diagnostics
 
 Three layers, from rawest to most interpreted.
 
-### 16.1 Layer 1 — raw fixes
+### 17.1 Layer 1 — raw fixes
 
 Requires `persistence.persistRawFixes = true`.
 
@@ -2144,11 +2542,11 @@ data class RawFix(
     val accuracy: Float,
     val bearingDeg: Float,      // 0f when the provider reported no bearing
     val provider: String,
-    val integrityFlags: Int,    // device-integrity bitmask when received — see §19.4
+    val integrityFlags: Int,    // device-integrity bitmask when received — see §20.4
 )
 ```
 
-### 16.2 Layer 2 — raw points
+### 17.2 Layer 2 — raw points
 
 Requires `persistence.persistRawPoints = true`. Every judged fix in point form, accepted or not
 — the layer to reach for when the question is "why is there **no** point here" rather than "why
@@ -2166,7 +2564,7 @@ is this point wrong". `RawPoint` has the same columns as `TrackPoint` plus:
 one: a run of rejects whose snapshot shows `accuracyAuthorization = ACCURACY_REDUCED` is a
 permission problem, not a filter problem, and the two look identical from the point table alone.
 
-### 16.3 Layer 3 — the decision log
+### 17.3 Layer 3 — the decision log
 
 On by default (`persistence.persistDecisions = true`).
 
@@ -2199,7 +2597,7 @@ every row ever written recorded the default, on a motorway and on a desk alike. 
 stamped for real. It remains a label and nothing more: no gate reads it, because capture is
 never gated on motion detection.
 
-### 16.4 `Reasons` — the reason vocabulary **is API**
+### 17.4 `Reasons` — the reason vocabulary **is API**
 
 These exact strings appear on `TrackPoint.acceptReason`, `RawPoint.reason` and
 `FixDecision.reason`. They are stable; changing one is a breaking change.
@@ -2243,7 +2641,7 @@ These exact strings appear on `TrackPoint.acceptReason`, `RawPoint.reason` and
 
 ---
 
-## 17. Java interop
+## 18. Java interop
 
 Every entry point is Java-callable. `getInstance`, `TrackerConfig.builder()` and
 `SyncConfig.builder()` are `@JvmStatic`; `PointQuery`, `TrackOptions` and the paged query
@@ -2269,7 +2667,7 @@ you are assembling config from untrusted input.
 
 ---
 
-## 18. ProGuard / R8
+## 19. ProGuard / R8
 
 **You do not need to add any rules.** Each AAR ships `consumer-rules.pro` and the published
 artifacts are already R8-minified.
@@ -2282,6 +2680,9 @@ What this means in practice:
   `StopNode`, `ArrowAnchor`, `LiveTrackUpdate`, `PuckState`, `SegmentType`, `Smoothing`, …) keep
   public class and member names, so named accessors survive.
 - Enum constants are preserved — persisted rows and wire values use `name`/`valueOf`.
+- The log channel's types (`LogSyncConfig` and its `Builder`, `LogRecord`, `LogLevel`,
+  `LogType`, `LifecyclePhase`, `LogSyncQueue.Result`, and the wire DTOs) keep their names
+  too, so `configureLogs(...)` compiles against the published AAR unchanged.
 - SDK logging is compiled out of release builds entirely.
 - No sources JAR is published; a Javadoc JAR with rendered public API HTML is.
 
@@ -2292,7 +2693,7 @@ inside your APK.
 
 ---
 
-## 19. Device integrity
+## 20. Device integrity
 
 A second security layer beside the license gate. It answers one question — *can this
 device fabricate the location data it is about to send?* — and lets you decide what to do
@@ -2303,7 +2704,7 @@ debuggable, exactly as the license check is waived there. Development builds, em
 and instrumentation runs are unaffected, with nothing to remember to switch off and
 nothing that could survive into production.
 
-### 19.1 What is checked
+### 20.1 What is checked
 
 | Signal | How | Default |
 |---|---|---|
@@ -2319,9 +2720,9 @@ nothing that could survive into production.
 | `MOCK_LOCATION_FIX` | The platform flagged a delivered fix as mock | **`BLOCK`** |
 
 No new permission is required, and `QUERY_ALL_PACKAGES` is deliberately **not** requested
-— see [§19.5](#195-limits-worth-knowing).
+— see [§20.5](#205-limits-worth-knowing).
 
-### 19.2 Policy
+### 20.2 Policy
 
 Three levels per group of signals:
 
@@ -2370,7 +2771,7 @@ In practice:
 `isMock` comes from the platform's own `Location.isMock`, which cannot be argued with. It is
 Android-only.
 
-### 19.3 Reading the result
+### 20.3 Reading the result
 
 ```kotlin
 when (val result = tracker.ready(config)) {
@@ -2399,7 +2800,7 @@ evaluation. A `BLOCK` finding also arrives as `TrackerEvent.Error` with
 `IntegrityReport.waived` is `true` in a debuggable build: nothing was probed, and the
 empty `findings` list is not a claim that the device is clean.
 
-### 19.4 On the wire and in storage
+### 20.4 On the wire and in storage
 
 Every accepted point carries `integrityFlags` — the bitmask of every signal observed when
 it was captured, `WARN` and `BLOCK` alike. It is persisted on the point, readable through
@@ -2428,7 +2829,7 @@ column.
 the whole defence: an attacker who has already hooked the process can patch the client
 that produces them. The value is that tampering has to defeat both sides.
 
-### 19.5 Limits worth knowing
+### 20.5 Limits worth knowing
 
 - **Package visibility.** From Android 11 the SDK cannot enumerate every installed app, so
   `MOCK_LOCATION_APP_SELECTED` catches a fake-GPS app only where the platform makes it
@@ -2443,7 +2844,7 @@ that produces them. The value is that tampering has to defeat both sides.
 - **Emulators skip the Frida port scan.** CI images run enough loopback tooling to make it
   noise.
 
-### 19.6 Build-time checks
+### 20.6 Build-time checks
 
 The SDK ships lint rules inside its AARs, so they run in **your** build:
 
@@ -2461,7 +2862,7 @@ fire and the runtime waiver already applies.
 
 ---
 
-## 20. Troubleshooting
+## 21. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -2474,9 +2875,9 @@ fire and the runtime waiver already applies.
 | Very few points while stationary | Working as designed — the data-plane heartbeat warms the filter without storing | Set `persistHeartbeat = true` if you want them stored |
 | Zigzag / drift while stationary | Accuracy ceiling too loose | `AccuracyProfile.STRICT`, or a `CUSTOM` ceiling |
 | Points keep arriving from a phone lying on a desk | Indoor Wi-Fi/cell-centroid hops read as travel. The pipeline's own fix for this needs no configuration and is in the SDK already | Update the SDK first. If points still arrive, turn on `motion.suppressWhileStationary` — the accelerometer veto ([§12.3](#123-points-from-a-device-that-is-not-moving)) |
-| `suppressWhileStationary` set, still storing points | The fix measured as moving, so the veto was never consulted — Doppler or displacement outranks the sensors by design | Read the decision log: a withheld fix says `Stillness Veto`, a stored one names the gate that kept it ([§16.3](#163-layer-3--the-decision-log)) |
+| `suppressWhileStationary` set, still storing points | The fix measured as moving, so the veto was never consulted — Doppler or displacement outranks the sensors by design | Read the decision log: a withheld fix says `Stillness Veto`, a stored one names the gate that kept it ([§17.3](#173-layer-3--the-decision-log)) |
 | `suppressWhileStationary` had no effect at all | No accelerometer — the flag is turned off at `ready()` with a `Diagnostic` | Check `tracker.getSensors().accelerometer`. Nothing else to do; the pipeline's own defences still apply |
-| Every `FixDecision.motionState` reads `STOPPED` | Fixed — the field had no writer, so every row recorded the default | Update the SDK ([§16.3](#163-layer-3--the-decision-log)) |
+| Every `FixDecision.motionState` reads `STOPPED` | Fixed — the field had no writer, so every row recorded the default | Update the SDK ([§17.3](#173-layer-3--the-decision-log)) |
 | Corners drawn as straight chords | Turn fidelity settings off | Keep `turnBurst = true`, `useGyroTurnPrediction = true`, `cornerAnchorCapture = true`, `bearingChangeCaptureDeg = 30`; use `smoothing = HEADING_SPLINE` where the fixes carry a GNSS bearing |
 | Navigation "randomly stops" | 1 Hz stream with no foreground service | `navigationMode` requires `service.foregroundService` — `validate()` enforces it |
 | Tracking ends when the user swipes the app away | `stopOnTerminate = true` | Leave it `false` (the default) |
@@ -2484,10 +2885,17 @@ fire and the runtime waiver already applies.
 | Uploads stopped, rows still queued | A 403 halted the queue | Call `sync.configure(...)` again with a working credential |
 | Queue does not drain when the network returns | `autoSync = false`, so only the durable half runs — nothing asks for a drain until the next enqueued work is released | Set `autoSync = true`, or call `syncNow()` from your own connectivity handling |
 | Rows left queued after `stop()` under `autoSync = false` | Fixed — the session-close drain used to fire only when `autoSync` was on, and `stop()` tears down every other path that could notice | Update the SDK. Closing a session now enqueues a drain whenever sync is configured ([§14.4](#when-a-session-ends)) |
-| No background uploads after the OEM kills the app | Your app configures sync after login, so the process WorkManager builds for the worker has no config | Leave `persistConfig = true` (the default) — the worker reads an encrypted copy back ([§14.1](#141-syncconfig)). It is disabled automatically if you supply a custom `SyncTransport` |
-| Background uploads stopped after adding a custom `SyncTransport` | Deliberate: the config is not persisted with one, because a cold worker cannot rebuild your client and the built-in one is not a substitute | Configure sync in `Application.onCreate` so every process has it, including the worker's |
+| No background uploads after the OEM kills the app | Your app configures sync after login, so the process WorkManager builds for the worker has no config, and nothing is read back from disk | Call `configure()` in `Application.onCreate` with whatever you have, and again when the token arrives ([§14.1](#141-syncconfig)) |
+| Background uploads stopped after adding a custom `SyncTransport` | A worker process runs `Application.onCreate` and nothing else, so your transport is only installed if you install it there | Configure sync, and supply your transport, from `Application.onCreate` so every process has both ([§14.6](#146-custom-transport)) |
 | `NetworkAvailable` arrives but nothing uploads | The drain ran and failed — the event says a drain was *requested*, not that it succeeded | Read the `HttpResponse` that follows for the reason; a `null` `statusCode` means the request never completed |
 | Backlog uploads in a scrambled order | Fixed — the queue is FIFO by insertion, including across a reboot | Update the SDK; older builds ordered on a monotonic clock that restarts at boot |
+| Nothing ever reaches the log endpoint | `configureLogs()` was never called — points and diagnostics are separate channels | Call it after `configure()` ([§15.1](#151-turning-it-on)) |
+| Log entries arrive up to 15 minutes late | Working as designed: the channel is a quarter-hourly heartbeat, and only `nudgeLevel` and above drain promptly | Nothing, or lower `nudgeLevel` to `INFO` — a battery cost, not a free one ([§15.2](#152-logsyncconfig)) |
+| Log shipping stopped on its own, entries still buffered | The endpoint refused the channel: 401/403 on the credential, or 404/405/501 meaning there is no endpoint there | Fix the route or the token; the next `configureLogs()` retries with the buffer intact ([§15.7](#157-results-and-failure-semantics)) |
+| Logs saved under a device your points are not under | `LogSyncConfig.deviceId` differs from `SyncConfig.extraParams["device_id"]` | Leave `deviceId` blank so it inherits. The join between the two channels is that string ([§15.1](#151-turning-it-on)) |
+| `seq` has gaps | The device buffer is bounded and evicted its oldest entries | Expected, and reported rather than hidden. Raise `bufferCapacity` or shorten `uploadIntervalMinutes` ([§15.6](#156-logrecord-and-its-enums)) |
+| A `data` payload is missing from an entry that is otherwise there | It was not a JSON object or array, so it was dropped rather than sent | Pass valid JSON text to `log()`; the entry itself is always kept ([§15.5](#155-writing-your-own-lines)) |
+| Log volume far higher than expected | `LogType.DECISION` is enabled — roughly 29 000 entries per device per shift | Remove it from `types`, or keep it on one named device while a ticket is open ([§15.10](#1510-what-it-costs-and-what-to-leave-off)) |
 | Tracking stopped and the queue emptied | A 401 tore everything down | Re-authenticate, then `ready()` / `start()` / `configure()` again |
 | The upload-status line vanished mid-session | A 401 or 403 cleared the sync config — the line is only posted while sync is configured | Check `SyncEvent.HttpResponse` for which, then the two rows above ([§14.4](#144-terminal-failure-semantics)) |
 | The upload-status line never appeared | `showSyncStatusInNotification` left off, or `configure()` never called | Turn the flag on **and** configure sync; it is a diagnostic and stays off by default ([§5.5](#55-serviceconfig)) |
@@ -2498,8 +2906,8 @@ fire and the runtime waiver already applies.
 | `MOTION_ONLY` behaves like `CONTINUOUS`, battery high | `motionQuality = POOR` — the mode was overridden at `ready()` | Read `tracker.state.value.effectiveTrackingMode`. Check `ACTIVITY_RECOGNITION` is granted: a denial reaches `POOR` on hardware that is otherwise fine, and re-running `ready()` after the grant clears it |
 | Never saw `MOTION_DETECTION_DEGRADED` on a device you know is degraded | It is emitted inside `ready()`, and `events` has `replay = 0` | Read `TrackerState.motionQuality` instead — it always has a current value. Collect `events` before calling `ready()` if you want the event itself |
 | Stops reported minutes late | `motionQuality = DEGRADED` — the SDK doubled `stopTimeoutMin` | Working as designed on hardware with no gyroscope or trigger sensor. The `Diagnostic` at `ready()` names the old and new value |
-| `ready()`/`start()` returns `DEVICE_INTEGRITY_BLOCKED` | A `BLOCK`-policy signal fired | Read `tracker.integrity()` for the signals ([§19](#19-device-integrity)); relax that policy to `WARN` if the device is legitimate |
+| `ready()`/`start()` returns `DEVICE_INTEGRITY_BLOCKED` | A `BLOCK`-policy signal fired | Read `tracker.integrity()` for the signals ([§20](#20-device-integrity)); relax that policy to `WARN` if the device is legitimate |
 | Session ends by itself with `DEVICE_INTEGRITY_BLOCKED` | The health-loop re-check fired mid-session | Same as above; `integrityRecheckIntervalMs(0)` disables the periodic re-check |
 | Integrity findings never appear | The host app is debuggable, so the layer is waived | Expected. Check `IntegrityReport.waived`; exercise the layer in a release build |
-| `assembleRelease` fails on `FieldTrackSecurityDisabled` | A release source set disables the integrity layer | Move the override to `src/debug/` ([§19.6](#196-build-time-checks)) |
+| `assembleRelease` fails on `FieldTrackSecurityDisabled` | A release source set disables the integrity layer | Move the override to `src/debug/` ([§20.6](#206-build-time-checks)) |
 | Live map jumps backwards | Drawing a stale frame | Drop any `LiveTrackUpdate` whose `sequence` is not newer than the last drawn |
