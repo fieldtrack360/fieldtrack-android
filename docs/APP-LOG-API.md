@@ -78,6 +78,37 @@ Identity precedence: **token first, envelope second**. The envelope is an unauth
 > track, next to the reason for it — is the entire point of the endpoint. Two spellings of the
 > same phone produce two unrelated datasets.
 
+### The hardware line
+
+`app` and `device` land on the batch row **and** on the session's first sighting: the server
+turns them into one synthetic log entry at the head of every session named by the batch.
+
+```jsonc
+{
+  "seq": -1,                      // below the device's own counter, which starts at 0
+  "level": "info", "type": "lifecycle", "tag": "Device", "code": "DEVICE_INFO",
+  "message": "samsung SM-A546E · Android 34 · com.acme.field 3.4.1 (3401) · sdk 1.9.0",
+  "data": { "synthetic": "server", "source": "log-batch envelope",
+            "device": { /* verbatim */ }, "app": { /* verbatim */ } }
+}
+```
+
+- **The device does not send it and must not.** The SDK ships the metadata once per envelope,
+  never as an entry; the entry is synthesised server-side from what the envelope already
+  carried. It costs the device nothing and no wire format changed.
+- **`elapsed_nanos` is one below the batch's earliest entry**, and `seq` is `-1`, so it is first
+  in both orders — the panel's `elapsed_nanos` and the export's `(type, seq)`. `-1 → 0` is
+  contiguous, so it does not invent a dropped-entry marker.
+- **Idempotent, and honest about upgrades.** The id is `SHA-1("<session>:device-info:<the two
+  blocks, canonical>")`: a re-delivered batch collides, and an app upgrade mid-session writes a
+  *second* line rather than overwriting the first.
+- **It is not counted.** `accepted` answers for the entries the device sent, so a device can
+  still reconcile the response against its own batch.
+- **The two exclusions.** A tombstoned session gets none (§2.7 — a synthetic row would
+  resurrect it on the dashboard), and an envelope carrying neither `app` nor `device` gets none:
+  an empty hardware line would claim the phone reported nothing, which is a different fact from
+  a client too old to send it.
+
 ### One entry
 
 ```jsonc
@@ -103,7 +134,7 @@ Identity precedence: **token first, envelope second**. The envelope is an unauth
 | `id` | **yes** | `SHA-1("<session_id>:<seq>:<type>:<elapsed_nanos>")`, 40 hex. Truncated at 128 chars. Missing ⇒ the entry is **rejected**. |
 | `elapsed_nanos` | **yes** | Digits only. Accepted as a **string** or a number; send the string — the count passes 2^53 after 104 days of uptime and JSON numbers round silently past it. Missing or non-numeric ⇒ **rejected**. |
 | `session_id` | no | Per-row wins, then the envelope's, then `null`. Capped at 200 chars. |
-| `seq` | no | Defaults to 0. Per session **and per type** — see §5. |
+| `seq` | no | Defaults to 0. Per session **and per type** — see §5. `-1` is reserved for the server's hardware line; a device sends from 0. |
 | `time` | no | Epoch ms, epoch **seconds** (10 digits, detected), or ISO. Unparseable ⇒ server receive time. |
 | `level` | no | Unknown value ⇒ coerced to `info`. Never rejected. |
 | `type` | no | Unknown value ⇒ coerced to `message`. Never rejected. |
@@ -130,23 +161,20 @@ because a log line that cannot be stored perfectly is still worth storing imperf
 | **200** | Stored. `duplicates` are entries already held. | Drop those entries from the buffer — after your transaction commits. |
 | **413** | More than 500 entries in one batch. | **Drop the batch.** Do not retry it — it will never be accepted. |
 | **4xx** | Permanently unacceptable. | Drop the batch and move on. |
-| **404 / 405 / 501** | There is no endpoint here. | Stop shipping logs, keep the buffer. Every later batch would be told the same thing. |
 | **401 / 403** | Credential refused. | Stop shipping logs. **Never touch the point queue.** |
 | **503 / timeout** | Transient. `Retry-After` is set. | Keep buffered, retry with backoff. |
 
 Note the inversion from §2.3: for *points*, dropping is data loss and a retry loop is the lesser
 evil. For *logs*, a poison batch that blocks the buffer forever costs battery and buys nothing.
 
-**Logging is optional, and a backend that never implemented it costs the device one request per
-process.** `404`, `405` and `501` are statements about the *endpoint* rather than about the bytes
-just sent, so the device halts this channel instead of dropping a batch of the host's diagnostics
-every heartbeat for the life of the install. Nothing else changes: capture continues, positions
-upload, the buffer is kept, and the next `configureLogs()` picks the endpoint up if it is deployed
-later. `503` is deliberately not in that list — it is documented above as retryable.
-
 Retrying is free — `id` is deterministic, so a re-sent batch collides instead of duplicating.
 Delivery is **at-least-once by design**: a connection dropped after the server committed costs
 one `duplicates`, which the database ignores.
+
+**The three counts add up to the entries you sent.** The hardware line (§3) is written in the
+same transaction and deliberately left out of all three — a device must be able to reconcile the
+response against its own batch, and a number it cannot account for is a number that starts a bug
+report.
 
 ---
 
@@ -164,6 +192,11 @@ change, NTP correction) and `elapsedRealtimeNanos` cannot. It resets to 0 on reb
 offline drops its oldest entries. `seq` makes that visible, and the dashboard renders
 `— 411 entries dropped —` between the two rows. A silent gap reads as "nothing happened", which
 is the one thing it does not mean.
+
+The hardware line sits at `seq -1` in the `lifecycle` space for this reason: `-1 → 0` is
+contiguous, so it sorts ahead of everything the device sent without drawing a marker claiming an
+entry went missing ahead of it. Its `elapsed_nanos` is one below the earliest entry of the batch
+that carried the metadata, which puts it first in the panel's order too.
 
 ### `session_id: null` is legal and sometimes correct
 
@@ -191,25 +224,10 @@ Those entries are stored against the device and are visible **only** in
 **`event`** — the `TrackerEvent` payload, flattened.
 
 ```jsonc
-{ "gps": false, "network": true, "enabled": true, "permission": "FULL",    // ProviderChange
-  "accuracy_authorization": "PRECISE", "power_save": false, "airplane": false,
-  "fused_available": true,
-  "previous_gps": true, "previous_network": true, "previous_enabled": true }
+{ "gps": false, "network": true, "enabled": true, "permission": "FULL" }   // ProviderChange
 { "previous": "FULL", "current": "FOREGROUND_ONLY" }                       // PermissionChange
 { "error_code": "LOCATION_DISABLED" }                                      // CaptureSuspended
 ```
-
-A `ProviderChange` whose `code` is set — `GPS_OFF`, `GPS_ON`, `NETWORK_OFF`, `NETWORK_ON`,
-`LOCATION_OFF`, `LOCATION_ON` — is a **provider transition**, and is sent at `warn` so it earns
-a prompt drain rather than waiting out the heartbeat. The `previous_*` fields are present on
-exactly those entries; without them the transition is only readable by finding the row before
-it, which the device ring may have evicted.
-
-The distinction matters because GPS switched off while network positioning survives is **not**
-an outage: the device can still locate, so no `LocationServicesChange` and no `LOCATION_DISABLED`
-is emitted, and this entry is the only record that the provider moved at all. A `ProviderChange`
-with no `code` is a power-save, airplane or permission field moving — each has its own entry —
-and stays at `info`.
 
 **`lifecycle`** — the only place a session start or stop ever reaches the server. **Advisory**:
 this channel is lossy, so annotate the session with it, never treat it as the sole truth for the
@@ -218,7 +236,42 @@ session's bounds.
 ```jsonc
 { "phase": "session_start" }   // session_start | session_stop | session_interrupted
                                // service_start | service_stop | process_start
-                               // boot_completed | config_changed
+                               // boot_completed | config_changed | device_motion
+```
+
+One `lifecycle` row per session comes from the device's **sensors** rather than from a
+boundary: `code: "DEVICE_MOTION"`, `tag: "Motion"`, written once at the head of the session.
+
+```jsonc
+{ "phase": "device_motion", "motion_quality": "DEGRADED",
+  "accelerometer": true, "gyroscope": false, "magnetometer": true,
+  "significant_motion": false, "step_detector": true, "step_counter": true,
+  "barometer": false, "rotation_vector": true,
+  "activity_recognition": true }
+```
+
+The envelope's `device` block names the phone; nothing in it says whether that phone can
+**detect a stop**, and motion gating is what decides the capture cadence. `motion_quality`
+is the SDK's own verdict on the three fields above it:
+
+| `motion_quality` | What the SDK does about it | How the track reads |
+|---|---|---|
+| `FULL` | Nothing. Accelerometer, gyroscope and a trigger sensor are all present. | As configured. |
+| `DEGRADED` | Doubles the stop timeout, because a stop is detected later and less certainly. | Stops linger; a few extra fixes after the vehicle parks. |
+| `POOR` | Forces `CONTINUOUS` — motion gating is not trustworthy on this hardware. | Not the cadence the host configured. Sent at **`warn`**, so it earns a prompt drain. |
+
+`activity_recognition` is reported separately on purpose: the SDK folds that grant into
+`step_detector` and `step_counter`, so a `false` on either could mean *no sensor* or *no
+permission* — a different phone and a prompt are not the same remedy.
+
+One `lifecycle` row per session is **not** from the device: `code: "DEVICE_INFO"`, `tag:
+"Device"`, `seq: -1`, the hardware line of §3. Its `data` is the envelope's two metadata blocks
+verbatim, under a marker saying where it came from.
+
+```jsonc
+{ "synthetic": "server", "source": "log-batch envelope",
+  "device": { "manufacturer": "samsung", "model": "SM-A546E", "os": 34, "fingerprint": "…" },
+  "app":    { "package": "com.acme.field", "version": "3.4.1", "build": 3401, "sdk": "1.9.0" } }
 ```
 
 **`message`** — free-form host lines. `data` may be `{}`.
@@ -268,6 +321,11 @@ Read it back:
 curl "http://localhost:3000/api/sessions/$SESSION/logs" -H 'authorization: Bearer dash.default'
 ```
 
+**Two entries come back, not one.** The second is the hardware line the server derived from the
+`app` and `device` blocks above — `DEVICE_INFO`, at the head of the session. Post the same batch
+again and it stays at two: the response counts one `duplicates`, and the hardware line collides
+on its own id.
+
 ---
 
 ## 8. Why it is not saving
@@ -276,7 +334,7 @@ curl "http://localhost:3000/api/sessions/$SESSION/logs" -H 'authorization: Beare
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| **404** | Posting to `/v1/logs`, or no log endpoint deployed at all. | Use `/v1/logs/batch`. The device stops shipping after one of these and keeps its buffer — recovery is the next `configureLogs()`, which is an `Application.onCreate` for most hosts. |
+| **404** | Posting to `/v1/logs`. | Use `/v1/logs/batch`. |
 | **403** | `AUTH_MODE=dev` and no/oddly-shaped token. | `Bearer dev.<deviceId>.<tenantId>`. |
 | **413** | Over 500 entries. | Batch smaller. The device should drop, not retry. |
 | **503** | Auth provider unimplemented (`AUTH_MODE=external`), or the DB is down. | Retryable — check `/readyz`. |
@@ -286,6 +344,10 @@ curl "http://localhost:3000/api/sessions/$SESSION/logs" -H 'authorization: Beare
 | `duplicates: n` | Same `id` already stored. | Not an error — retrying is free by design. |
 | `accepted: n` but nothing in the panel | Entries have `session_id: null`. | They are device-scoped: `GET /api/devices/:id/logs?unassigned=1`. |
 | Saved under the wrong device | `device_id` here ≠ `extraParams["device_id"]` on the points channel. | Make them the same string. |
+| An entry the device never sent | A `lifecycle` row, `code: DEVICE_INFO`, `seq: -1`. | Not a bug and not a duplicate: the server's hardware line (§3). One per session, uncounted. |
+| Gaps on a track the fixes cannot explain | The phone cannot detect a stop. | Read the session's `DEVICE_MOTION` row (§6): `POOR` forced `CONTINUOUS`, `DEGRADED` doubled the stop timeout. |
+| No `DEVICE_MOTION` row on a session | `configureLogs()` was never called during it, or `lifecycle` is not in the device's `types`. | It is written at session start and again when the channel is turned on mid-session. |
+| No hardware line on a session | The envelope carried neither `app` nor `device`, or no log batch has named that session yet. | Send both blocks. A session built from points alone has no hardware to report — the metadata only ever arrives on this endpoint. |
 
 ### The audit table
 
@@ -320,7 +382,7 @@ LIMIT 50;
 
 | Route | For |
 |---|---|
-| `GET /api/sessions/:id/logs` | The panel. `?level=`, `?type=`, `?code=`, `?after_seq=`, `?limit=`. Returns `entries`, `counts`, `gaps`, `next_after_seq`. |
+| `GET /api/sessions/:id/logs` | The panel. `?level=`, `?type=`, `?code=`, `?after_id=`, `?limit=`. Newest first, ordered on `elapsed_nanos`. Returns `entries`, `counts`, `gaps`, `total`, `next_after_id`. |
 | `GET /api/sessions/:id/log-summary` | One row per `(level, type, code)` with a count and the window it spans. The ticket-closer. |
 | `GET /api/sessions/:id/logs.ndjson` | The whole session, streamed. What you attach to a ticket. |
 | `GET /api/devices/:id/logs` | Whole-device feed, defaults to `warn,error`. `?unassigned=1` for entries with no session. |
@@ -339,7 +401,7 @@ four are scoped to the caller's tenant.
 | Entries per request | 500 (`MAX_LOGS_PER_REQUEST`) — over it, 413 |
 | `message` | 4096 chars, truncated not rejected |
 | Body size | 10 MB (`BODY_LIMIT`), gzip decoded automatically |
-| Page size on read | 200 default, 1000 max (`LOG_LIMIT`, `LOG_LIMIT_MAX`) |
+| Page size on read | 20 default, 1000 max (`LOG_LIMIT`, `LOG_LIMIT_MAX`) — page with `?after_id=`, the id of the last row you hold |
 
 Retention is tiered, because `decision` is the same order of volume as `points` and each row is
 wider (`npm run prune`, `--apply` to delete):
@@ -350,6 +412,11 @@ debug entries     14 days
 everything        30 days
 log_batches        7 days
 ```
+
+The hardware line is `info`/`lifecycle`, so it prunes with everything else at 30 days. A session
+older than that keeps its track and loses the record of which phone drew it — `points` has its
+own, longer retention. If that matters for your fleet, lift the hardware line onto the session
+row rather than lengthening log retention for all of it.
 
 **Ship `decision` selectively.** Default a device to `info`, which excludes it, and raise one
 device while a ticket is open:
@@ -371,12 +438,17 @@ never cleared is how one device ends up shipping 29 000 rows a day for a year. T
 
 | Table | Holds |
 |---|---|
-| `session_logs` | One row per entry. PK `id`; `device_id`, `session_id` (nullable), `seq`, `elapsed_nanos`, `time`, `received_at`, `level`, `type`, `tag`, `code`, `message`, `data`, `batch_id`. |
+| `session_logs` | One row per entry. PK `id`; `device_id`, `session_id` (nullable), `seq`, `elapsed_nanos`, `time`, `received_at`, `level`, `type`, `tag`, `code`, `message`, `data`, `batch_id`. Plus the server's hardware line per session — same table, `seq -1`, `code DEVICE_INFO`. |
 | `log_batches` | One row per HTTP exchange: counts, `status_code`, `gzip`, and the per-batch `app`/`device` metadata. |
 
 Kept separate from `ingest_batches` so a log flood is visible without polluting the point-ingest
 audit trail. Deleting a session deletes its logs — the confirmation says "permanently", and a log
 line naming a deleted session is that session's data.
+
+The `app`/`device` metadata is therefore in two places on purpose. `log_batches` answers "what
+was this device running last Tuesday at 14:02", one row per exchange; the hardware line answers
+"what phone was this session" without a second query, and travels with the NDJSON attached to a
+ticket.
 
 ---
 

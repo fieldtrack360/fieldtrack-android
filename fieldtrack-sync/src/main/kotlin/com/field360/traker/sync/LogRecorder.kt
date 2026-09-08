@@ -2,6 +2,8 @@ package com.field360.traker.sync
 
 import com.field360.tracker.domain.model.ProviderState
 import com.field360.tracker.domain.model.TrackerEvent
+import com.field360.tracker.motion.DeviceSensors
+import com.field360.tracker.motion.MotionQuality
 import com.field360.traker.geo.port.Clock
 import com.field360.traker.geo.port.TrackLogger
 import com.field360.traker.sync.data.db.LogCounterRow
@@ -18,6 +20,8 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * Writes the diagnostic buffer.
@@ -61,6 +65,32 @@ internal class LogRecorder(
     private val sessionId: () -> String?,
     /** `Tracker.events`. A flow rather than the tracker, so this class is testable. */
     private val events: SharedFlow<TrackerEvent>,
+    /**
+     * The device's motion hardware, or `null` where it cannot be probed.
+     *
+     * A lambda for the same reason [sessionId] is one: this class is exercised without an
+     * Android graph behind it, and there is no `SensorManager` there to answer.
+     */
+    private val sensors: () -> DeviceSensors? = { null },
+    /**
+     * Whether `ACTIVITY_RECOGNITION` is granted.
+     *
+     * Reported beside [sensors] because `DeviceSensors` folds the grant into its step
+     * fields: `stepDetector` is false both on a device that has no step sensor and on one
+     * that has it behind a denied permission, and those are two different tickets with two
+     * different remedies.
+     */
+    private val activityRecognitionGranted: () -> Boolean = { false },
+    /**
+     * The open session, read from the store rather than from a cached state.
+     *
+     * [sessionId] is a `StateFlow` read, and that state is published by a **different**
+     * collector of the same event flow this class attaches to — so at the instant
+     * `EnabledChange(true)` arrives here, the id there can still name the previous session
+     * or none at all. A motion line is only worth writing if it lands on the session it
+     * describes, so it resolves the session itself.
+     */
+    private val openSessionId: suspend () -> String? = { sessionId() },
 ) {
 
     @Volatile
@@ -86,6 +116,18 @@ internal class LogRecorder(
     /** Entries written since the last ring trim. */
     private var writtenSinceTrim = 0
 
+    /**
+     * The session whose motion hardware has already been recorded.
+     *
+     * One line per session, not per start signal: `EnabledChange(true)` also arrives when
+     * capture is resumed inside a revived process, and the hardware has not changed since
+     * the line already sitting at the head of that session.
+     */
+    private var motionRecordedFor: String? = null
+
+    /** Serialises the check-then-write above; two start signals can race on it. */
+    private val motionLock = Mutex()
+
     val isRecording: Boolean get() = config != null
 
     /**
@@ -98,6 +140,10 @@ internal class LogRecorder(
         this.onNudge = onNudge
         start()
         attach()
+        // For the host that calls `configureLogs()` *after* `start()`. The session-start
+        // signal that normally carries this has already been and gone, and a session
+        // missing its motion line is the one case this whole entry exists to cover.
+        recordSessionMotion()
     }
 
     /**
@@ -131,27 +177,48 @@ internal class LogRecorder(
         code: String? = null,
         data: String? = null,
     ) {
-        val active = config ?: return
-        if (!level.admits(active.level)) return
-        if (type !in active.types) return
-
-        val payload = data?.takeIf(::isJsonStructure)
-        if (data != null && payload == null) {
-            sdkLog { logger.w(TAG, "Dropped log data for \"$tag\": not a JSON object or array") }
-        }
-
-        // `seq` and the wire id are assigned by the pump, where the sequence space is
-        // single-threaded. What travels here is everything else.
-        inbox.trySend(
+        submit(
             Draft(
                 sessionId = sessionId(),
                 timeMs = clock.wallTimeMs(),
                 elapsedRealtimeNanos = clock.elapsedRealtimeNanos(),
                 level = level,
                 type = type,
-                tag = tag.take(MAX_TAG_CHARS),
-                code = code?.take(MAX_CODE_CHARS),
-                message = message.take(MAX_MESSAGE_CHARS),
+                tag = tag,
+                code = code,
+                message = message,
+                data = data,
+            ),
+        )
+    }
+
+    /**
+     * The one gate every entry passes, whoever built the draft.
+     *
+     * The filters, the truncation and the hand-off live here rather than in [record] so
+     * that a draft which pinned its own session and instant — the motion line below, and
+     * every draft converted from a `TrackerEvent` — keeps them, instead of having the clock
+     * and the current session re-read at queue time.
+     */
+    private fun submit(draft: Draft) {
+        val active = config ?: return
+        if (!draft.level.admits(active.level)) return
+        if (draft.type !in active.types) return
+
+        val payload = draft.data?.takeIf(::isJsonStructure)
+        if (draft.data != null && payload == null) {
+            sdkLog {
+                logger.w(TAG, "Dropped log data for \"${draft.tag}\": not a JSON object or array")
+            }
+        }
+
+        // `seq` and the wire id are assigned by the pump, where the sequence space is
+        // single-threaded. What travels here is everything else.
+        inbox.trySend(
+            draft.copy(
+                tag = draft.tag.take(MAX_TAG_CHARS),
+                code = draft.code?.take(MAX_CODE_CHARS),
+                message = draft.message.take(MAX_MESSAGE_CHARS),
                 data = payload,
             ),
         )
@@ -167,6 +234,103 @@ internal class LogRecorder(
             code = phase,
             data = jsonObjectOrNull(mapOf("phase" to phase)),
         )
+    }
+
+    /**
+     * Writes the device's motion hardware at the head of the open session, once.
+     *
+     * ### Why the session and not the envelope
+     *
+     * The batch envelope names the phone — manufacturer, model, OS — and says nothing
+     * about whether that phone can *detect a stop*. Motion gating is what decides the
+     * capture cadence, and a device with no significant-motion sensor and no step detector
+     * is rated [MotionQuality.POOR]: `ResolveConfigUseCase` forces `CONTINUOUS` on it, a
+     * `DEGRADED` one has its stop timeout doubled, and both draw tracks that look wrong in
+     * ways the points cannot explain. "The gaps are the hardware" is a one-line answer to a
+     * ticket, and until this entry existed the server had no way to reach it.
+     *
+     * ### Once per session
+     *
+     * Sensors cannot appear or disappear while the process lives, so this is a per-session
+     * constant rather than something to re-send per drain. The one field under it that
+     * *can* move — the `ACTIVITY_RECOGNITION` grant, which gates the step sensors — has a
+     * `PermissionChange` entry of its own already.
+     *
+     * A no-op when no session is open: an entry claiming to describe a session there would
+     * be filed against the device, which is the one thing this is not.
+     */
+    fun recordSessionMotion() {
+        if (config == null) return
+        scope.launch {
+            runCatching { writeSessionMotion() }
+                .onFailure { sdkLog { logger.w(TAG, "Motion probe failed: ${it.message}") } }
+        }
+    }
+
+    private suspend fun writeSessionMotion() {
+        motionLock.withLock {
+            val session = openSessionId() ?: return
+            if (session == motionRecordedFor) return
+            val probe = sensors() ?: return
+            // Set before the submit, not after: the filters below are a host's standing
+            // decision about what it records, and a retry on the next start signal would
+            // reach exactly the same one.
+            motionRecordedFor = session
+            submit(motionDraft(session, probe))
+        }
+    }
+
+    private fun motionDraft(session: String, sensors: DeviceSensors): Draft {
+        val activityRecognition = activityRecognitionGranted()
+        return Draft(
+            sessionId = session,
+            timeMs = clock.wallTimeMs(),
+            elapsedRealtimeNanos = clock.elapsedRealtimeNanos(),
+            // POOR only. DEGRADED is the ordinary state of a great deal of cheap hardware
+            // and the SDK already compensates for it by doubling the stop timeout, so
+            // warning on it would warn on a large part of a fleet and therefore on none of
+            // it — the same reasoning `BackgroundRestrictions.degraded` is built on.
+            level = if (sensors.motionQuality == MotionQuality.POOR) LogLevel.WARN else LogLevel.INFO,
+            type = LogType.LIFECYCLE,
+            tag = TAG_MOTION,
+            code = CODE_DEVICE_MOTION,
+            message = motionMessage(sensors, activityRecognition),
+            data = jsonObjectOrNull(
+                mapOf(
+                    "phase" to LifecyclePhase.DEVICE_MOTION,
+                    "motion_quality" to sensors.motionQuality.name,
+                    "accelerometer" to sensors.accelerometer,
+                    "gyroscope" to sensors.gyroscope,
+                    "magnetometer" to sensors.magnetometer,
+                    "significant_motion" to sensors.significantMotion,
+                    "step_detector" to sensors.stepDetector,
+                    "step_counter" to sensors.stepCounter,
+                    "barometer" to sensors.barometer,
+                    "rotation_vector" to sensors.rotationVector,
+                    // Not derivable from the two step fields above: `SensorProbe` already
+                    // folded this grant into them, so a false there could mean either no
+                    // sensor or no permission.
+                    "activity_recognition" to activityRecognition,
+                ),
+            ),
+        )
+    }
+
+    /** The whole answer on one line, so the entry reads without opening `data`. */
+    private fun motionMessage(sensors: DeviceSensors, activityRecognition: Boolean): String {
+        val present = buildList {
+            if (sensors.accelerometer) add("accelerometer")
+            if (sensors.gyroscope) add("gyroscope")
+            if (sensors.magnetometer) add("magnetometer")
+            if (sensors.significantMotion) add("significant-motion")
+            if (sensors.stepDetector) add("step-detector")
+            if (sensors.stepCounter) add("step-counter")
+            if (sensors.barometer) add("barometer")
+            if (sensors.rotationVector) add("rotation-vector")
+        }
+        return "Motion hardware ${sensors.motionQuality}: " +
+            (if (present.isEmpty()) "no motion sensors" else present.joinToString(", ")) +
+            "; activity recognition ${if (activityRecognition) "granted" else "denied"}"
     }
 
     /**
@@ -196,7 +360,12 @@ internal class LogRecorder(
     private fun attach() {
         if (collector != null) return
         collector = scope.launch {
-            events.collect { event -> event.toDraft()?.let(::record) }
+            events.collect { event ->
+                event.toDraft()?.let(::submit)
+                // Launched rather than awaited: resolving the session is a store read, and
+                // a collector that blocks on one delays every entry queued behind it.
+                if (event is TrackerEvent.EnabledChange && event.enabled) recordSessionMotion()
+            }
         }
     }
 
@@ -281,17 +450,6 @@ internal class LogRecorder(
     private fun fireNudge(atNanos: Long) {
         lastNudgeNanos = atNanos
         onNudge?.invoke()
-    }
-
-    private fun record(draft: Draft) {
-        record(
-            level = draft.level,
-            type = draft.type,
-            tag = draft.tag,
-            message = draft.message,
-            code = draft.code,
-            data = draft.data,
-        )
     }
 
     /**
@@ -581,6 +739,9 @@ internal class LogRecorder(
         const val TAG_MOTION = "Motion"
         const val TAG_SESSION = "Session"
         const val TAG_GEOFENCE = "Geofence"
+
+        /** The session's motion-hardware line, as `code` — what a dashboard filters on. */
+        const val CODE_DEVICE_MOTION = "DEVICE_MOTION"
 
         /** Provider transitions, as `code` — what a dashboard filters a toggle by. */
         const val CODE_GPS_ON = "GPS_ON"

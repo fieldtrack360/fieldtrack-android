@@ -142,4 +142,16 @@ public object LifecyclePhase {
     public const val PROCESS_START: String = "process_start"
     public const val BOOT_COMPLETED: String = "boot_completed"
     public const val CONFIG_CHANGED: String = "config_changed"
+
+    /**
+     * The motion hardware this session was recorded on, written once at its head.
+     *
+     * Not a boundary like the rest, and here for the same reason they are: it is a fact
+     * about the session that no point can carry. Whether the device has a
+     * significant-motion sensor, a step detector and a gyroscope decides whether the
+     * motion-gated cadence can be trusted at all, so a track full of holes on hardware
+     * rated `POOR` is the hardware's gaps, not the SDK's — and that is unanswerable from
+     * the points alone.
+     */
+    public const val DEVICE_MOTION: String = "device_motion"
 }

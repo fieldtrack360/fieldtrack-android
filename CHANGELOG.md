@@ -37,6 +37,40 @@ and validate the result. It covers every exported version, and a companion case 
 
 ### Added
 
+- **Every upload is written to logcat as one line, under `FieldTrackApi`.** Debug builds
+  only — the lines go through `sdkLog`, which the release variant compiles out.
+
+  ```
+  $ adb logcat -s FieldTrackApi
+  D/FieldTrackApi: POST points https://api.acme.test/v1/location/batch -> 200 success in 412ms (18422B gzip)
+  W/FieldTrackApi: POST logs   https://api.acme.test/v1/logs/batch -> 503 refused in 9004ms (2210B gzip) retryAfter=30000ms
+  ```
+
+  `adb logcat -s FieldTrackApi` is the device's whole API conversation and nothing else,
+  both queues in one stream. A 2xx is `d`, everything else is `w`. Until now the only trace
+  of an exchange was `SyncEvent.HttpResponse`, which carries a status code and a row count —
+  no endpoint, no method and no duration, so a server that was *answering but slowly* was
+  invisible.
+
+  - The word after the status is the outcome and is deliberately **not** derived from it:
+    `success`, `unauthorized`, `forbidden`, `refused`, `no_response`, or
+    `threw <Exception>`. A request that never reached a server has no status, and reading
+    that as a 500 is what makes "the API is down" indistinguishable from "this device has
+    no signal".
+  - Written at the `SyncTransport` seam, so it covers a host's own client and anything its
+    interceptors did to the request — and it is the only place an exchange can be *timed*.
+  - **Never printed:** headers and bodies in either direction, and the URL's query string
+    and userinfo. A credential lives in all four, and `SyncResponse.Failure.body` can echo a
+    request header back.
+  - A transport that throws — which the interface forbids but a host's own client may do
+    anyway — is logged before the throw propagates. A `CancellationException` is not: a
+    drain cancelled with its `viewModelScope` is a caller changing its mind, not a failed
+    call.
+  - Nothing is stored or uploaded. API calls are deliberately absent from the log channel of
+    §15: a row per upload on disk is a different price, and for the log channel itself it
+    would be an entry that the next log upload has to ship, which writes another one — a
+    buffer that never drains and a radio that never sleeps.
+
 - **Session logs — a diagnostic channel with its own endpoint, in `fieldtrack-sync`.**
   Points answer *where the device was*; this answers *why there is nothing there*. Off by
   default, and entirely inside the optional sync artifact — `fieldtrack-core` carries no
@@ -77,6 +111,23 @@ and validate the result. It covers every exported version, and a companion case 
     for a named device with a ticket open, not for a fleet. The first `configureLogs` that
     enables it moves the watermark to the newest row, so an opt-in ships the next drive
     rather than the last three days.
+  - **The device's motion hardware, saved with the session.** One `lifecycle` entry at the
+    head of every session — `code: DEVICE_MOTION`, `tag: Motion`, `phase: device_motion` —
+    carrying `motion_quality` (`FULL` / `DEGRADED` / `POOR`) and the eight sensors behind
+    it: `accelerometer`, `gyroscope`, `magnetometer`, `significant_motion`,
+    `step_detector`, `step_counter`, `barometer`, `rotation_vector`, plus the
+    `activity_recognition` grant. The batch envelope's `device` block names the phone and
+    says nothing about whether it can **detect a stop**, which is what decides the capture
+    cadence: `POOR` forces `CONTINUOUS` and `DEGRADED` doubles the stop timeout, so a track
+    full of holes on that hardware is the hardware's gaps rather than the SDK's — and until
+    now the server had no way to reach that answer. `POOR` is recorded at `warn` so it earns
+    a prompt drain; `DEGRADED` and `FULL` stay at `info`, because warning on the ordinary
+    state of a great deal of cheap hardware would warn on half a fleet and therefore on
+    none of it. Written once per session, on the session-start signal and again when
+    `configureLogs()` is called mid-session, and never without an open session to file it
+    against. `activity_recognition` is carried separately because the SDK folds that grant
+    into the two step fields, so a `false` there is either no sensor or no permission.
+    `LifecyclePhase.DEVICE_MOTION` is new in the public API.
   - **A provider toggle is a `warn`, so it drains promptly.** `ProviderChange` used to be
     logged at `info` unconditionally, which put it below `nudgeLevel` and left a GPS toggle
     sitting in the buffer for up to `uploadIntervalMinutes`. It is now `warn` when a provider

@@ -43,6 +43,21 @@ internal fun newLogRecorder(
     logger = logger,
     sessionId = { tracker.state.value.currentSessionId },
     events = events,
+    sensors = { runCatching { tracker.getSensors() }.getOrNull() },
+    // Read separately from the probe above, which folds this grant into its two step
+    // fields: a `false` there could mean no sensor or no permission, and the remedies are
+    // a different phone and a prompt.
+    activityRecognitionGranted = {
+        runCatching { tracker.permissions().hasActivityRecognition() }.getOrDefault(false)
+    },
+    // `Tracker.state` is published by a second collector of the same event flow the
+    // recorder attaches to, so at the instant `EnabledChange(true)` reaches the recorder
+    // the id there may still be the previous session's — or null. The session store is the
+    // authority, and the cached state is the fallback for a read that fails.
+    openSessionId = {
+        runCatching { tracker.currentSession()?.id }.getOrNull()
+            ?: tracker.state.value.currentSessionId
+    },
 )
 
 /** @see newLogRecorder — the same packaging reason applies to both suspend lambdas here. */

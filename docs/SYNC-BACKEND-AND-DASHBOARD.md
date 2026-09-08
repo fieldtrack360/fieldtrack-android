@@ -2187,8 +2187,25 @@ verdict, and the fix's own provenance is on the point row next to it.
 ```jsonc
 { "phase": "session_start" }   // session_start | session_stop | session_interrupted
                                // service_start | service_stop | process_start
-                               // boot_completed | config_changed
+                               // boot_completed | config_changed | device_motion
 ```
+
+One row per session is the device's **motion hardware** rather than a boundary —
+`code: "DEVICE_MOTION"`, `tag: "Motion"`, at the head of the session:
+
+```jsonc
+{ "phase": "device_motion", "motion_quality": "DEGRADED",
+  "accelerometer": true, "gyroscope": false, "magnetometer": true,
+  "significant_motion": false, "step_detector": true, "step_counter": true,
+  "barometer": false, "rotation_vector": true, "activity_recognition": true }
+```
+
+`motion_quality` is `FULL`, `DEGRADED` or `POOR`, and it is the answer to "why does this
+track have holes in it": `POOR` means motion gating is untrustworthy on this hardware and
+the SDK forced `CONTINUOUS`, `DEGRADED` means it doubled the stop timeout. `POOR` is sent at
+`warn`; the other two at `info`. `activity_recognition` is carried separately because the
+SDK folds that grant into the two step fields, so a `false` there is either no sensor or no
+permission.
 
 > **This is the only place a session start and stop ever reach your server.** §1.5 still
 > holds for the points endpoint: sessions there materialise from arriving points, and their
@@ -2348,7 +2365,7 @@ Volume, per device, per 8-hour shift:
 
 | Type | Rows/shift | Why |
 |---|---|---|
-| `lifecycle` | ~10 | Session and service boundaries. |
+| `lifecycle` | ~10 | Session and service boundaries, plus one `DEVICE_MOTION` row per session. |
 | `event` | ~200–2 000 | Provider and permission changes, heartbeats, errors. |
 | `message` | host-defined | |
 | **`decision`** | **~29 000** | **One row per delivered fix at 1 Hz — the same order as `points`, and each row is wider.** |

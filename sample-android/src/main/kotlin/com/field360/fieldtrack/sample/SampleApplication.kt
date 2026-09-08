@@ -70,6 +70,9 @@ class SampleApplication : Application() {
     /** Exposed so the Home card can show what is going out in the request envelope. */
     val deviceId: String get() = identity.deviceId
 
+    /** The readable name sent beside [deviceId] — `SAMSUNG SM-A546E`. */
+    val deviceLabel: String get() = DEVICE_LABEL
+
     /**
      * Why [installSync] gave up, or `null` if it did not.
      *
@@ -456,7 +459,11 @@ class SampleApplication : Application() {
                     //   { "device_id": "…", "session_id": "…", "location": [ … ] }
                     //
                     // `device_id` is a per-install UUID and is genuinely constant, so it
-                    // belongs here without qualification.
+                    // belongs here without qualification. It must **identify one install**:
+                    // a `Build` field like `BRAND` or `MODEL` is the same string on every
+                    // phone of that kind, so a fleet of Samsungs would arrive as one device
+                    // and their tracks would interleave into a single unreadable history.
+                    // `device_label` below is where the readable name goes.
                     //
                     // `session_id` is NOT constant, which is why installSync() is called
                     // again on every session start. Read the KDoc above before relying on
@@ -464,7 +471,13 @@ class SampleApplication : Application() {
                     // not guaranteed to belong to one session.
                     .extraParams(
                         buildMap {
-                            put("device_id", "${Build.BRAND}")
+                            put("device_id", deviceId)
+                            // The human name for the id above, so a dashboard's device
+                            // selector reads `SAMSUNG SM-A546E` rather than a raw UUID.
+                            // Constant for the life of the install, and deliberately not
+                            // an identifier: two identical phones send the same label and
+                            // two different `device_id`s.
+                            put("device_label", DEVICE_LABEL)
                             // Omitted rather than sent null while no session is open:
                             // `null` is not a supported extraParams value, and a literal
                             // "none" would be a session id the server could index on.
@@ -486,6 +499,21 @@ class SampleApplication : Application() {
             // simply replaces it.
             sync.configureLogs(
                 LogSyncConfig.builder()
+                    // The same readable name the points envelope carries, under the same
+                    // key, so a backend reads `device_label` off either channel with one
+                    // code path.
+                    //
+                    // Not inherited the way `device_id` is, and that asymmetry is correct:
+                    // the id has to match across the two channels or the join breaks, so
+                    // the SDK carries it over for you. A label breaks nothing, so it stays
+                    // an explicit line rather than another thing configureLogs() decides
+                    // on the host's behalf.
+                    //
+                    // Distinct from the envelope's own `device` block, which the SDK fills
+                    // with `manufacturer`, `model` and `os` and which the server turns into
+                    // its DEVICE_INFO hardware line. That block is the parsed form; this is
+                    // the one string a human reads.
+                    .extraParam("device_label", DEVICE_LABEL)
                     // Ship on any entry rather than only on WARN and worse.
                     //
                     // A battery decision, taken deliberately here because this app is a
@@ -634,6 +662,21 @@ class SampleApplication : Application() {
          * because the high-water mark advances past everything the scan returned.
          */
         const val GEOFENCE_SCAN_LIMIT: Int = 50
+
+        /**
+         * The device's readable name — `SAMSUNG SM-A546E`.
+         *
+         * Manufacturer upper-cased and the model as the vendor spells it. `MANUFACTURER`
+         * rather than `BRAND`: they agree on most phones and disagree on the ones a fleet
+         * actually has trouble with — a carrier-branded or OEM-rebadged handset reports
+         * the reseller in `BRAND` and the company that built it in `MANUFACTURER`, and it
+         * is the second that matches what is printed on the back.
+         *
+         * A **label, never an identifier**: every phone of one model sends this exact
+         * string. `device_id` is what tells two of them apart.
+         */
+        val DEVICE_LABEL: String =
+            "${Build.MANUFACTURER.uppercase(Locale.ROOT)} ${Build.MODEL}".trim()
     }
 }
 

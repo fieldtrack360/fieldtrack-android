@@ -194,6 +194,8 @@ class TrackerViewModel(
     private val transportAvailable: Boolean = true,
     /** The `device_id` going out in every request envelope, for display. */
     private val deviceId: String = "",
+    /** The `device_label` going out beside it — `SAMSUNG SM-A546E`. */
+    private val deviceLabel: String = "",
     /** What the host passed to `persistRawFixes()`. The SDK exposes no way to read it back. */
     private val persistRawFixes: Boolean = false,
     /**
@@ -369,6 +371,14 @@ class TrackerViewModel(
         val syncEndpoint: String? = null,
         /** Sent as `device_id` in the request envelope. A generated per-install UUID. */
         val syncDeviceId: String = "",
+        /**
+         * Sent as `device_label` beside it: `SAMSUNG SM-A546E`.
+         *
+         * On screen next to the id because the two answer different questions and are
+         * confused for each other constantly — the label says *what kind of phone this
+         * is*, and every phone of that model sends the same one. Only the id is unique.
+         */
+        val syncDeviceLabel: String = "",
         /**
          * Sent as `session_id` in the request envelope: the session's start time, in the
          * device's timezone, per `sessionEnvelopeId`.
@@ -608,7 +618,13 @@ class TrackerViewModel(
      * a diagnostic. A production host would show the count on a refresh, not a timer.
      */
     private fun observeSync() {
-        _state.update { it.copy(syncEndpoint = sync.endpoint, syncDeviceId = deviceId) }
+        _state.update {
+            it.copy(
+                syncEndpoint = sync.endpoint,
+                syncDeviceId = deviceId,
+                syncDeviceLabel = deviceLabel,
+            )
+        }
 
         // Two states that are already wrong before a single request is made, so they are
         // raised at startup rather than inferred from a failure minutes away. Neither
@@ -1897,6 +1913,7 @@ class TrackerViewModel(
                     syncConfigError = app.syncConfigError,
                     transportAvailable = app.syncTransportAvailable,
                     deviceId = app.deviceId,
+                    deviceLabel = app.deviceLabel,
                     persistRawFixes = SampleApplication.PERSIST_RAW_FIXES,
                     onSessionChanged = app::installSync,
                     // The same instance `ready()` was called with in `onCreate`, not a

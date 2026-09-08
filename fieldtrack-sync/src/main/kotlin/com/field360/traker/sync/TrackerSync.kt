@@ -19,6 +19,7 @@ import com.field360.tracker.Tracker
 import com.field360.tracker.TrackerArtifacts
 import com.field360.tracker.domain.repository.SyncTrigger
 import com.field360.traker.geo.port.TrackLogger
+import com.field360.traker.sync.internal.LoggingSyncTransport
 import com.field360.traker.sync.internal.MAX_PARAM_DEPTH
 import com.field360.traker.sync.internal.NetworkMonitor
 import com.field360.traker.sync.internal.NoOpTransport
@@ -727,7 +728,10 @@ public class TrackerSync internal constructor(
             ?: return LogSyncQueue.Result.Retry(LogSyncQueue.REASON_NO_TRANSPORT)
         logsRejectedWith?.let { return LogSyncQueue.Result.Rejected(it) }
 
-        val result = logQueue.drain(active, activeTransport)
+        val result = logQueue.drain(
+            active,
+            logged(activeTransport, LoggingSyncTransport.CHANNEL_LOGS),
+        )
         when (result) {
             is LogSyncQueue.Result.Rejected -> {
                 // Stop the loop; keep everything. Nothing here reaches the point queue.
@@ -775,7 +779,10 @@ public class TrackerSync internal constructor(
         // Answer from memory rather than spending a request to be told the same thing.
         if (haltedReason != null) return SyncQueue.Result.Forbidden
 
-        val result = queue.drain(activeConfig, activeTransport)
+        val result = queue.drain(
+            activeConfig,
+            logged(activeTransport, LoggingSyncTransport.CHANNEL_POINTS),
+        )
         when (result) {
             SyncQueue.Result.AuthExpired -> tearDown()
             SyncQueue.Result.Forbidden -> halt()
@@ -783,6 +790,26 @@ public class TrackerSync internal constructor(
         }
         return result
     }
+
+    /**
+     * [transport] wrapped so every exchange it makes is written to logcat under
+     * `FieldTrackApi` — method, endpoint, status, outcome, duration, body size.
+     *
+     * `adb logcat -s FieldTrackApi` is then the device's whole API conversation, both
+     * channels in one stream. Debug builds only: the lines go through `sdkLog`, which the
+     * release variant compiles out.
+     *
+     * Applied at the point of use rather than in [configure], so the stored transport stays
+     * exactly the object the host handed over — `configureLogs()` falls back to that field
+     * when it is given no transport of its own, and wrapping the field would then wrap it
+     * twice and print every log upload two times.
+     *
+     * Nothing here writes to the diagnostic buffer. That is the difference between this and
+     * an uploaded API log: these lines cost no storage, no radio, and — for the log channel
+     * itself — cannot become an entry that the next log upload has to ship.
+     */
+    private fun logged(transport: SyncTransport, channel: String): SyncTransport =
+        LoggingSyncTransport(transport, logger, artifacts.clock, channel)
 
     /**
      * 403 handling: stop uploading, keep everything.

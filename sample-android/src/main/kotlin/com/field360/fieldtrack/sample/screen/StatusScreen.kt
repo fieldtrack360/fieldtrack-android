@@ -188,6 +188,10 @@ fun StatusScreen(
                     // A generated per-install UUID: without it on screen there is no way
                     // to correlate a row on the server with the install that sent it.
                     KeyValue("device_id", state.syncDeviceId.take(DEVICE_ID_CHARS), Hack.Cyan)
+                    // The readable name for the id above. Shown whole — it is short, and
+                    // truncating the one row a human can actually recognise the phone by
+                    // would defeat the reason it is here.
+                    KeyValue("device_label", state.syncDeviceLabel, Hack.Cyan)
                     // The session's start time, not the SDK's session id — see
                     // `sessionEnvelopeId`. Shown whole rather than truncated: the whole
                     // point of the format is that it is readable.
@@ -659,6 +663,7 @@ fun StatusScreenPreview() {
             syncQueued = 12,
             syncEndpoint = "https://api.example.com/v1/location/batch",
             syncDeviceId = "0f9a1c7e-3b44-4b0a-9f21-1c9d6e2a77bb",
+            syncDeviceLabel = "SAMSUNG SM-A546E",
             apiCheckResult = "OK lat=23.02231 lng=72.57136 acc=8m",
             log = listOf(
                 "ACCEPT  bearing_change  acc=6m",

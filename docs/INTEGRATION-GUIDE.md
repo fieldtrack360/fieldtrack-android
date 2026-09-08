@@ -2060,6 +2060,42 @@ sealed interface SyncResponse {
 }
 ```
 
+### 14.7 Watching the API calls in logcat
+
+Every upload the SDK makes is written to logcat as one line, under its own tag:
+
+```
+$ adb logcat -s FieldTrackApi
+D/FieldTrackApi: POST points https://api.acme.test/v1/location/batch -> 200 success in 412ms (18422B gzip)
+W/FieldTrackApi: POST logs   https://api.acme.test/v1/logs/batch -> 503 refused in 9004ms (2210B gzip) retryAfter=30000ms
+W/FieldTrackApi: POST points https://api.acme.test/v1/location/batch -> - no_response in 30001ms (18422B gzip) "timeout"
+```
+
+`-s FieldTrackApi` is the device's whole API conversation and nothing else — both queues in
+one stream, `points` and `logs` naming which. A 2xx is `d`, everything else is `w`.
+
+The word after the status is the **outcome**, and it is not derived from the status: a
+request that never reached a server has none, and reading that as a 500 is what makes "the
+API is down" indistinguishable from "this device has no signal". It is one of `success`,
+`unauthorized`, `forbidden`, `refused`, `no_response`, or a `threw <Exception>` for a
+transport that raised instead of answering.
+
+Written at the [`SyncTransport`](#146-custom-transport) seam, so it sees **your** client too
+if you supplied one — including a request one of your interceptors rewrote.
+
+> **Debug builds only.** The lines go through the SDK's internal `sdkLog`, which the release
+> variant compiles out. A released app writes nothing here, which is the right default for
+> output that any app on a rooted device can read.
+
+> **Never printed:** headers and bodies, in either direction, and the URL's query string and
+> userinfo. A credential lives in all four. This is a diagnostic aid, not a proxy trace — add
+> an OkHttp logging interceptor to a debug build if you need the wire itself.
+
+Nothing here is stored or uploaded. The durable, uploaded channel is [§15](#15-log-module--diagnostics-to-your-backend),
+and API calls are deliberately not part of it: a row per upload on disk is a different price,
+and for the log channel itself it would be an entry that the next log upload has to ship,
+which writes another one.
+
 ---
 
 ## 15. Log module — diagnostics to your backend
@@ -2209,6 +2245,7 @@ subscribe to anything:
 | `GeofenceEntered` / `GeofenceExited` | `INFO` | A fence was crossed |
 | `EnabledChange` | `INFO`, `LIFECYCLE` | Session start and stop — **the only place a session boundary reaches your server** |
 | `SessionInterrupted` | `WARN`, `LIFECYCLE` | `ready()` found a session left open by a crash |
+| `DEVICE_MOTION` | `WARN` on `POOR`, else `INFO`, `LIFECYCLE` | The motion hardware this session is being captured on — see below |
 
 **Deliberately not recorded:** `Location` (that is what the points endpoint is for),
 `LocationRejected` (already in the SDK's decision log and read from there at send time — see
@@ -2218,6 +2255,37 @@ nothing a reader would act on).
 A provider transition also carries a filterable `code` — `GPS_OFF`, `GPS_ON`,
 `NETWORK_OFF`, `NETWORK_ON`, `LOCATION_OFF`, `LOCATION_ON` — plus `previous_gps`,
 `previous_network` and `previous_enabled` in its `data`.
+
+**The session's motion hardware.** One entry at the head of every session, from the SDK's
+own `SensorProbe` rather than from a `TrackerEvent`:
+
+```jsonc
+{ "phase": "device_motion", "motion_quality": "DEGRADED",
+  "accelerometer": true, "gyroscope": false, "magnetometer": true,
+  "significant_motion": false, "step_detector": true, "step_counter": true,
+  "barometer": false, "rotation_vector": true, "activity_recognition": true }
+```
+
+It is the answer to "why does this track have holes in it". Motion gating decides the
+capture cadence, and `motion_quality` is what the SDK decided it could trust:
+
+| `motion_quality` | What the SDK does | Level |
+|---|---|---|
+| `FULL` | Nothing — accelerometer, gyroscope and a trigger sensor are all present | `INFO` |
+| `DEGRADED` | Doubles `motion.stopTimeoutMin`; a stop is detected later and less certainly | `INFO` |
+| `POOR` | Forces `CONTINUOUS` — motion gating is not trustworthy on this hardware | **`WARN`** |
+
+`DEGRADED` stays at `INFO` on purpose: it is the ordinary state of a great deal of cheap
+hardware, the SDK already compensates for it, and warning on it would warn on half a fleet
+and therefore on none of it.
+
+`activity_recognition` is reported separately because `SensorProbe` folds that grant into
+`step_detector` and `step_counter` — a `false` on either is *no sensor* or *no permission*,
+and a different phone and a prompt are not the same remedy.
+
+Written once per session: on the session-start signal, and again if you call
+`configureLogs()` part-way through a session that is already open. Never without an open
+session to file it against — an entry describing a session belongs to one.
 
 ### 15.5 Writing your own lines
 
@@ -2287,13 +2355,16 @@ the recorder does.
 | `LogType` | Volume | Notes |
 |---|---|---|
 | `EVENT` | low | The `TrackerEvent` stream, flattened |
-| `LIFECYCLE` | very low | Session and service boundaries. **Advisory** — this channel is lossy, so annotate a session with it, never treat it as the sole truth for the session's bounds |
+| `LIFECYCLE` | very low | Session and service boundaries, plus one `DEVICE_MOTION` row per session (§15.4). **Advisory** — this channel is lossy, so annotate a session with it, never treat it as the sole truth for the session's bounds |
 | `MESSAGE` | yours | `log()` |
 | `DECISION` | **~29 000 per device per 8-hour shift** | Why each fix was accepted or rejected, with the arithmetic. Off by default. Turn it on for a **named device with a ticket open**, never for a fleet — and note it is only recorded at `DEBUG`. It is read from the SDK's existing decision log at send time rather than written twice, and the first `configureLogs()` that enables it skips everything already recorded, so an opt-in ships the next drive rather than the last three days |
 
 `LifecyclePhase` holds the `phase` strings a `LIFECYCLE` entry carries in its `data`:
 `session_start`, `session_stop`, `session_interrupted`, `service_start`, `service_stop`,
-`process_start`, `boot_completed`, `config_changed`.
+`process_start`, `boot_completed`, `config_changed`, `device_motion`.
+
+`device_motion` is the one the SDK writes for you rather than one you pass to
+`logLifecycle()` — the session's motion hardware, described in §15.4.
 
 ### 15.7 Results and failure semantics
 
