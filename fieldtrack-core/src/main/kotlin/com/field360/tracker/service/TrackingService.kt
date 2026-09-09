@@ -7,6 +7,7 @@ import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.lifecycle.LifecycleService
@@ -102,6 +103,21 @@ public class TrackingService : LifecycleService() {
         val action = intent?.action ?: ACTION_RESUME
 
         if (action == ACTION_STOP) {
+            // Promoted before it is torn down, and the order is not cosmetic. If *this*
+            // instance was created by `startForegroundService`, the platform is holding a
+            // ~10-second timer that only `startForeground` clears, and returning without
+            // one is `ForegroundServiceDidNotStartInTimeException` — a fatal crash on a
+            // command whose next line stops the service anyway.
+            //
+            // The SDK's own [stop] uses `stopService` and never lands here, but
+            // [ACTION_STOP] is public: a host that builds the intent itself and sends it
+            // through `startForegroundService` takes exactly that path.
+            //
+            // Deliberately not [promoteToForeground]: its refusal branch schedules a
+            // restore, and asking for the service back is the opposite of what a stop
+            // command means. A refusal here needs no handling at all — being refused
+            // means no timer was ever armed.
+            runCatching { postForegroundNotification() }
             teardown()
             stopSelf()
             return START_NOT_STICKY
@@ -275,9 +291,15 @@ public class TrackingService : LifecycleService() {
         postedNotification = null
     }
 
-    /** @return false if the OS refused; the service has already stopped itself. */
+    /**
+     * The `startForeground` call itself, with nothing around it.
+     *
+     * Extracted so the [ACTION_STOP] path can satisfy the start-foreground contract
+     * without also inheriting [promoteToForeground]'s refusal handling, which schedules a
+     * restore. Everything it touches is in memory — see [cachedServiceConfig].
+     */
     @SuppressLint("InlinedApi") // ServiceCompat ignores this inlined type below API 29.
-    private fun promoteToForeground(): Boolean = try {
+    private fun postForegroundNotification() {
         // The in-memory config, never a disk read: `startForeground` has to happen inside
         // `onStartCommand` on the main thread, and `ConfigRepository.load()` suspends.
         // `ResolveConfigUseCase` saves on every `ready()`, so this is populated for the
@@ -290,6 +312,12 @@ public class TrackingService : LifecycleService() {
             buildNotification(cachedServiceConfig().also { postedNotification = it }),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
         )
+    }
+
+    /** @return false if the OS refused; the service has already stopped itself. */
+    private fun promoteToForeground(): Boolean = try {
+        postForegroundNotification()
+        reportPromotionLatency()
         // The service is genuinely up, so whatever losing streak got us here is over.
         // Without this the backoff would carry a previous failure's attempt count into the
         // next real outage and give it a 4-minute delay it never earned.
@@ -302,6 +330,17 @@ public class TrackingService : LifecycleService() {
         //           FGS may only START from an eligible state even when granted.
         // Stop cleanly to honour the start-foreground contract; otherwise the platform
         // piles a "did not call startForeground" ANR on top of the original failure.
+        //
+        // FIRST, before the diagnostics and before the restore is enqueued. The platform's
+        // start-foreground timer runs until this service is destroyed, and the destroy
+        // cannot happen until `onStartCommand` returns — so every millisecond spent here
+        // is spent inside the window that produces
+        // `ForegroundServiceDidNotStartInTimeException`. `ServiceRestorer.request` below
+        // reaches `WorkManager.getInstance()`, and the first call to that in a process
+        // opens WorkManager's own database on this thread; on a cold start that is exactly
+        // the kind of delay the timer is measuring.
+        stopSelf()
+
         sdkLog { logger.w(TAG, "startForeground(location) refused: ${e.message}") }
         events.tryEmit(TrackerEvent.Error(ErrorCode.FGS_START_REFUSED, e.message.orEmpty()))
 
@@ -324,8 +363,49 @@ public class TrackingService : LifecycleService() {
         // of a session that has already closed resolves to a no-op there, and
         // `SessionTeardown` cancels the unique work by name regardless.
         ServiceRestorer.request(applicationContext)
-        stopSelf()
         false
+    }
+
+    /**
+     * Reports how long the platform's start-foreground window was actually used.
+     *
+     * The crash this measures for — `ForegroundServiceDidNotStartInTimeException` — fires
+     * when the gap between `startForegroundService` and `startForeground` exceeds roughly
+     * ten seconds, and the part of that gap the SDK does not control is usually the
+     * larger one: on a start from `BootReceiver`, `ServiceHeartbeat` or `RestoreWorker`
+     * the process is dead, so the host's `Application.onCreate` runs inside the window
+     * before this service is even constructed. A crash report says only that the deadline
+     * was missed; this says how close an ordinary start came to it.
+     *
+     * Two channels on purpose. The ordinary reading goes to logcat, which release builds
+     * compile out — it is only interesting while looking at it. A reading past
+     * [PROMOTION_WARN_MS] goes out as a [TrackerEvent.Diagnostic] as well, because that
+     * one is a crash the host has not had yet, on a device the developer does not have,
+     * and it has to survive into a release build to be worth anything.
+     *
+     * Silent when there is no stamp to measure against: a sticky restart or an OEM revival
+     * constructs this service without anything in this process having called [start], and
+     * a zero there would otherwise read as an instant promotion.
+     */
+    private fun reportPromotionLatency() {
+        val requestedAt = startRequestedAtMs
+        startRequestedAtMs = 0L
+        if (requestedAt == 0L) return
+
+        val elapsedMs = SystemClock.elapsedRealtime() - requestedAt
+        sdkLog { logger.d(TAG, "startForeground reached ${elapsedMs}ms after start request") }
+        if (elapsedMs >= PROMOTION_WARN_MS) {
+            sdkLog { logger.w(TAG, "foreground promotion took ${elapsedMs}ms") }
+            events.tryEmit(
+                TrackerEvent.Diagnostic(
+                    "foreground promotion took ${elapsedMs}ms of the platform's ~10s " +
+                        "start-foreground window; a slower start would crash with " +
+                        "ForegroundServiceDidNotStartInTimeException. The window opens at " +
+                        "startForegroundService(), so host Application.onCreate work on a " +
+                        "cold start counts against it.",
+                ),
+            )
+        }
     }
 
     private fun cachedServiceConfig(): ServiceConfig =
@@ -421,6 +501,33 @@ public class TrackingService : LifecycleService() {
         internal const val NOTIFICATION_ID = 8_301
 
         /**
+         * How much of the platform's start-foreground window may be used before the
+         * promotion is reported as a near miss.
+         *
+         * Half of the ~10 second deadline. Set at a fraction rather than just under it
+         * because the reading is a warning about the devices that did *not* report — the
+         * same start on a colder cache, a slower disk or a busier CPU is the one that
+         * crashes, and a threshold that only fires at 9 seconds would say nothing until
+         * the crash was already happening in the field.
+         */
+        private const val PROMOTION_WARN_MS = 5_000L
+
+        /**
+         * `elapsedRealtime` at the last [start] call, or 0 when this process has not made
+         * one that is still unaccounted for.
+         *
+         * Cleared by [reportPromotionLatency] as it is read, so a sticky restart — which
+         * constructs the service with no [start] behind it — measures nothing rather than
+         * measuring against a stamp left by the previous session.
+         *
+         * `elapsedRealtime` rather than the wall clock: it counts through sleep, which is
+         * where a cold start on a dozing device spends its time, and it cannot be moved
+         * backwards by an NTP correction mid-measurement.
+         */
+        @Volatile
+        private var startRequestedAtMs: Long = 0L
+
+        /**
          * Used only when the host named an icon that does not resolve, or named none.
          * The title, text, channel and icon a host DID configure live in [ServiceConfig]
          * and are read from there — duplicating their defaults here is how the two drift.
@@ -450,9 +557,18 @@ public class TrackingService : LifecycleService() {
             if (!config.foregroundService) return false
             val intent = Intent(context, TrackingService::class.java).setAction(ACTION_RESUME)
             return try {
+                // Stamped immediately before the call, because this is the instant the
+                // platform's start-foreground deadline begins — see
+                // [reportPromotionLatency]. Set before rather than after so a process that
+                // is forked to answer this start command cannot promote before the stamp
+                // it is measured against exists.
+                startRequestedAtMs = SystemClock.elapsedRealtime()
                 context.startForegroundService(intent)
                 true
             } catch (e: Exception) {
+                // Nothing was armed, so nothing is pending: leaving the stamp set would
+                // charge the next successful start with the time since this refusal.
+                startRequestedAtMs = 0L
                 val graph = TrackerGraph.get(context.applicationContext)
                 sdkLog {
                     graph.logger.w(TAG, "startForegroundService refused: ${e.message}")

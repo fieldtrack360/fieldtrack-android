@@ -1773,7 +1773,7 @@ the last event rather than a blank panel.
 
 `TrackerSync` also carries the log channel — `configureLogs`, `log`, `logLifecycle`,
 `getLogs`, `syncLogsNow`, `requestLogSync`, `logEvents` and their state. Those are listed in
-[§15.3](#153-the-log-api-on-trackersync), because none of them does anything until you turn
+[§15.4](#154-the-log-api-on-trackersync), because none of them does anything until you turn
 that channel on.
 
 ### 14.4 Terminal failure semantics
@@ -2173,7 +2173,106 @@ resolved config does not validate, so wrap it the same way you wrap `configure()
 other, neither can tear the other down, and no log failure can reach `Tracker.stop()`, the
 upload queue, or a stored position.
 
-### 15.2 `LogSyncConfig`
+### 15.2 How the channel works
+
+One pipeline, four stages: a line is **recorded** on the device, **buffered** in a bounded
+ring, **drained** on a schedule, and **settled** against what the server answered. Nothing in
+it can reach a position — the two channels share only the transport interface.
+
+```
+  Tracker.events ─────┐
+  sync.log(…)         ├──►  LogRecorder  ──►  inbox · Channel(256, DROP_OLDEST)
+  sync.logLifecycle(…)┘          │                    │
+                                 │ level + type       │ never blocks the caller
+                                 ▼ filter, truncate   ▼ one writer, ordered
+                    log_entry · Room, fieldtrack-logs-<yourPackage>.db
+                    a ring of bufferCapacity rows — oldest evicted, shipped or not
+                                 │
+              ┌──────────────────┴───────────────────┐
+              │ heartbeat                            │ nudge
+              │ LogSyncWorker, every                 │ an entry at nudgeLevel or above
+              │ uploadIntervalMinutes (floor: 15)    │ asks for a drain now, throttled
+              │ WorkManager, network-constrained     │ to one per nudgeCooldownMs
+              └──────────────────┬───────────────────┘
+                                 ▼
+                        LogSyncQueue.drain()
+                          1. recorded entries — batchSize at a time, ≤ 20 batches
+                          2. decisions       — read from the SDK's own decision log,
+                                               everything above a per-session watermark
+                                 │
+                                 ▼
+                        SyncTransport.upload()  ──►  POST <logEndpoint>
+                                 │                   one logcat line per exchange (§14.7)
+                                 ▼
+                        2xx → rows marked settled · watermark advanced
+                        4xx → batch dropped, or the channel halts (§15.8)
+                        5xx → nothing settled, retry with backoff
+```
+
+**1 · Record.** `Tracker.events` is collected for you, and `log()` / `logLifecycle()` add your
+own lines. Every draft goes through a bounded, single-consumer channel: the call never blocks
+the thread it came from, and one writer at the other end is what keeps `seq` meaningful. The
+channel drops its **oldest** on overflow, matching the ring below it — a diagnostic buffer that
+applied backpressure to the tracker it is diagnosing would be a worse bug than the ones it was
+added to find.
+
+The write itself does four things: applies the `level` and `types` filters (a device set to
+`INFO` never *stores* a `DEBUG` line, so filtering costs no disk), truncates `message` to 4096,
+`tag` and `code` to 64, takes the next `seq` for that `(session, type)` pair, and derives the
+row's id — `SHA-1("<sessionId>:<seq>:<type>:<elapsedRealtimeNanos>")`, the dedupe key the whole
+channel is built on ([§15.11](#1511-schema-architecture)).
+
+**2 · Buffer.** Rows land in a second Room database, separate from the one holding positions.
+Each row is queued or settled, nothing else. The ring is trimmed to `bufferCapacity` newest
+rows — **shipped and unshipped alike**, because a buffer that refused to evict unsent rows is
+an unbounded buffer on exactly the device that cannot reach a server. Settled rows are pruned
+by age at `retentionHours` on the way out of a successful drain — an entry is only safe to
+forget once it has actually left the device — and queued rows are never pruned by age at all.
+
+**3 · Trigger.** Two paths, and they cannot cancel each other — they run under separate unique
+work names:
+
+| Path | Enqueued as | When |
+|---|---|---|
+| Heartbeat | periodic, `UPDATE` policy | every `uploadIntervalMinutes`, floor 15 — WorkManager's own |
+| Nudge | one-shot, `KEEP` | an entry at `nudgeLevel` (default `WARN`) landed, at most one per `nudgeCooldownMs`; a burst inside the window is deferred to its end, not dropped |
+| `Retry-After` | one-shot, `REPLACE` | the server named a delay — its schedule wins over a pending one-shot |
+| `requestLogSync()` | one-shot, `KEEP` | you asked |
+
+Positions are shipped as soon as there is a network; diagnostics are read after the fact, by a
+person with a ticket open. That difference is the whole reason this channel is a heartbeat with
+a nudge rather than an event-driven queue: the radio wakes on a schedule you set, not on every
+line the SDK writes.
+
+**4 · Drain.** `LogSyncQueue.drain()` is single-flight — a second one returns
+`Retry("already draining")` rather than queueing behind the first. It makes one pass:
+
+- **Recorded entries first**, `batchSize` rows at a time, up to 20 batches in a drain. Rows are
+  re-filtered here as well as at record time, because a later `configureLogs()` can have
+  narrowed `level` or `types`; an entry that no longer passes is *settled* rather than skipped,
+  or it would sit at the head of every future batch forever. A 2xx settles the contiguous
+  prefix up to that batch's last row id.
+- **Decisions second**, and only when `LogType.DECISION` is enabled. They are not mirrored into
+  this buffer — at 1 Hz that is ~29 000 rows a shift written twice. They are read from the
+  SDK's existing decision log at send time, for the open session (or the most recent one),
+  everything newer than a stored watermark, which advances **per batch** so a failure halfway
+  through a backlog does not re-ship what already landed. The scan is bounded at 20 pages of
+  500: a device offline for a week ships what it can and moves on.
+
+Entries before decisions is deliberate on a device shipping both. An entry is what explains a
+gap; a decision is what fills one in. A drain cut short by a dead network should leave the more
+explanatory half already delivered.
+
+**5 · Settle.** The response decides what happens to the batch — shipped, dropped, or retried —
+and, for four status codes, whether the channel keeps asking at all. That table is
+[§15.8](#158-results-and-failure-semantics).
+
+> **Delivery is at-least-once, by construction.** A batch that reached the server and lost its
+> response is re-sent whole, and every entry in it collides on its derived id rather than
+> landing twice. Retrying is free, which is what lets the device settle rows on a 2xx it may
+> never have seen.
+
+### 15.3 `LogSyncConfig`
 
 Every field has a default derived from the points endpoint, so the common call passes
 nothing.
@@ -2186,7 +2285,7 @@ nothing.
 | `headers` | `Map<String, String>` | inherited | Empty inherits the points headers. **Never exposed back** |
 | `autoSync` | `Boolean` | `true` | Run the periodic drain. With it off you call `syncLogsNow()` / `requestLogSync()` yourself |
 | `level` | `LogLevel` | `INFO` | Minimum severity **recorded**. Filtering happens when the entry is written, not when it is sent, so a device set to `INFO` never stores a `DEBUG` line |
-| `types` | `Set<LogType>` | `EVENT, LIFECYCLE, MESSAGE` | Which kinds are recorded and shipped. `DECISION` is absent on purpose — read its row in [§15.6](#156-logrecord-and-its-enums) before adding it |
+| `types` | `Set<LogType>` | `EVENT, LIFECYCLE, MESSAGE` | Which kinds are recorded and shipped. `DECISION` is absent on purpose — read its row in [§15.7](#157-logrecord-and-its-enums) before adding it |
 | `bufferCapacity` | `Int` | `5000` | Rows kept on the device. Oldest evicted first, shipped or not — a bounded buffer that refused to drop unsent rows would be unbounded on exactly the device that cannot reach a server. The resulting gap in `seq` is reported, never hidden |
 | `retentionHours` | `Int` | `72` | How long a **shipped** entry is kept before pruning. Queued entries are never pruned by age |
 | `batchSize` | `Int` | `200` | Entries per request, 1..500. The server answers `413` above its own ceiling and the SDK drops that batch rather than retrying it |
@@ -2206,7 +2305,7 @@ suspension. Those are `WARN` or above and are released early, throttled to one d
 `nudgeCooldownMs`. Lowering it to `INFO` is a battery decision, not a diagnostics one: on a
 busy device that is a radio wake every cooldown window.
 
-### 15.3 The log API on `TrackerSync`
+### 15.4 The log API on `TrackerSync`
 
 | Member | Signature | Notes |
 |---|---|---|
@@ -2226,7 +2325,7 @@ busy device that is a radio wake every cooldown window.
 one "last sync" badge is never forced to conflate a diagnostics upload failing with a
 positions upload failing.
 
-### 15.4 What the SDK records without being asked
+### 15.5 What the SDK records without being asked
 
 Once configured, the SDK writes its own `TrackerEvent` stream into the buffer. You do not
 subscribe to anything:
@@ -2287,7 +2386,7 @@ Written once per session: on the session-start signal, and again if you call
 `configureLogs()` part-way through a session that is already open. Never without an open
 session to file it against — an entry describing a session belongs to one.
 
-### 15.5 Writing your own lines
+### 15.6 Writing your own lines
 
 ```kotlin
 sync.log(
@@ -2311,7 +2410,7 @@ structured and one malformed value would spoil a batch carrying thirty useful en
 Nothing written here reaches logcat. This is the durable channel, which is the whole point:
 a live log cannot cover the process that was killed.
 
-### 15.6 `LogRecord` and its enums
+### 15.7 `LogRecord` and its enums
 
 What `getLogs()` returns, and the shape the endpoint receives:
 
@@ -2355,7 +2454,7 @@ the recorder does.
 | `LogType` | Volume | Notes |
 |---|---|---|
 | `EVENT` | low | The `TrackerEvent` stream, flattened |
-| `LIFECYCLE` | very low | Session and service boundaries, plus one `DEVICE_MOTION` row per session (§15.4). **Advisory** — this channel is lossy, so annotate a session with it, never treat it as the sole truth for the session's bounds |
+| `LIFECYCLE` | very low | Session and service boundaries, plus one `DEVICE_MOTION` row per session (§15.5). **Advisory** — this channel is lossy, so annotate a session with it, never treat it as the sole truth for the session's bounds |
 | `MESSAGE` | yours | `log()` |
 | `DECISION` | **~29 000 per device per 8-hour shift** | Why each fix was accepted or rejected, with the arithmetic. Off by default. Turn it on for a **named device with a ticket open**, never for a fleet — and note it is only recorded at `DEBUG`. It is read from the SDK's existing decision log at send time rather than written twice, and the first `configureLogs()` that enables it skips everything already recorded, so an opt-in ships the next drive rather than the last three days |
 
@@ -2364,9 +2463,9 @@ the recorder does.
 `process_start`, `boot_completed`, `config_changed`, `device_motion`.
 
 `device_motion` is the one the SDK writes for you rather than one you pass to
-`logLifecycle()` — the session's motion hardware, described in §15.4.
+`logLifecycle()` — the session's motion hardware, described in §15.5.
 
-### 15.7 Results and failure semantics
+### 15.8 Results and failure semantics
 
 ```kotlin
 sealed interface LogSyncQueue.Result {
@@ -2380,7 +2479,7 @@ sealed interface LogSyncQueue.Result {
 | Status | Behaviour |
 |---|---|
 | **2xx** | Stored. `duplicates` in the response are entries the server already held — not an error |
-| **401 / 403** | **Terminal for this channel, non-destructive.** Log shipping halts, the buffer is kept, tracking and the point queue are untouched |
+| **401 / 403** | **Terminal for this channel, non-destructive.** Shipping and recording both halt, the buffer is kept, tracking and the point queue are untouched |
 | **404 / 405 / 501** | **There is no endpoint here.** Same halt: every later batch would collect the same answer, so the SDK stops asking rather than discarding your diagnostics a batch at a time. This is the case where your backend has not implemented the endpoint at all — it costs one request per process and nothing else |
 | **413** | Over the server's 500-entry ceiling. The batch is **dropped**, not retried — it will never be accepted |
 | **Other 4xx** | Permanently unacceptable. Batch dropped, drain moves on |
@@ -2397,7 +2496,7 @@ deployed in the meantime, with the buffer intact.
 `Retry("already draining")`, `Retry("log sync not configured")` and `Retry("no transport")`
 describe the SDK's own situation rather than a failed exchange. None is an upload error.
 
-### 15.8 The wire format
+### 15.9 The wire format
 
 ```
 POST <logEndpoint>
@@ -2454,20 +2553,380 @@ is the one nobody modelled in advance.
 | `type` | Shape of `data` |
 |---|---|
 | `event` | The flattened `TrackerEvent` — e.g. `{"gps":false,"network":true,"enabled":true,"permission":"FULL","previous_gps":true}` |
-| `decision` | `{"verdict":"REJECT","reason":"NLP Fallback","latitude":23.02,"longitude":72.57,"accuracy":48.0,"sigma":6.4,"threshold":4.0,"distance_moved_m":287.4,"effective_speed_mps":23.9,"motion_state":"MOVING","point_uuid":"…"}` — `point_uuid` only when the verdict is `ACCEPT` |
+| `decision` | `{"verdict":"REJECT","reason":"NLP Fallback","latitude":23.02,"longitude":72.57,"accuracy":48.0,"bearing_deg":118.4,"has_speed":true,"has_bearing":true,"filter_lat":23.0198,"filter_lng":72.5731,"sigma":6.4,"threshold":4.0,"distance_moved_m":287.4,"effective_speed_mps":23.9,"motion_state":"MOVING","point_uuid":"…"}` — `filter_lat`/`filter_lng` are where the filter thought the device was, which is what makes a rejection readable; `point_uuid` is present only when the verdict is `ACCEPT` |
 | `lifecycle` | `{"phase":"session_start"}` |
 | `message` | Whatever you passed. May be `{}` |
 
-### 15.9 Table structure
+One complete exchange — headers, a four-entry body, the response, and every other answer the
+endpoint can give — is [§15.10](#1510-a-sample-request-and-response).
 
-**On the device.** The buffer is a second Room database, `fieldtrack-logs-<yourPackage>.db`,
-created only when `configureLogs()` is called and kept **separate from the file holding
-positions** — which is what makes a credential failure on the log endpoint structurally
-unable to reach a stored point. It is private to the SDK and has no public schema; read it
-through `getLogs()` and `pendingLogCount()`, never by opening the file.
+### 15.10 A sample request and response
 
-**On your backend**, two tables. This is the shape the endpoint above implies; column types
-are PostgreSQL and translate directly.
+One exchange, end to end. This is what a backend implementing the endpoint has to accept, and
+what the device does with each answer.
+
+#### The request
+
+```http
+POST /v1/logs/batch HTTP/1.1
+Host: api.acme.test
+Content-Type: application/json; charset=utf-8
+Content-Encoding: gzip
+Authorization: Bearer f3c1…            <- the log credential, not the points one
+Accept-Encoding: gzip
+```
+
+The body below is what the server sees **after** decoding `Content-Encoding: gzip`. Four
+entries, oldest first — the session's motion line, a flattened event, a host line, and one
+decision:
+
+```json
+{
+  "device_id": "8f14e45f-ceea-467a-9c1a-2b0a1e1f9c31",
+  "uploaded_at": 1719400123456,
+  "app": {
+    "package": "com.acme.field",
+    "version": "3.4.1",
+    "build": 3401,
+    "sdk": "1.0.8"
+  },
+  "device": {
+    "manufacturer": "samsung",
+    "model": "SM-A546E",
+    "os": 34
+  },
+  "logs": [
+    {
+      "id": "aff5f3e0a28c9ec0daf73553fa48fefbe73588b4",
+      "session_id": "20260907-143512-1f0c8a2e",
+      "seq": 0,
+      "time": 1719399512004,
+      "elapsed_nanos": "918273645000000",
+      "level": "info",
+      "type": "lifecycle",
+      "tag": "Motion",
+      "code": "DEVICE_MOTION",
+      "message": "Motion DEGRADED - accelerometer, magnetometer, step detector",
+      "data": {
+        "phase": "device_motion",
+        "motion_quality": "DEGRADED",
+        "accelerometer": true,
+        "gyroscope": false,
+        "magnetometer": true,
+        "significant_motion": false,
+        "step_detector": true,
+        "step_counter": true,
+        "barometer": false,
+        "rotation_vector": true,
+        "activity_recognition": true
+      }
+    },
+    {
+      "id": "8cdaa79826af5d2747293c152ecdecb03b3248d3",
+      "session_id": "20260907-143512-1f0c8a2e",
+      "seq": 1482,
+      "time": 1719400000000,
+      "elapsed_nanos": "918891245000000",
+      "level": "warn",
+      "type": "event",
+      "tag": "ProviderState",
+      "code": "GPS_OFF",
+      "message": "GPS off",
+      "data": {
+        "gps": false,
+        "network": true,
+        "enabled": true,
+        "permission": "FULL",
+        "previous_gps": true,
+        "previous_network": true,
+        "previous_enabled": true
+      }
+    },
+    {
+      "id": "eb8761f2fbb52e75294865a668415ac13d981873",
+      "session_id": "20260907-143512-1f0c8a2e",
+      "seq": 12,
+      "time": 1719400004120,
+      "elapsed_nanos": "918895365000000",
+      "level": "warn",
+      "type": "message",
+      "tag": "Dispatch",
+      "code": "NO_ROUTE",
+      "message": "Job 8842 accepted with no route",
+      "data": { "job_id": "8842", "stop_count": 0 }
+    },
+    {
+      "id": "c97bceddc5852d219924b0318dfac530a2424b52",
+      "session_id": "20260907-143512-1f0c8a2e",
+      "seq": 29431,
+      "time": 1719400005000,
+      "elapsed_nanos": "918896245000000",
+      "level": "debug",
+      "type": "decision",
+      "tag": "AcceptancePipeline",
+      "code": "NLP Fallback",
+      "message": "REJECT — NLP Fallback",
+      "data": {
+        "verdict": "REJECT",
+        "reason": "NLP Fallback",
+        "latitude": 23.0225,
+        "longitude": 72.5714,
+        "accuracy": 48.0,
+        "bearing_deg": 118.4,
+        "has_speed": true,
+        "has_bearing": true,
+        "filter_lat": 23.0198,
+        "filter_lng": 72.5731,
+        "sigma": 6.4,
+        "threshold": 4.0,
+        "distance_moved_m": 287.4,
+        "effective_speed_mps": 23.9,
+        "motion_state": "MOVING"
+      }
+    }
+  ]
+}
+```
+
+Three things to notice before writing the handler:
+
+- **`elapsed_nanos` is a string**, and it is the ordering key. `time` is the device wall clock
+  and is display only — it can jump backwards mid-session.
+- **`seq` is per session *and* per type.** The `0`, `1482`, `12` and `29431` above are four
+  independent counters, not a broken sequence. A gap inside one counter is the bounded buffer
+  evicting its oldest rows: data, not an error.
+- **`data` is not the same shape twice.** Store it verbatim and unvalidated — the useful field
+  is always the one nobody modelled in advance. An `ACCEPT` decision carries one more key,
+  `point_uuid`, naming the point that reached your points endpoint.
+
+#### The response
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+```
+
+```json
+{ "accepted": 3, "duplicates": 1, "rejected": 0, "batch_id": "lb_01J8XM4Z7QK2W9R0" }
+```
+
+`accepted + duplicates + rejected` must equal the number of entries the device sent — 4 here.
+The SDK does not read the counts (a 2xx settles the batch whatever they say), but a person
+reconciling a device against a dashboard does, and a number they cannot account for is a number
+that starts a bug report. If your server synthesises rows of its own — the reference backend
+writes one `DEVICE_INFO` line per session out of the envelope's `app` and `device` blocks —
+leave them out of all three counts.
+
+`duplicates` is not an error. It is the expected cost of at-least-once delivery: a batch whose
+response was lost is re-sent whole, and every entry in it collides on its derived id.
+
+#### Every other answer, and what the device does with it
+
+| Response | The SDK's behaviour | `LogSyncQueue.Result` |
+|---|---|---|
+| `200` / `201` / `204` | Rows settled, drain continues with the next batch | `Shipped(n)` |
+| `401`, `403` | **Channel halts** — shipping and recording both stop. The buffer is kept, and tracking, the point queue and stored positions are untouched. Recovery is the next `configureLogs()` | `Rejected(401 or 403)` |
+| `404`, `405`, `501` | **Channel halts** the same way — there is no endpoint at this URL, and every later batch would collect the same answer. One request per process, then silence | `Rejected(code)` |
+| `413` | Batch **dropped**, not retried: it is over the server's entry ceiling and will never be accepted | drain continues |
+| Other `4xx` | Batch dropped, drain continues with the next batch | drain continues |
+| `408`, `429` | Retryable in 4xx clothing. Nothing settled | `Retry(msg, retryAfterMs)` |
+| `5xx`, timeout, no response | Nothing settled, entries stay queued, backoff. A `Retry-After` reschedules the one-shot | `Retry(msg, retryAfterMs)` |
+
+```json
+// 503, with Retry-After: 30
+{ "error": "database unavailable" }
+```
+
+A `503` costs the device one wasted radio wake. A `404` costs it one per process. Both are safe
+answers while you are still building the endpoint — [§15.8](#158-results-and-failure-semantics)
+is why those two are treated so differently.
+
+#### Reproducing it with `curl`
+
+The id is derived, so it can be computed outside the SDK. This posts one entry, and is the
+fastest way to prove a new endpoint accepts the shape:
+
+```bash
+SESSION=20260907-143512-1f0c8a2e
+NANOS=918891245000000
+ID=$(printf '%s' "$SESSION:1482:event:$NANOS" | sha1sum | cut -d' ' -f1)
+
+curl -sS -X POST https://api.acme.test/v1/logs/batch \
+  -H 'content-type: application/json; charset=utf-8' \
+  -H 'authorization: Bearer <log token>' \
+  --data-binary @- <<JSON
+{
+  "device_id": "8f14e45f-ceea-467a-9c1a-2b0a1e1f9c31",
+  "uploaded_at": $(date +%s)000,
+  "app":    { "package": "com.acme.field", "version": "3.4.1", "build": 3401, "sdk": "1.0.8" },
+  "device": { "manufacturer": "samsung", "model": "SM-A546E", "os": 34 },
+  "logs": [{
+    "id": "$ID",
+    "session_id": "$SESSION",
+    "seq": 1482,
+    "time": $(date +%s)000,
+    "elapsed_nanos": "$NANOS",
+    "level": "warn",
+    "type": "event",
+    "tag": "ProviderState",
+    "code": "GPS_OFF",
+    "message": "GPS off",
+    "data": { "gps": false, "network": true, "previous_gps": true }
+  }]
+}
+JSON
+
+# {"accepted":1,"duplicates":0,"rejected":0,"batch_id":"lb_…"}
+# run it a second time:
+# {"accepted":0,"duplicates":1,"rejected":0,"batch_id":"lb_…"}
+```
+
+The second run is the contract working: same inputs, same id, no second row.
+
+### 15.11 Schema architecture
+
+Two stores, one derived key holding them together.
+
+```
+  DEVICE                                     BACKEND
+  fieldtrack-logs-<yourPackage>.db           your database
+  ────────────────────────────────           ──────────────────────────────────────
+
+   log_entry                                  log_batches       one row per exchange
+     id         INTEGER PK  local only          batch_id   PK
+     uid        TEXT UNIQUE ────┐               device_id
+     sessionId  TEXT NULL       │               status_code, entry_count,
+     seq        INTEGER         │               accepted / duplicates / rejected
+     …                          │               app_* / device_*   (per batch)
+     syncState  0 queued        │                    │
+                1 settled       │                    │ batch_id
+                                │                    ▼
+   log_counter                  │             session_logs      one row per entry
+     seq:<session>:<type>       │               id          TEXT PK  ◄── uid
+     decision:<session>         │               device_id   ────────►  your devices
+                                │               session_id  ────────►  your sessions
+   positions live in a          │               seq, elapsed_nanos, time
+   SEPARATE file:               │               level, type, tag, code, message
+   fieldtrack-<pkg>.db          │               data jsonb ─ point_uuid ─►  your points
+                                │               batch_id
+                                │
+                                └──── POST /v1/logs/batch ────►
+```
+
+The device's `uid` **becomes** the server's primary key. That is the whole dedupe design: a
+re-sent batch collides instead of duplicating, so the device is free to settle rows on a
+response it may never have received.
+
+#### On the device
+
+A second Room database, created only when `configureLogs()` is called, named for your package
+so two apps embedding the SDK cannot collide, and kept **separate from the file holding
+positions** — which is what makes a credential failure on the log endpoint structurally unable
+to reach a stored point.
+
+It is private to the SDK and is not public API: read it through `getLogs()` and
+`pendingLogCount()`, never by opening the file. The effective schema, for understanding what
+those calls are reading:
+
+```sql
+CREATE TABLE log_entry (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,  -- local insert order
+    uid                  TEXT    NOT NULL,   -- the wire id; the server's PK
+    sessionId            TEXT,               -- NULL for an entry outside any session
+    seq                  INTEGER NOT NULL,
+    timeMs               INTEGER NOT NULL,
+    elapsedRealtimeNanos INTEGER NOT NULL,
+    level                TEXT    NOT NULL,
+    type                 TEXT    NOT NULL,
+    tag                  TEXT    NOT NULL,
+    code                 TEXT,
+    message              TEXT    NOT NULL,
+    data                 TEXT,               -- JSON as text, or NULL
+    syncState            INTEGER NOT NULL    -- 0 queued, 1 shipped or dropped
+);
+CREATE UNIQUE INDEX index_log_entry_uid       ON log_entry(uid);
+CREATE        INDEX index_log_entry_syncState ON log_entry(syncState);
+CREATE        INDEX index_log_entry_timeMs    ON log_entry(timeMs);
+
+CREATE TABLE log_counter (
+    key   TEXT PRIMARY KEY NOT NULL,
+    value INTEGER NOT NULL
+);
+```
+
+Four decisions in that schema are worth knowing about, because they are what the API above
+behaves like:
+
+| | |
+|---|---|
+| `id` is local, `uid` is the identity | Insert order is what a batch is a prefix of; `uid` is what the server dedupes on. Unique on `uid` means a double-record is dropped here rather than sent twice |
+| `syncState` is the only send filter | Every `level` and `type` decision is made **before** a row exists, so a queued batch is always a contiguous prefix and settling by cursor is exact |
+| The ring evicts by `id`, whatever `syncState` says | Shipped and unshipped alike. A bounded buffer that refused to drop unsent rows would be unbounded on exactly the device that cannot reach a server |
+| Two counters outlive the process | `seq:<sessionId>:<type>` is the next sequence number for that pair; `decision:<sessionId>` is how far the decision log has been shipped, as an `elapsedRealtimeNanos`. A `seq` restarting at 0 after a process death would replay ids the server already holds |
+
+The entry id is derived, never allocated:
+
+```
+uid = SHA1("<sessionId>:<seq>:<type>:<elapsedRealtimeNanos>")     40 lowercase hex
+
+SHA1("20260907-143512-1f0c8a2e:1482:event:918891245000000")
+  = 8cdaa79826af5d2747293c152ecdecb03b3248d3
+```
+
+`sessionId` is hashed as the literal `null` when there is none. `elapsedRealtimeNanos` is in the
+digest as well as `seq` because `seq` alone repeats if a session's entries are all evicted and
+the counter restarts — a legible gap in a log, and a silent overwrite of somebody else's row
+without that term.
+
+#### On your backend
+
+Two tables. This is the shape the endpoint implies rather than a schema the SDK enforces —
+column types are PostgreSQL and translate directly:
+
+```sql
+CREATE TABLE log_batches (                    -- created first: session_logs points at it
+    batch_id            text        PRIMARY KEY,
+    device_id           text        NOT NULL,
+    received_at         timestamptz NOT NULL DEFAULT now(),
+    status_code         int         NOT NULL,
+    entry_count         int         NOT NULL,
+    accepted            int         NOT NULL DEFAULT 0,
+    duplicates          int         NOT NULL DEFAULT 0,
+    rejected            int         NOT NULL DEFAULT 0,
+    error               text        NULL,
+    gzip                boolean     NOT NULL DEFAULT false,
+    app_package         text,
+    app_version         text,
+    app_build           bigint,
+    sdk_version         text,
+    device_manufacturer text,
+    device_model        text,
+    device_os           int
+);
+
+CREATE INDEX ON log_batches (device_id, received_at DESC);
+
+CREATE TABLE session_logs (
+    id            text        PRIMARY KEY,          -- the entry's 40-hex id
+    device_id     text        NOT NULL,
+    session_id    text        NULL,                 -- nullable is required, not optional
+    seq           bigint      NOT NULL DEFAULT 0,
+    elapsed_nanos bigint      NOT NULL,             -- arrives as a string; store 64-bit
+    time          timestamptz NOT NULL,
+    received_at   timestamptz NOT NULL DEFAULT now(),
+    level         text        NOT NULL DEFAULT 'info',
+    type          text        NOT NULL DEFAULT 'message',
+    tag           text        NOT NULL DEFAULT 'app',
+    code          text        NULL,
+    message       text        NOT NULL DEFAULT '',
+    data          jsonb       NULL,
+    batch_id      text        NOT NULL REFERENCES log_batches(batch_id)
+);
+
+CREATE INDEX ON session_logs (device_id, received_at DESC);
+CREATE INDEX ON session_logs (session_id, elapsed_nanos);
+CREATE INDEX ON session_logs (device_id, code);
+```
 
 `session_logs` — one row per entry:
 
@@ -2488,9 +2947,6 @@ are PostgreSQL and translate directly.
 | `data` | `jsonb` **null** | Verbatim, never validated |
 | `batch_id` | `text` | The batch it arrived in |
 
-Useful indexes: `(device_id, received_at desc)`, `(session_id, elapsed_nanos)`, and
-`(device_id, code)`.
-
 `log_batches` — one row per HTTP exchange, **written whatever the outcome**, including the
 `413`s and the auth failures:
 
@@ -2507,16 +2963,45 @@ Useful indexes: `(device_id, received_at desc)`, `(session_id, elapsed_nanos)`, 
 | `app_package` / `app_version` / `app_build` / `sdk_version` | `text` / `text` / `bigint` / `text` | From the envelope's `app` |
 | `device_manufacturer` / `device_model` / `device_os` | `text` / `text` / `int` | From the envelope's `device` |
 
-Keep it separate from your point-ingest audit trail so a log flood is visible without
-polluting it. The per-batch `app` and `device` metadata lives here rather than on every
-entry — it is the same 200 bytes on each one otherwise, and it is what a "works on my
-device" ticket is actually about.
+Keep it separate from your point-ingest audit trail so a log flood is visible without polluting
+it. The per-batch `app` and `device` metadata lives here rather than on every entry — it is the
+same 200 bytes on each one otherwise, and it is what a "works on my device" ticket is actually
+about.
 
 **No row in `log_batches` at all** means the request never reached your handler: a 404, a
 network failure, or it never left the device. **A row** means `status_code`, `rejected` and
 `error` say exactly what happened.
 
-### 15.10 What it costs, and what to leave off
+Only two things should get an entry rejected, and both are structural: a missing `id` (the
+dedupe key) and a missing or non-numeric `elapsed_nanos` (the ordering key). Everything else is
+coerced — a log line that cannot be stored perfectly is still worth storing imperfectly.
+
+#### The four joins this schema exists for
+
+| From | To | Answers |
+|---|---|---|
+| `session_logs.device_id` | your points/devices table | "the track has a hole at 14:02 — what was the phone doing?" This is why the two channels must send the **same** `device_id` string |
+| `session_logs.session_id` | your sessions table | The panel: one session's entries in order, `elapsed_nanos` ascending. `null` belongs to the device, not to a session, and is correct |
+| `data ->> 'point_uuid'` | a stored point | An `ACCEPT` decision names the point that reached you; a `REJECT` is a point that never did, at the place where the polyline draws a straight line instead |
+| `session_logs.batch_id` | `log_batches` | "was this entry the last thing that got through" — and which build the device was running when it did |
+
+#### Retention
+
+`decision` is the same order of volume as your points table and its rows are wider, so it is
+worth pruning on its own schedule rather than with everything else:
+
+```sql
+DELETE FROM session_logs WHERE type = 'decision' AND received_at < now() - interval '7 days';
+DELETE FROM session_logs WHERE level = 'debug'   AND received_at < now() - interval '14 days';
+DELETE FROM session_logs WHERE received_at < now() - interval '30 days';
+DELETE FROM log_batches  WHERE received_at < now() - interval '7 days';
+```
+
+Deleting a session should delete its logs: a log line naming a deleted session is that session's
+data. The device does its own pruning independently — settled rows past `retentionHours`, and
+the ring at `bufferCapacity` — so nothing here needs the device's cooperation.
+
+### 15.12 What it costs, and what to leave off
 
 | | |
 |---|---|
@@ -2961,12 +3446,12 @@ fire and the runtime waiver already applies.
 | `NetworkAvailable` arrives but nothing uploads | The drain ran and failed — the event says a drain was *requested*, not that it succeeded | Read the `HttpResponse` that follows for the reason; a `null` `statusCode` means the request never completed |
 | Backlog uploads in a scrambled order | Fixed — the queue is FIFO by insertion, including across a reboot | Update the SDK; older builds ordered on a monotonic clock that restarts at boot |
 | Nothing ever reaches the log endpoint | `configureLogs()` was never called — points and diagnostics are separate channels | Call it after `configure()` ([§15.1](#151-turning-it-on)) |
-| Log entries arrive up to 15 minutes late | Working as designed: the channel is a quarter-hourly heartbeat, and only `nudgeLevel` and above drain promptly | Nothing, or lower `nudgeLevel` to `INFO` — a battery cost, not a free one ([§15.2](#152-logsyncconfig)) |
-| Log shipping stopped on its own, entries still buffered | The endpoint refused the channel: 401/403 on the credential, or 404/405/501 meaning there is no endpoint there | Fix the route or the token; the next `configureLogs()` retries with the buffer intact ([§15.7](#157-results-and-failure-semantics)) |
+| Log entries arrive up to 15 minutes late | Working as designed: the channel is a quarter-hourly heartbeat, and only `nudgeLevel` and above drain promptly | Nothing, or lower `nudgeLevel` to `INFO` — a battery cost, not a free one ([§15.3](#153-logsyncconfig)) |
+| Log shipping stopped on its own, entries still buffered | The endpoint refused the channel: 401/403 on the credential, or 404/405/501 meaning there is no endpoint there | Fix the route or the token; the next `configureLogs()` retries with the buffer intact ([§15.8](#158-results-and-failure-semantics)) |
 | Logs saved under a device your points are not under | `LogSyncConfig.deviceId` differs from `SyncConfig.extraParams["device_id"]` | Leave `deviceId` blank so it inherits. The join between the two channels is that string ([§15.1](#151-turning-it-on)) |
-| `seq` has gaps | The device buffer is bounded and evicted its oldest entries | Expected, and reported rather than hidden. Raise `bufferCapacity` or shorten `uploadIntervalMinutes` ([§15.6](#156-logrecord-and-its-enums)) |
-| A `data` payload is missing from an entry that is otherwise there | It was not a JSON object or array, so it was dropped rather than sent | Pass valid JSON text to `log()`; the entry itself is always kept ([§15.5](#155-writing-your-own-lines)) |
-| Log volume far higher than expected | `LogType.DECISION` is enabled — roughly 29 000 entries per device per shift | Remove it from `types`, or keep it on one named device while a ticket is open ([§15.10](#1510-what-it-costs-and-what-to-leave-off)) |
+| `seq` has gaps | The device buffer is bounded and evicted its oldest entries | Expected, and reported rather than hidden. Raise `bufferCapacity` or shorten `uploadIntervalMinutes` ([§15.7](#157-logrecord-and-its-enums)) |
+| A `data` payload is missing from an entry that is otherwise there | It was not a JSON object or array, so it was dropped rather than sent | Pass valid JSON text to `log()`; the entry itself is always kept ([§15.6](#156-writing-your-own-lines)) |
+| Log volume far higher than expected | `LogType.DECISION` is enabled — roughly 29 000 entries per device per shift | Remove it from `types`, or keep it on one named device while a ticket is open ([§15.12](#1512-what-it-costs-and-what-to-leave-off)) |
 | Tracking stopped and the queue emptied | A 401 tore everything down | Re-authenticate, then `ready()` / `start()` / `configure()` again |
 | The upload-status line vanished mid-session | A 401 or 403 cleared the sync config — the line is only posted while sync is configured | Check `SyncEvent.HttpResponse` for which, then the two rows above ([§14.4](#144-terminal-failure-semantics)) |
 | The upload-status line never appeared | `showSyncStatusInNotification` left off, or `configure()` never called | Turn the flag on **and** configure sync; it is a diagnostic and stays off by default ([§5.5](#55-serviceconfig)) |
