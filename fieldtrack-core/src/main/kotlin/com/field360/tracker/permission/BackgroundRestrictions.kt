@@ -39,10 +39,15 @@ import android.os.PowerManager
  *   `RESTRICTED` (45) means jobs may never run (EC-22); `RARE` (40) means heavily deferred.
  *   `null` below API 28, where the concept does not exist.
  */
-internal data class BackgroundRestrictions(
-    val ignoringBatteryOptimizations: Boolean,
-    val backgroundRestricted: Boolean,
-    val standbyBucket: Int?,
+// A public primary constructor, not an internal one. `HealthLoop` compares snapshots with
+// `!=` to report only genuine changes, so this has to stay a data class — and a data class
+// with an internal constructor leaks it through the generated `copy()`, which Kotlin flags.
+// There is no invariant to protect here: three facts read off the platform, and a host
+// building one by hand is doing it in a test.
+public data class BackgroundRestrictions(
+    public val ignoringBatteryOptimizations: Boolean,
+    public val backgroundRestricted: Boolean,
+    public val standbyBucket: Int?,
 ) {
 
     /**
@@ -52,11 +57,11 @@ internal data class BackgroundRestrictions(
      * it is the normal, healthy state of almost every app on Android, and treating it as a
      * fault would make this warn on every device and therefore on none.
      */
-    val degraded: Boolean
+    public val degraded: Boolean
         get() = backgroundRestricted || standbyBucket?.let { it >= BUCKET_RARE } == true
 
     /** One line for a log or a `Diagnostic`, naming only what is actually wrong. */
-    fun describe(): String = buildString {
+    public fun describe(): String = buildString {
         append("background restrictions: ")
         append("restricted=$backgroundRestricted")
         append(", bucket=${bucketName()}")

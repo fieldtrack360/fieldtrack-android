@@ -119,6 +119,10 @@
 # glob and not a package glob.
 -keep public class com.field360.tracker.permission.PermissionManager { public protected *; }
 -keep public class com.field360.tracker.permission.PermissionManager$* { public protected *; }
+# The background-restriction snapshot `PermissionManager.backgroundRestrictions()` returns.
+# Reachable from the public API, so it has to survive R8 for the same reason
+# WakeLockPolicy did — a stripped return type is a link error in the host's build, not ours.
+-keep public class com.field360.tracker.permission.BackgroundRestrictions { public protected *; }
 
 # The two motion types on the public surface. Everything else in the package —
 # controllers, wake sources, the sensor probe — is wiring.

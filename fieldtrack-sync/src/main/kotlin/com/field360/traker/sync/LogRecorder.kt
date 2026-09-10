@@ -6,6 +6,7 @@ import com.field360.tracker.domain.model.PermissionTier
 import com.field360.tracker.domain.model.ProviderState
 import com.field360.tracker.domain.model.TrackerEvent
 import com.field360.tracker.motion.DeviceSensors
+import com.field360.tracker.permission.BackgroundRestrictions
 import com.field360.tracker.motion.MotionQuality
 import com.field360.traker.geo.port.Clock
 import com.field360.traker.geo.port.TrackLogger
@@ -84,6 +85,15 @@ internal class LogRecorder(
      * lives.
      */
     private val providerState: () -> ProviderState? = { null },
+    /**
+     * What the OS and the OEM allow this app to do in the background, or `null`.
+     *
+     * Rides along with the location snapshot rather than getting an entry of its own: the
+     * two answer the same ticket from opposite ends. Permission and providers say why a
+     * session recorded nothing at all; these say why one that started fine stopped an hour
+     * later.
+     */
+    private val backgroundRestrictions: () -> BackgroundRestrictions? = { null },
     /**
      * Whether `ACTIVITY_RECOGNITION` is granted.
      *
@@ -342,18 +352,26 @@ internal class LogRecorder(
             }
             val state = providerState() ?: return
             if (session != null) locationRecordedFor = session
-            submit(locationDraft(session, state))
+            submit(locationDraft(session, state, backgroundRestrictions()))
         }
     }
 
-    private fun locationDraft(session: String?, state: ProviderState): Draft {
+    private fun locationDraft(
+        session: String?,
+        state: ProviderState,
+        background: BackgroundRestrictions?,
+    ): Draft {
         // Anything that would stop or degrade recording. WARN rather than INFO so it
         // survives the default `level = INFO` filter on a fleet — an entry about a device
         // that cannot track is worthless if the device that cannot track drops it.
         val blocking = state.permission != PermissionTier.FULL ||
             !state.locationServicesEnabled ||
             state.accuracyAuthorization != LocationAccuracy.PRECISE ||
-            !state.gpsEnabled
+            !state.gpsEnabled ||
+            // `degraded`, never `!ignoringBatteryOptimizations`: not holding the exemption
+            // is the normal state of almost every app, and warning on it would warn on a
+            // whole fleet and therefore on none of it.
+            background?.degraded == true
 
         return Draft(
             sessionId = session,
@@ -363,7 +381,7 @@ internal class LogRecorder(
             type = LogType.LIFECYCLE,
             tag = TAG_PROVIDER,
             code = CODE_DEVICE_LOCATION,
-            message = locationMessage(state),
+            message = locationMessage(state, background),
             data = jsonObjectOrNull(
                 mapOf(
                     "phase" to LifecyclePhase.DEVICE_LOCATION,
@@ -379,13 +397,19 @@ internal class LogRecorder(
                     // did not. Without it the two are indistinguishable on the server, and
                     // they are the two different tickets.
                     "session_opened" to (session != null),
+                    // The other half of the same question. Nullable rather than defaulted:
+                    // "we could not read it" and "it is false" are different facts, and a
+                    // default would file the first as the second.
+                    "battery_optimised" to background?.let { !it.ignoringBatteryOptimizations },
+                    "background_restricted" to background?.backgroundRestricted,
+                    "standby_bucket" to background?.standbyBucket,
                 ),
             ),
         )
     }
 
     /** One human-readable line, so the reason is legible without opening `data`. */
-    private fun locationMessage(state: ProviderState): String {
+    private fun locationMessage(state: ProviderState, background: BackgroundRestrictions?): String {
         val faults = buildList {
             when (state.permission) {
                 PermissionTier.NONE -> add("no location permission")
@@ -398,6 +422,15 @@ internal class LogRecorder(
             if (state.airplaneMode) add("airplane mode")
             if (state.powerSaveMode) add("power save on")
             if (!state.fusedAvailable) add("no fused provider")
+            // Named only when it is actually restrictive. The battery-optimisation
+            // exemption on its own is not a fault and does not appear here.
+            if (background?.backgroundRestricted == true) add("app background-restricted")
+            // Gated on `degraded` rather than on the bucket ladder: the thresholds are
+            // BackgroundRestrictions' own business, and restating them here is how the two
+            // drift apart.
+            background?.takeIf { it.degraded }
+                ?.standbyBucket
+                ?.let { add("standby bucket $it") }
         }
 
         return if (faults.isEmpty()) {

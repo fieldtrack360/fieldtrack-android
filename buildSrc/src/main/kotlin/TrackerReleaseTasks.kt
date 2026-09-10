@@ -79,6 +79,7 @@ abstract class VerifyReleaseObfuscationTask : DefaultTask() {
                     "com/field360/tracker/domain/model/TrackerResult.class",
                     "com/field360/tracker/domain/model/TrackSession.class",
                     "com/field360/tracker/motion/DeviceSensors.class",
+                    "com/field360/tracker/permission/BackgroundRestrictions.class",
                     "com/field360/tracker/permission/PermissionManager.class",
                 ),
                 "tr/dev/core/",

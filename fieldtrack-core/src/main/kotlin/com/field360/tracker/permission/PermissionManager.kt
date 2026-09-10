@@ -1,6 +1,7 @@
 package com.field360.tracker.permission
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -125,6 +126,84 @@ public class PermissionManager internal constructor(
         Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
         Uri.fromParts("package", context.packageName, null),
     ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
+    /**
+     * What the OS and the OEM currently allow this app to do in the background.
+     *
+     * Three reads, none of which needs a permission — see [BackgroundRestrictions] for what
+     * each one means when it is false. Cheap enough to call from a settings screen's
+     * `onResume` so the UI reflects a change the user just made.
+     *
+     * **`ignoringBatteryOptimizations == false` is the normal, healthy state of almost every
+     * app** and is not on its own a fault. [BackgroundRestrictions.degraded] deliberately
+     * ignores it: the exemption is the cheapest remedy to *offer* once something else is
+     * already wrong, not a box that has to be ticked.
+     */
+    public fun backgroundRestrictions(): BackgroundRestrictions =
+        BackgroundRestrictions.read(context)
+
+    /**
+     * The system list of apps and their battery-optimisation setting, for the host to open.
+     *
+     * **Needs no permission and is always safe to launch**, which is why it is the route
+     * this SDK can offer unconditionally. It costs the user two taps — find the app, choose
+     * "Don't optimise" — where [batteryExemptionRequestIntent] costs one, and it carries
+     * none of that one's Play-policy weight.
+     *
+     * Launch it from an Activity. `FLAG_ACTIVITY_NEW_TASK` is set so a host with only an
+     * application `Context` is not left with an intent it cannot start, but a Settings
+     * screen opened from a real Activity behaves better on Back.
+     */
+    public fun batteryOptimizationSettingsIntent(): Intent =
+        Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
+    /**
+     * The one-tap "allow this app to run in the background?" dialog, or `null`.
+     *
+     * **Null unless the host app declares `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` in its own
+     * manifest**, which this checks at runtime rather than assuming. The SDK does not
+     * declare it: that permission is Play-policy reviewed, and a library that quietly adds
+     * it to a host's merged manifest has made the host's store submission its own decision
+     * (EC-15). `ServiceHeartbeat` treats `SCHEDULE_EXACT_ALARM` the same way, for the same
+     * reason.
+     *
+     * So the contract is: declare it if your app qualifies — Play expects a core feature
+     * that genuinely cannot work under Doze, which continuous location tracking can be —
+     * and this returns the intent. Do not declare it, and the SDK falls back to
+     * [batteryOptimizationSettingsIntent], which always works.
+     *
+     * Returns `null` when the exemption is already held, so a host can use a non-null
+     * result as "there is something to ask for" without reading the status separately.
+     *
+     * Launching it when the permission is undeclared throws on some OEMs and silently does
+     * nothing on others, which is exactly the failure this null is here to prevent.
+     */
+    public fun batteryExemptionRequestIntent(): Intent? {
+        if (backgroundRestrictions().ignoringBatteryOptimizations) return null
+        if (!declaresBatteryExemptionPermission()) return null
+
+        @SuppressLint("BatteryLife") // The host declared the permission; the ask is its call.
+        return Intent(
+            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+            Uri.fromParts("package", context.packageName, null),
+        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+
+    /**
+     * Whether the merged manifest declares the exemption permission.
+     *
+     * `requestedPermissions` rather than a `checkSelfPermission`: this is a normal-level
+     * permission, so it is granted at install time and a runtime check answers "is it in
+     * the manifest" in a roundabout way that returns the wrong thing on the OEMs that
+     * pre-grant it. Asking the package manager what was declared is the direct question.
+     */
+    private fun declaresBatteryExemptionPermission(): Boolean = runCatching {
+        context.packageManager
+            .getPackageInfo(context.packageName, PackageManager.GET_PERMISSIONS)
+            .requestedPermissions
+            ?.contains(Manifest.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS) == true
+    }.getOrDefault(false)
 
     private fun hasBackgroundLocation(): Boolean =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
