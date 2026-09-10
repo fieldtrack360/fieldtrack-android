@@ -2376,8 +2376,43 @@ subscribe to anything:
 
 **Deliberately not recorded:** `Location` (that is what the points endpoint is for),
 `LocationRejected` (already in the SDK's decision log and read from there at send time — see
-`LogType.DECISION`), and `Heartbeat`, `BatteryChange` and the licence answers (volume, with
-nothing a reader would act on).
+`LogType.DECISION`), and `Heartbeat` and `BatteryChange` (volume, with nothing a reader
+would act on).
+
+#### The SDK's own log lines
+
+The events above are the SDK's *structured* output. Its running commentary — the lines that
+go to `adb logcat` under `Tracker/…` — is recorded too, from the moment a channel exists,
+with no `log()` call from you:
+
+```
+API_CALL        POST /verify -> HTTP 200 in 617ms, 352 bytes
+API_CALL        verdict ACTIVE valid=true ttl=21600s -> carry on
+SyncScheduler   Sync trigger registered
+LocationStream  Provider went quiet for 94s — restarting the request
+```
+
+They arrive as `LogType.MESSAGE`, the same type as your own lines, with the SDK's tag naming
+where each came from. One ordered stream rather than two you have to merge by hand.
+
+**`LogSyncConfig.level` decides how much of it you get, and the default is not "all of it".**
+The SDK logs at two levels internally: `DEBUG` for its commentary, `WARN` for something that
+went wrong. At the default `level = INFO` that means **warnings are recorded and the
+commentary is not**. Set `.level(LogLevel.DEBUG)` to capture everything — with the volume
+warning in [§15.12](#1512-what-it-costs-and-what-to-leave-off) firmly in mind, because the
+SDK writes several lines per fix and a shift is thousands of rows.
+
+**This is the one part of the channel that works in a release build.** `Tracker/…` logcat
+output is compiled out of release APKs — any app on a rooted device can read logcat, so a
+shipped app should not narrate itself there. The buffer is different: it is private, it is
+the host's own backend, and the host asked for it. So a released app records nothing until
+a log channel is configured, and records normally once one is. That is the whole point: the
+incident worth explaining is on a phone in the field, running a release build.
+
+**`FieldTrackApi` is the one tag never recorded.** That is the upload log — one line per
+request, on both channels. Recorded, a log upload would write an entry describing itself,
+which the next upload ships, which writes another. It stays in logcat, where it costs
+nothing.
 
 A provider transition also carries a filterable `code` — `GPS_OFF`, `GPS_ON`,
 `NETWORK_OFF`, `NETWORK_ON`, `LOCATION_OFF`, `LOCATION_ON` — plus `previous_gps`,
@@ -3046,6 +3081,12 @@ kilobytes per device per shift.
 `track_point` and the rows are wider. Enable it for one device while a ticket is open, and
 turn it off again — a `DEBUG` flag set during a ticket and never cleared is how one device
 ends up shipping 29 000 rows a day for a year.
+
+**`level = DEBUG` is the second one.** It turns on the SDK's own running commentary
+([§15.5](#155-what-the-sdk-records-without-being-asked)) — several lines per fix, so at a
+15-second cadence, thousands of rows a shift. Same rule: one device, while a ticket is open.
+At the default `INFO` the SDK contributes its warnings and nothing else, which is what the
+"few kilobytes per shift" figure above assumes.
 
 If you never want the channel at all, build your `SyncConfig` with `.syncLogs(false)` — or
 call `disableLogSync()` after the fact. Doing nothing now means the channel is on.

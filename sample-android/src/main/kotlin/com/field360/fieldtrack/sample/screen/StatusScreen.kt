@@ -180,7 +180,7 @@ fun StatusScreen(
                 if (state.syncEndpoint == null) {
                     KeyValue("endpoint", "not configured", Hack.Dim)
                     Text(
-                        "set SYNC_URL in local.properties to enable uploads",
+                        "set SYNC_URL in local.properties or configuration.properties",
                         style = MonoBody.copy(color = Hack.Dim, fontSize = 11.sp),
                     )
                 } else {

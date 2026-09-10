@@ -2044,9 +2044,18 @@ The device half is implemented, and it lives **entirely in `fieldtrack-sync`**:
 entries, and a `LogSyncWorker` heartbeat drains it. `fieldtrack-core` carries no logging
 code and no log table — a host that never depends on the sync module pays nothing.
 
-The endpoint **follows the points endpoint**. `configureLogs()` with no argument derives
-the URL from the origin of the `SyncConfig` already in force plus `v1/logs/batch`, inherits
-`device_id` from `SyncConfig.extraParams`, and reuses the points headers. See §11.13.
+The endpoint **follows the points endpoint**, and it is derived for you. `configure()`
+builds the log channel from the `SyncConfig` it was just given — the origin of that URL plus
+`v1/logs/batch`, `device_id` out of `SyncConfig.extraParams`, and the points headers — so a
+backend that implements this contract starts receiving without a second SDK call. Set
+`SyncConfig.syncLogs = false` to opt out, or call `configureLogs(...)` to override any of it;
+an explicit call wins permanently. If the channel cannot be derived (no `device_id`, an
+unparseable URL) the SDK logs why and points continue unaffected. See §11.13.
+
+**What this means for the backend: assume every SDK 1.1+ device that uploads points will
+also POST logs, unless its host opted out.** Have the route in place with the same auth the
+points route uses before rolling the upgrade out — see §11.11 for volume, which is the part
+worth reading twice.
 
 > The implemented server contract is [`APP-LOG-API.md`](APP-LOG-API.md) — read that for the
 > field-by-field rules, the auth modes, and the "why is it not saving" table. This section
@@ -2666,8 +2675,8 @@ sync.configure(
         .build(),
 )
 
-// The log channel. Same host, same credential, /v1/logs/batch, device_id inherited.
-sync.configureLogs()
+// The log channel needs no call: configure() derived it above. Same host, same
+// credential, /v1/logs/batch, device_id inherited. `.syncLogs(false)` opts out.
 ```
 
 That inheritance is not a convenience. Sending a *different* `device_id` on this channel
@@ -2768,5 +2777,5 @@ three days (§11.9).
 | 34 | Auth service down | `503` + `Retry-After`. **Never 401** — see §11.2. |
 | 35 | An entry and a decision sharing a `seq` in one session | Both stored. `seq` is per session **and per type** — dedupe is on `id`, which mixes the type in. |
 | 36 | Decision shipping turned on mid-life | Only entries recorded *after* the opt-in arrive. The device marks the existing `fix_decision` backlog as dealt with rather than uploading three days of it (§11.9). |
-| 37 | `configureLogs` never called | Nothing arrives, and nothing is recorded either: the recorder is armed by that call, so a device with no log endpoint writes no buffer. |
+| 37 | `syncLogs = false`, or a points config with no `device_id` | Nothing arrives, and nothing is recorded either: the recorder is armed only when a channel resolves, so a device without one writes no buffer. The second case is the common one — the log envelope requires `device_id` and the points envelope does not. |
 | 38 | 401 on the log endpoint while the points endpoint is healthy | Log shipping stops, the buffer is kept, **and positions keep uploading**. Verify this one explicitly — it is the whole reason the channels are separate. |

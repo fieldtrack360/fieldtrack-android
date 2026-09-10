@@ -29,7 +29,19 @@ Unreleased section. Reading them twice costs nothing; none of them needs an acti
 change, no new permission, and no change to the JSON your backend already receives for
 location points.
 
-Two things to *check* rather than change, then five things you may want to opt into.
+**One thing on your *server* may have to.** Session logs (§2) are now derived from your
+points config rather than waiting for a second call, so a device that uploads points will
+also POST to `<same origin>/v1/logs/batch`. Implement that route, or set
+`SyncConfig.syncLogs = false` and nothing is sent.
+
+**And the SDK now explains itself without being asked.** Once a log channel exists, the
+SDK's own internal logging — the licence verdict, a provider that went quiet, a worker that
+gave up — is recorded into the same buffer, with no `log()` call from your app, and it works
+in release builds where `adb logcat` is compiled out. At the default `level = INFO` you get
+its warnings; `.level(LogLevel.DEBUG)` gets everything, at several rows per fix.
+
+Two things to *check* rather than change, then five things you may want to opt into — one
+of which, session logs, is now on by default and needs a backend route (§2).
 
 ### 1. Check these two before you ship
 
@@ -72,8 +84,10 @@ killed. A track with a twenty-minute hole in it is unreadable on its own; the sa
 next to `CaptureSuspended(LOCATION_DISABLED)` and a `CaptureResumed` twenty minutes later
 is a closed support ticket.
 
-**Off by default.** It lives entirely in `fieldtrack-sync`, and it follows the points
-endpoint you already configured — so turning it on is one call:
+**On by default from this release, if you configure uploads at all.** It lives entirely in
+`fieldtrack-sync`, and `configure()` derives it from the points endpoint you already set up
+— so there is no call to add, and **your backend needs the route ready before you ship
+this**:
 
 ```kotlin
 // The points channel, as you already have it.
@@ -85,8 +99,8 @@ sync.configure(
         .build(),
 )
 
-// The log channel: same host, same credential, /v1/logs/batch, device_id inherited.
-sync.configureLogs()
+// The log channel needs no second call: configure() derives it — same host, same
+// credential, /v1/logs/batch, device_id inherited. `.syncLogs(false)` opts out.
 ```
 
 Override anything with a `LogSyncConfig` — and giving this endpoint its **own** credential
@@ -246,11 +260,12 @@ same jump for all of them. Nothing is dropped, nothing is rewritten, and
 Defaults are chosen so the first fix after the upgrade behaves exactly as it did before
 it. Existing sessions, points and geofences are untouched.
 
-**Session logs use a second database**, created by `fieldtrack-sync` and only when you call
-`configureLogs()`. It is a separate file (`fieldtrack-logs-<package>.db`) with its own
-schema and its own lifecycle, which is what makes a credential failure on the log endpoint
-structurally unable to touch a stored position. A host that never enables logs never
-creates it.
+**Session logs use a second database**, created by `fieldtrack-sync` when a log channel
+resolves — which now happens inside `configure()`. It is a separate file
+(`fieldtrack-logs-<package>.db`) with its own schema and its own lifecycle, which is what
+makes a credential failure on the log endpoint structurally unable to touch a stored
+position. A host that sets `syncLogs = false`, or that never configures uploads at all,
+never creates it.
 
 **Downgrading is not supported.** A build with an older schema opening a v10 database will
 refuse to start. Roll forward, or clear app data.

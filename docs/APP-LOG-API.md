@@ -274,7 +274,21 @@ verbatim, under a marker saying where it came from.
   "app":    { "package": "com.acme.field", "version": "3.4.1", "build": 3401, "sdk": "1.9.0" } }
 ```
 
-**`message`** — free-form host lines. `data` may be `{}`.
+**`message`** — free-form lines, `data` may be `{}`. Two sources share this type:
+
+- **the host's own**, from `TrackerSync.log(...)`, with whatever `tag` the host chose.
+- **the SDK's own commentary**, recorded automatically for as long as a log channel exists —
+  no host call involved. The `tag` names the SDK subsystem (`API_CALL`, `SyncScheduler`,
+  `LocationStream`, …) and the level is `debug` or `warn`.
+
+They are one type rather than two on purpose: a reader following one device through one
+incident wants a single ordered stream, not two to interleave by hand. Filter on `tag` if you
+need them apart — the SDK's tags are stable.
+
+Expect **only `warn`** from the SDK on a fleet: the device-side `level` filter defaults to
+`info`, so its `debug` commentary is dropped before it is ever stored. A device with `level`
+turned down to `debug` for a ticket will send several `message` rows per fix, which is worth
+knowing before you size a table on the fleet average.
 
 Any `warn`/`error` entry whose `data` carries `latitude`/`longitude` is **plotted on the track**
 in the dashboard — so a rejected fix appears exactly where the polyline draws a straight line

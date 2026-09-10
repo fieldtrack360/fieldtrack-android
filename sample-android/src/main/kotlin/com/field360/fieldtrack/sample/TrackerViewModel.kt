@@ -634,7 +634,8 @@ class TrackerViewModel(
             syncConfigError != null -> raiseSyncAlert(
                 headline = "Upload endpoint rejected",
                 detail = "SyncConfig.validate() failed: $syncConfigError\n\nFix SYNC_URL " +
-                    "in local.properties and reinstall. Nothing will ever upload until " +
+                    "in local.properties (or configuration.properties, which it falls " +
+                    "back to) and reinstall. Nothing will ever upload until " +
                     "it validates — configure() throws rather than accepting a config " +
                     "that would fail on every request.",
                 terminal = true,
@@ -879,7 +880,7 @@ class TrackerViewModel(
             raiseSyncAlert(
                 headline = "Sync is not configured",
                 detail = "No endpoint is set, so there is nothing to drain. Set SYNC_URL " +
-                    "in local.properties and reinstall.\n\nThis is a valid state, not a " +
+                    "in local.properties or configuration.properties and reinstall.\n\nThis is a valid state, not a " +
                     "fault: with no endpoint the SDK keeps every point in Room and opens " +
                     "no socket.",
                 terminal = true,
@@ -943,7 +944,9 @@ class TrackerViewModel(
             it.copy(
                 licenseStatus = when {
                     BuildConfig.TRACKER_LICENSE.isNotEmpty() -> "configured from local.properties"
-                    else -> "debug installs waived; add TRACKIT_LICENSE for release builds"
+                    // Deliberately not configuration.properties: that file is committed,
+                    // and a licence token is a credential.
+                    else -> "debug installs waived; add TRACKER_LICENSE to local.properties"
                 },
             )
         }

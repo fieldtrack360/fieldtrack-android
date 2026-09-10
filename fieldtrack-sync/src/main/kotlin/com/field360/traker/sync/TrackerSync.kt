@@ -18,6 +18,7 @@ import androidx.work.WorkerParameters
 import com.field360.tracker.Tracker
 import com.field360.tracker.TrackerArtifacts
 import com.field360.tracker.domain.repository.SyncTrigger
+import com.field360.traker.geo.port.SdkLogRelay
 import com.field360.traker.geo.port.TrackLogger
 import com.field360.traker.sync.internal.LoggingSyncTransport
 import com.field360.traker.sync.internal.MAX_PARAM_DEPTH
@@ -706,6 +707,12 @@ public class TrackerSync internal constructor(
         // waiting out the heartbeat. Throttled inside the recorder.
         logRecorder.configure(resolved) { requestLogSync() }
 
+        // From here the SDK's own log output is recorded too, with no `log()` call from the
+        // host. Installed after `configure` above, never before: the recorder drops
+        // everything while its config is null, so a line emitted in between would be lost
+        // rather than buffered.
+        SdkLogRelay.install(sdkLogSink)
+
         // The opt-in reset. The SDK writes its decision log whether or not anyone ships it,
         // so without this the first drain after turning decisions on would upload days of
         // history: tens of thousands of entries about drives nobody asked to diagnose.
@@ -731,8 +738,45 @@ public class TrackerSync internal constructor(
         logConfig = null
         logsAutoConfigured = false
         logTransport = null
+        // Before stop(), so the SDK's own lines cannot arrive at a recorder that has already
+        // let go of its config — and so `sdkLog` in a release build goes back to costing
+        // nothing the moment a host turns the channel off.
+        SdkLogRelay.install(null)
         logRecorder.stop()
         LogSyncWorker.cancel(context)
+    }
+
+    /**
+     * The SDK's own log output, written into the diagnostic buffer as it happens.
+     *
+     * **This is what makes the channel worth having without the host writing any code.** A
+     * host that calls `log()` on its own events gets its own story; this is the SDK's — the
+     * provider that went quiet, the fix the accuracy gate rejected, the worker that gave up,
+     * the licence verdict. Those are the lines that explain a hole in a track, and until now
+     * they existed only in logcat on a debug build, which is never where the incident is.
+     *
+     * **Level maps straight through, and [LogSyncConfig.level] still decides.** `TrackLogger`
+     * has two levels: `d` becomes [LogLevel.DEBUG] and `w` becomes [LogLevel.WARN]. At the
+     * default `level = INFO` that means **warnings are recorded and debug chatter is not** —
+     * the same gate every other entry passes, in the same place, so turning the SDK's own
+     * output up is `LogSyncConfig.builder().level(LogLevel.DEBUG)` and nothing else. That
+     * default is deliberate: the SDK writes several debug lines per fix, and at a 15-second
+     * cadence "record everything" is thousands of rows a shift, uploaded, for a device
+     * nobody has a ticket open on.
+     *
+     * Recorded as [LogType.MESSAGE], the same type as a host's own `log()` line — with the
+     * SDK's tag (`API_CALL`, `SyncScheduler`, …) naming where it came from. It is not a
+     * separate type because a reader following one device through one incident wants one
+     * ordered stream, not two interleaved ones they have to merge by hand.
+     */
+    private val sdkLogSink = object : TrackLogger {
+        override fun d(tag: String, message: String) {
+            logRecorder.record(LogLevel.DEBUG, LogType.MESSAGE, tag, message)
+        }
+
+        override fun w(tag: String, message: String) {
+            logRecorder.record(LogLevel.WARN, LogType.MESSAGE, tag, message)
+        }
     }
 
     /**
@@ -828,6 +872,10 @@ public class TrackerSync internal constructor(
                 logsRejectedWith = result.statusCode
                 logConfig = null
                 logTransport = null
+                // The relay comes down with the channel. A stopped recorder drops what it
+                // is handed anyway, but leaving the relay installed would keep every
+                // `sdkLog` block in a release build running to build a message for nobody.
+                SdkLogRelay.install(null)
                 logRecorder.stop()
                 LogSyncWorker.cancel(context)
             }

@@ -26,8 +26,9 @@ additive (two `filter_state` columns, both defaulting to `0`) and is registered 
 
 `fieldtrack-sync` creates a **second, separate** database, `fieldtrack-logs-<package>.db`,
 at version 1. It has never shipped, so no install has the file and there is nothing to
-migrate; Room creates it on the first entry written after `configureLogs()`. A host that
-never calls `configureLogs()` never gets the file.
+migrate; Room creates it on the first entry written after a log channel resolves. Since
+`configure()` now derives one by default, that is most hosts — a host that sets
+`SyncConfig.syncLogs = false`, or that configures no uploads at all, never gets the file.
 
 New: `TrackerDatabaseMigrationTest` seeds a real database from each **committed schema
 export** — its own DDL, indices, `room_master_table` identity and `user_version` — then
@@ -72,24 +73,58 @@ and validate the result. It covers every exported version, and a companion case 
     buffer that never drains and a radio that never sleeps.
 
 - **Session logs — a diagnostic channel with its own endpoint, in `fieldtrack-sync`.**
-  Points answer *where the device was*; this answers *why there is nothing there*. Off by
-  default, and entirely inside the optional sync artifact — `fieldtrack-core` carries no
+  Points answer *where the device was*; this answers *why there is nothing there*. **On by
+  default whenever `configure()` is called**, and entirely inside the optional sync
+  artifact — `fieldtrack-core` carries no
   logging code and no log table, so a host that does not depend on `fieldtrack-sync` pays
   nothing. Server contract: [`docs/APP-LOG-API.md`](docs/APP-LOG-API.md); design:
   [`docs/SYNC-BACKEND-AND-DASHBOARD.md` §11](docs/SYNC-BACKEND-AND-DASHBOARD.md#11-session-logs).
-  - `TrackerSync.configureLogs(LogSyncConfig, SyncTransport?)` — **follows the points
-    endpoint**. Called with no argument it derives the URL from the origin of the
-    `SyncConfig` already in force plus `v1/logs/batch`, inherits `device_id` from
-    `SyncConfig.extraParams`, and reuses the points headers. Sending a different
-    `device_id` would produce two unrelated datasets, so inheriting it is the default.
+  - `SyncConfig.syncLogs` (default `true`) and `SyncConfig.Builder.syncLogs(Boolean)` —
+    **`configure()` sets the channel up for you.** It derives the URL from the origin of
+    the points `SyncConfig` plus `v1/logs/batch`, inherits `device_id` from
+    `SyncConfig.extraParams`, and reuses the points headers. Sending a different `device_id`
+    would produce two unrelated datasets, so inheriting it is the default.
+
+    On rather than off because of what the logs are for: they explain the report that
+    arrives as "tracking stopped on one phone yesterday", and by then the window to have
+    been collecting has closed.
+
+    **Never fatal.** If the channel cannot be derived — no `device_id`, an unparseable URL
+    — `configure()` logs why under `Tracker/TrackerSync` and points continue unaffected.
+    Deriving a log channel is never a reason to fail a points config. **Backends should
+    expect log traffic from any host that uploads points and has not opted out.**
+  - **The SDK's own log output is recorded automatically**, with no `log()` call from the
+    host. Every internal line — the licence verdict, a provider that went quiet, a worker
+    that gave up — goes through `TrackLogger`, and `SdkLogRelay` (new, in `fieldtrack-geo`)
+    tees that stream into the buffer for as long as a log channel exists. Recorded as
+    `LogType.MESSAGE` with the SDK's own tag, so one device's story reads as one ordered
+    stream rather than two to merge by hand.
+
+    **`d` maps to `DEBUG` and `w` to `WARN`, and `LogSyncConfig.level` still decides.** At
+    the default `INFO` that means the SDK's warnings are kept and its commentary is not —
+    `.level(LogLevel.DEBUG)` captures everything, at several lines per fix.
+
+    **It works in release builds**, which is the point: `sdkLog` now runs its block when
+    either `SDK_LOGGING_ENABLED` is set *or* a relay sink is installed. Logcat stays
+    compiled out of release — anything with `READ_LOGS` can read that — while a private
+    buffer the host asked for does not. A host that never configures log shipping is
+    unchanged: `isActive` is a volatile read returning false and the block is skipped.
+
+    The relay never recurses (a sink whose write path logs is guarded per thread), never
+    throws into its caller, and never relays the `FieldTrackApi` upload log — an entry
+    describing a log upload is an entry the next log upload has to ship.
+  - `TrackerSync.configureLogs(LogSyncConfig, SyncTransport?)` — the explicit form, for a
+    different endpoint, credential, level or interval. **An explicit call wins
+    permanently**: once made, later `configure()` calls leave it alone rather than
+    re-deriving over it. Unlike the derived default it throws on an invalid config.
   - `TrackerSync.log(level, tag, message, code, data)`, `logLifecycle(phase, tag)`,
     `getLogs(sessionId, limit, offset)`, `pendingLogCount()`, `syncLogsNow()`,
     `requestLogSync()`, `disableLogSync()`, `logEvents`, `logEndpoint`,
     `isLogSyncConfigured`.
   - `LogSyncConfig` (+ `Builder`), `LogRecord`, `LogLevel`, `LogType`, `LifecyclePhase`,
     `LogSyncQueue`, `LogPayload` / `LogEntryDto` — all in `com.field360.traker.sync`.
-  - **Its own Room database**, `fieldtrack-logs-<package>.db`, created only when
-    `configureLogs()` is called. A separate file from the one holding positions, which is
+  - **Its own Room database**, `fieldtrack-logs-<package>.db`, created only once a log
+    channel resolves. A separate file from the one holding positions, which is
     what makes a credential failure on the log endpoint structurally unable to reach a
     stored point.
   - **Prompt drain on a severe entry.** The channel is a 15-minute `LogSyncWorker`
@@ -387,6 +422,32 @@ and validate the result. It covers every exported version, and a companion case 
   names the app holding the foreground service with a debug readout.
 
 ### Changed
+
+- **Build configuration split into a committed `configuration.properties` and the gitignored
+  `local.properties`.** `FIELDTRACK_LICENSE_URL` and `FIELDTRACK_RESPONSE_KEY` are now read
+  from the committed file — `-P…` → environment → `configuration.properties` — and
+  `local.properties` is **not** consulted for either. A fresh clone and every CI runner
+  therefore build against the same licence endpoint with no setup step, and a per-machine
+  override can no longer point one laptop's release at a server nobody tested. Neither value
+  is a secret: both are compiled into `BuildConfig` and readable in any published AAR or
+  installed APK whichever file they were typed into, and the response key is the *public*
+  half of the signing pair.
+
+  Credentials are unaffected and unmoved: `MAPS_API_KEY` and `TRACKER_LICENSE` read
+  `local.properties` only, with **no** fallback to the committed file, so a value pasted
+  there is ignored rather than silently published. `SYNC_URL` and `OSRM_BASE_URL` are
+  per-developer and read `local.properties` first, falling back to the committed defaults.
+
+  `FIELDTRACK_LICENSE_KEYS` is documented as **read by nothing** — the offline token
+  signature gate it fed was removed, and the response key is the only key still compiled in.
+
+- **The licence client logs request and response headers**, alongside the bodies it already
+  logged, under `Tracker/API_CALL` in debug builds. A proxy answering `200 text/html` is a
+  captive portal rather than the licence server, and a `Retry-After` explains a 429 that
+  otherwise reads as an outage — neither is visible in a body-only log. Header *names* are
+  never shortened; values of `Authorization`, `Cookie`, `X-Api-Key` and the rest are cut to
+  a 12-character preview, on the same reasoning as `access_key` in the body. Compiled out of
+  release builds entirely, like every other `sdkLog` call.
 
 - **The sync status is layered onto the notification, never replacing it.** Title, subtitle and
   description are three slots: the host keeps the title in both states, the sync headline renders

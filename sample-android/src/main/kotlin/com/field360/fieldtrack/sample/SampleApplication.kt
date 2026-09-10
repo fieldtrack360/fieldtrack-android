@@ -98,7 +98,7 @@ class SampleApplication : Application() {
      */
     val syncTransportAvailable: Boolean by lazy {
         runCatching { Class.forName("retrofit2.Retrofit") }.isSuccess &&
-            runCatching { Class.forName("okhttp3.OkHttpClient") }.isSuccess
+                runCatching { Class.forName("okhttp3.OkHttpClient") }.isSuccess
     }
 
     /**
@@ -127,7 +127,10 @@ class SampleApplication : Application() {
                     Log.i(TRACKER_TAG, "ready() ok state=${result.value}")
 
                 is TrackerResult.Error ->
-                    Log.e(TRACKER_TAG, "ready() failed code=${result.code} message=${result.message}")
+                    Log.e(
+                        TRACKER_TAG,
+                        "ready() failed code=${result.code} message=${result.message}"
+                    )
             }
 
             // Re-installed with whatever session is open on disk, and this is the half of
@@ -169,7 +172,7 @@ class SampleApplication : Application() {
      */
     @Suppress("LongMethod") // The length is the point: every setter, none hidden.
     private fun buildTrackerConfig(): TrackerConfig =
-        // The builder rather than the constructor on purpose: it is the surface a Java
+    // The builder rather than the constructor on purpose: it is the surface a Java
         // host has, so the sample exercises it.
         TrackerConfig.builder()
             // ── identity and lifecycle ──────────────────────────────────────
@@ -363,7 +366,8 @@ class SampleApplication : Application() {
             .build()
 
     /**
-     * The upload half, if `SYNC_URL` is set in `local.properties`.
+     * The upload half, if `SYNC_URL` is set — in `local.properties`, else the committed
+     * `configuration.properties` it falls back to.
      *
      * Blank is the default and a working configuration: no endpoint is configured, points
      * accumulate in Room, and the SDK opens no socket. Everything below is what a host
@@ -488,17 +492,21 @@ class SampleApplication : Application() {
             )
 
             // The diagnostic channel (`docs/APP-LOG-API.md`), and it has to be asked for:
-            // `configure()` above turns on the POINTS endpoint only. Without this line the
-            // SDK records nothing, `/v1/logs/batch` is never called, and a hole in a track
-            // reaches the dashboard with no reason attached — which is the whole failure
-            // the endpoint exists to prevent.
+            // `configure()` above already derived this channel — `SyncConfig.syncLogs` is
+            // on by default — so this line is an override rather than the switch. It is
+            // here because this app wants a `device_label` and a prompter drain than the
+            // defaults give, not because the channel would otherwise be off.
+            //
+            // Either way the SDK's own log output is recorded from the moment a channel
+            // exists: no `sync.log(...)` call anywhere in this app puts the licence check,
+            // the provider state changes or the worker outcomes into the buffer.
             //
             // No URL, no device id and no credential: all three are derived from the points
             // config just set, which is what keeps the two channels joined on the same
             // `device_id`. Idempotent, so the second `installSync()` on a session start
             // simply replaces it.
             sync.configureLogs(
-                LogSyncConfig.builder()
+                LogSyncConfig.builder().autoSync(true)
                     // The same readable name the points envelope carries, under the same
                     // key, so a backend reads `device_label` off either channel with one
                     // code path.
@@ -572,7 +580,10 @@ class SampleApplication : Application() {
             }
 
         geofenceAlerts.record(crossings, System.currentTimeMillis()).forEach { alert ->
-            Log.i(TRACKER_TAG, "geofence ${alert.transition} ${alert.geofenceId} at ${alert.crossedAtMs}")
+            Log.i(
+                TRACKER_TAG,
+                "geofence ${alert.transition} ${alert.geofenceId} at ${alert.crossedAtMs}"
+            )
             if (isNotifiable(alert)) geofenceNotifier.post(alert)
         }
     }
@@ -602,7 +613,8 @@ class SampleApplication : Application() {
     }
 
     /**
-     * Road snapping, if `OSRM_BASE_URL` is set in `local.properties`.
+     * Road snapping, if `OSRM_BASE_URL` is set — in `local.properties`, else the committed
+     * `configuration.properties` it falls back to.
      *
      * Blank is the default and a perfectly good configuration: no provider is installed,
      * `buildTrack` never leaves the device, and the polyline is drawn from the fixes that
