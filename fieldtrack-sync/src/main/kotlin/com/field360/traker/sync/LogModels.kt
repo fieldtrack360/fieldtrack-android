@@ -154,4 +154,23 @@ public object LifecyclePhase {
      * the points alone.
      */
     public const val DEVICE_MOTION: String = "device_motion"
+
+    /**
+     * The device's location permissions and providers, written on every start attempt.
+     *
+     * The counterpart to [DEVICE_MOTION], and the answer to the other half of "why is there
+     * nothing here". Motion hardware explains gaps *inside* a session; this explains a
+     * session that recorded nothing, or that never opened at all.
+     *
+     * **Written whatever the permission says, including when the permission is what stopped
+     * the start.** That is the case it exists for: a `start()` refused at the permission
+     * gate opens no session, so nothing else in this channel describes it, and the device
+     * that "never tracks" produces no evidence at all. This entry is filed against the
+     * device (`session_id: null`) when there is no session to attach it to.
+     *
+     * `WARN` whenever the state would stop or degrade tracking — permission missing or
+     * foreground-only, location services off, approximate accuracy — so it survives the
+     * default `level = INFO` on a fleet. `INFO` when everything is in order.
+     */
+    public const val DEVICE_LOCATION: String = "device_location"
 }

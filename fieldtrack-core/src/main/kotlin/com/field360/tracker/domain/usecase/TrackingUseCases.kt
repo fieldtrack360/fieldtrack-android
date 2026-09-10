@@ -17,6 +17,8 @@ import com.field360.tracker.domain.model.TrackerResult
 import com.field360.tracker.domain.model.TrackSession
 import com.field360.tracker.domain.repository.ConfigRepository
 import com.field360.tracker.domain.repository.SessionRepository
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import com.field360.traker.geo.model.MockPolicy
 import com.field360.traker.geo.model.MotionState
 import com.field360.tracker.integrity.IntegrityPolicy
@@ -165,33 +167,83 @@ public class StartTrackingUseCase internal constructor(
         // `onStartCommand`, and every value it supervises with — the health-loop cadence,
         // the force-capture config, the watchdog thresholds — was read when *that* session
         // started. A new session would silently run on the old session's configuration.
-        val superseded = teardown()
-        if (superseded != null) {
+        // NonCancellable from here down, and the FGS start moved to the front of it.
+        //
+        // Everything above this line is a synchronous gate that has changed nothing yet, so
+        // cancelling there is free. Everything below changes device state, and being
+        // cancelled midway is what produced "I tapped Start, swiped the app away, and
+        // nothing ever recorded".
+        //
+        // The caller's scope is the problem. `Tracker.start()` is a suspend function, so it
+        // runs on whatever the host gave it — `viewModelScope` in the sample
+        // (`TrackerViewModel.launchStart`). Swiping the task away clears the ViewModel,
+        // which cancels that scope, which abandons this coroutine at its very next
+        // suspension point. On stock Android the process usually lingers long enough that
+        // the user never notices; on MIUI and Funtouch the swipe is followed by a process
+        // kill in the same breath, so the abandoned half-start is all that ever happened.
+        //
+        // NonCancellable does not keep a dying process alive — nothing can. It removes the
+        // *cooperative* half of the race, which is the half that needs no OEM at all.
+        return withContext(NonCancellable) {
+            val superseded = teardown()
+            if (superseded != null) {
+                events.tryEmit(
+                    TrackerEvent.Diagnostic(
+                        "session ${superseded.id} superseded by a new start(); its service " +
+                            "and workers were stopped",
+                    ),
+                )
+            }
+
+            // THE FIRST THING THAT HAPPENS AFTER TEARDOWN, and it used to be the last thing
+            // in the whole function.
+            //
+            // The platform gives the app a short window in which starting a foreground
+            // service from a recent-foreground state is legal, and the window is measured
+            // from the user's interaction, not from this call. Everything that used to run
+            // ahead of it spent that window: a Room read and insert in `sessions.open`,
+            // then `launcher.launch` registering a location request, activity-recognition
+            // transitions, a step sensor and a significant-motion wake — binder calls, each
+            // a suspension point, on a cold-started process whose disk is contended.
+            //
+            // Ordering it here costs nothing, because the service does not need the session
+            // row: `onStartCommand` promotes with the *in-memory* config and
+            // `startSupervision` reads the rest off disk a moment later. If the process dies
+            // between here and the session row below, the service comes up, finds no open
+            // session, and stops itself at the first health-loop tick — the same tidy
+            // outcome as today, reached without losing the ones that would have survived.
+            //
+            // It cannot move above `teardown()`: that call ends in `TrackingService.stop`,
+            // which would stop the instance we had just asked for.
+            val promoted = TrackingService.start(context, config.service)
             events.tryEmit(
                 TrackerEvent.Diagnostic(
-                    "session ${superseded.id} superseded by a new start(); its service and " +
-                        "workers were stopped",
+                    if (promoted) {
+                        "foreground service requested before the session row was written"
+                    } else {
+                        "foreground service REFUSED at start(); tracking will depend on the " +
+                            "restore path — check Autostart/battery settings on this device"
+                    },
                 ),
             )
+
+            val session = sessions.open(tag, configStore.encode(config))
+
+            // The whole pipeline, in one call, shared with the resume path. Arming the gate
+            // is the last thing it does, which is why `isCapturing` is readable immediately
+            // after this returns: a session opened while location was switched off is
+            // already reported as suspended rather than claiming a capture that is not
+            // running.
+            //
+            // Deliberately not a start() gate: refusing to open a session because the GPS is
+            // off would strand a host that starts tracking from a background trigger — the
+            // session is the record, and the record should exist with a documented gap in it
+            // rather than not exist at all.
+            launcher.launch(session, config)
+
+            events.tryEmit(TrackerEvent.EnabledChange(enabled = true))
+            TrackerResult.Ok(session)
         }
-
-        val session = sessions.open(tag, configStore.encode(config))
-
-        // The whole pipeline, in one call, shared with the resume path. Arming the gate is
-        // the last thing it does, which is why `isCapturing` is readable immediately after
-        // this returns: a session opened while location was switched off is already
-        // reported as suspended rather than claiming a capture that is not running.
-        //
-        // Deliberately not a start() gate: refusing to open a session because the GPS is
-        // off would strand a host that starts tracking from a background trigger — the
-        // session is the record, and the record should exist with a documented gap in it
-        // rather than not exist at all.
-        launcher.launch(session, config)
-
-        TrackingService.start(context, config.service)
-
-        events.tryEmit(TrackerEvent.EnabledChange(enabled = true))
-        return TrackerResult.Ok(session)
     }
 }
 

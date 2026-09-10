@@ -1,5 +1,8 @@
 package com.field360.traker.sync
 
+import com.field360.tracker.domain.model.ErrorCode
+import com.field360.tracker.domain.model.LocationAccuracy
+import com.field360.tracker.domain.model.PermissionTier
 import com.field360.tracker.domain.model.ProviderState
 import com.field360.tracker.domain.model.TrackerEvent
 import com.field360.tracker.motion.DeviceSensors
@@ -73,6 +76,15 @@ internal class LogRecorder(
      */
     private val sensors: () -> DeviceSensors? = { null },
     /**
+     * The device's location permissions and providers, or `null` when it cannot be read.
+     *
+     * A lambda for the same reason [sensors] is one, and read at write time rather than
+     * cached: the whole value of this entry is that it says what was true at the moment the
+     * start was attempted, and permission and the GPS switch both move while a process
+     * lives.
+     */
+    private val providerState: () -> ProviderState? = { null },
+    /**
      * Whether `ACTIVITY_RECOGNITION` is granted.
      *
      * Reported beside [sensors] because `DeviceSensors` folds the grant into its step
@@ -125,6 +137,16 @@ internal class LogRecorder(
      */
     private var motionRecordedFor: String? = null
 
+    /**
+     * The session whose location state has already been recorded.
+     *
+     * Only the *session* write is deduplicated. A failed start has no session to key on and
+     * is always written: two refusals are two facts, and collapsing them would hide a user
+     * tapping Start repeatedly against a permission that never got granted — which is the
+     * exact shape of the reports this entry exists to answer.
+     */
+    private var locationRecordedFor: String? = null
+
     /** Serialises the check-then-write above; two start signals can race on it. */
     private val motionLock = Mutex()
 
@@ -141,9 +163,10 @@ internal class LogRecorder(
         start()
         attach()
         // For the host that calls `configureLogs()` *after* `start()`. The session-start
-        // signal that normally carries this has already been and gone, and a session
+        // signal that normally carries these has already been and gone, and a session
         // missing its motion line is the one case this whole entry exists to cover.
         recordSessionMotion()
+        recordSessionLocation()
     }
 
     /**
@@ -280,6 +303,110 @@ internal class LogRecorder(
         }
     }
 
+    /**
+     * Writes the device's location permissions and providers.
+     *
+     * ### Why it is not conditional on the permission being granted
+     *
+     * The denied case is the one worth recording. A `start()` refused at the permission
+     * gate returns before a session row exists, so `EnabledChange` never fires, the motion
+     * line never runs, and the whole channel says nothing about the attempt — leaving "this
+     * device never starts tracking" with no evidence behind it but the user's word.
+     * [openSessionId] is allowed to be null here, and the entry is then filed against the
+     * device, which the log API documents as legal and sometimes correct.
+     *
+     * ### Once per session, always per failure
+     *
+     * A granted start writes one line and the guard stops the repeats. A refused start has
+     * no session to key on and writes every time, deliberately: three refusals in ten
+     * seconds is a user tapping Start against a permission that was never granted, and that
+     * pattern is the answer to the ticket.
+     *
+     * @param force `true` from a failed start, where there may be no session and the
+     *   per-session guard must not apply.
+     */
+    fun recordSessionLocation(force: Boolean = false) {
+        if (config == null) return
+        scope.launch {
+            runCatching { writeSessionLocation(force) }
+                .onFailure { sdkWarn { logger.w(TAG, "Location probe failed: ${it.message}") } }
+        }
+    }
+
+    private suspend fun writeSessionLocation(force: Boolean) {
+        motionLock.withLock {
+            val session = openSessionId()
+            if (!force) {
+                if (session == null) return
+                if (session == locationRecordedFor) return
+            }
+            val state = providerState() ?: return
+            if (session != null) locationRecordedFor = session
+            submit(locationDraft(session, state))
+        }
+    }
+
+    private fun locationDraft(session: String?, state: ProviderState): Draft {
+        // Anything that would stop or degrade recording. WARN rather than INFO so it
+        // survives the default `level = INFO` filter on a fleet — an entry about a device
+        // that cannot track is worthless if the device that cannot track drops it.
+        val blocking = state.permission != PermissionTier.FULL ||
+            !state.locationServicesEnabled ||
+            state.accuracyAuthorization != LocationAccuracy.PRECISE ||
+            !state.gpsEnabled
+
+        return Draft(
+            sessionId = session,
+            timeMs = clock.wallTimeMs(),
+            elapsedRealtimeNanos = clock.elapsedRealtimeNanos(),
+            level = if (blocking) LogLevel.WARN else LogLevel.INFO,
+            type = LogType.LIFECYCLE,
+            tag = TAG_PROVIDER,
+            code = CODE_DEVICE_LOCATION,
+            message = locationMessage(state),
+            data = jsonObjectOrNull(
+                mapOf(
+                    "phase" to LifecyclePhase.DEVICE_LOCATION,
+                    "permission" to state.permission.name,
+                    "accuracy" to state.accuracyAuthorization.name,
+                    "gps_enabled" to state.gpsEnabled,
+                    "network_enabled" to state.networkEnabled,
+                    "location_services_enabled" to state.locationServicesEnabled,
+                    "fused_available" to state.fusedAvailable,
+                    "power_save_mode" to state.powerSaveMode,
+                    "airplane_mode" to state.airplaneMode,
+                    // Says whether this describes a session that opened or an attempt that
+                    // did not. Without it the two are indistinguishable on the server, and
+                    // they are the two different tickets.
+                    "session_opened" to (session != null),
+                ),
+            ),
+        )
+    }
+
+    /** One human-readable line, so the reason is legible without opening `data`. */
+    private fun locationMessage(state: ProviderState): String {
+        val faults = buildList {
+            when (state.permission) {
+                PermissionTier.NONE -> add("no location permission")
+                PermissionTier.FOREGROUND_ONLY -> add("foreground-only permission")
+                PermissionTier.FULL -> Unit
+            }
+            if (state.accuracyAuthorization != LocationAccuracy.PRECISE) add("approximate only")
+            if (!state.locationServicesEnabled) add("location services off")
+            if (!state.gpsEnabled) add("GPS provider off")
+            if (state.airplaneMode) add("airplane mode")
+            if (state.powerSaveMode) add("power save on")
+            if (!state.fusedAvailable) add("no fused provider")
+        }
+
+        return if (faults.isEmpty()) {
+            "Location ready: ${state.permission.name}/${state.accuracyAuthorization.name}"
+        } else {
+            "Location degraded: ${faults.joinToString(", ")}"
+        }
+    }
+
     private fun motionDraft(session: String, sensors: DeviceSensors): Draft {
         val activityRecognition = activityRecognitionGranted()
         return Draft(
@@ -364,7 +491,19 @@ internal class LogRecorder(
                 event.toDraft()?.let(::submit)
                 // Launched rather than awaited: resolving the session is a store read, and
                 // a collector that blocks on one delays every entry queued behind it.
-                if (event is TrackerEvent.EnabledChange && event.enabled) recordSessionMotion()
+                if (event is TrackerEvent.EnabledChange && event.enabled) {
+                    recordSessionMotion()
+                    recordSessionLocation()
+                }
+
+                // The other half, and the half that has no session behind it. A start
+                // refused at a gate emits one of these and returns — no session row, no
+                // EnabledChange, and until now nothing in the channel describing the
+                // device that refused. `force` because there is nothing to deduplicate
+                // against and every refusal is worth having.
+                if (event is TrackerEvent.Error && event.code in START_BLOCKING) {
+                    recordSessionLocation(force = true)
+                }
             }
         }
     }
@@ -742,6 +881,27 @@ internal class LogRecorder(
 
         /** The session's motion-hardware line, as `code` — what a dashboard filters on. */
         const val CODE_DEVICE_MOTION = "DEVICE_MOTION"
+        const val CODE_DEVICE_LOCATION = "DEVICE_LOCATION"
+
+        /**
+         * The errors that end a start attempt before a session exists.
+         *
+         * Each one gets a location snapshot filed against the device, because each one is a
+         * report that reads "it never starts tracking on this phone" and has, until now,
+         * arrived with nothing attached. `FGS_START_REFUSED` is in the list even though it
+         * happens *after* the session opens: on the OEMs where it fires, what the reader
+         * needs is the same permission-and-provider picture.
+         */
+        val START_BLOCKING = setOf(
+            ErrorCode.PERMISSION_DENIED,
+            ErrorCode.BACKGROUND_PERMISSION_MISSING,
+            ErrorCode.COARSE_ONLY,
+            ErrorCode.LOCATION_DISABLED,
+            ErrorCode.PLAY_SERVICES_UNAVAILABLE,
+            ErrorCode.FGS_START_REFUSED,
+            ErrorCode.DEVICE_INTEGRITY_BLOCKED,
+            ErrorCode.NOT_READY,
+        )
 
         /** Provider transitions, as `code` — what a dashboard filters a toggle by. */
         const val CODE_GPS_ON = "GPS_ON"

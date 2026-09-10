@@ -44,6 +44,10 @@ internal fun newLogRecorder(
     sessionId = { tracker.state.value.currentSessionId },
     events = events,
     sensors = { runCatching { tracker.getSensors() }.getOrNull() },
+    // Read live rather than cached. `ProviderStateMonitor` is refreshed at the top of every
+    // `start()`, so at the moment a start succeeds or is refused this holds what the device
+    // actually reported, which is the whole point of the entry it feeds.
+    providerState = { runCatching { tracker.state.value.providerState }.getOrNull() },
     // Read separately from the probe above, which folds this grant into its two step
     // fields: a `false` there could mean no sensor or no permission, and the remedies are
     // a different phone and a prompt.
