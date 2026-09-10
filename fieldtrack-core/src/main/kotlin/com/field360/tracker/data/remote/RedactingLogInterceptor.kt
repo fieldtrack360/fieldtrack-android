@@ -3,6 +3,7 @@ package com.field360.tracker.data.remote
 import com.field360.tracker.API_TAG
 import com.field360.tracker.sdkLog
 import com.field360.traker.geo.port.TrackLogger
+import okhttp3.Headers
 import okhttp3.Interceptor
 import okhttp3.Response
 import okio.Buffer
@@ -37,10 +38,16 @@ internal class RedactingLogInterceptor(
         sdkLog {
             val body = request.body
             val text = body?.let { runCatching { Buffer().also(it::writeTo).readUtf8() }.getOrNull() }
+            // Content-Type comes off the body rather than the header list. This is an
+            // application interceptor, so it runs before OkHttp derives that header from
+            // the body — reading `request.headers` alone would report a request that goes
+            // out with no content type, which is not what the server sees.
+            val contentType = body?.contentType()?.let { "\n    Content-Type: $it" } ?: ""
             logger.d(
                 API_TAG,
                 "--> ${request.method} ${request.url.encodedPath} " +
                     "(${body?.contentLength() ?: 0}-byte body)" +
+                    request.headers.describe() + contentType +
                     (text?.let { "\n    ${redact(it)}" } ?: ""),
             )
         }
@@ -57,6 +64,7 @@ internal class RedactingLogInterceptor(
                 // No duration here: ApiCall already reports one, and two slightly
                 // different numbers for the same call is worse than none.
                 "<-- ${response.code} ${response.message}" +
+                    response.headers.describe() +
                     (text?.takeIf { it.isNotEmpty() }?.let { "\n    ${redact(it)}" } ?: ""),
             )
         }
@@ -84,22 +92,70 @@ internal class RedactingLogInterceptor(
             runCatching {
                 text.replace(Regex("(\"$field\"\\s*:\\s*\")([^\"]*)(\")")) { match ->
                     val value = match.groupValues[2]
-                    val kept = value.take(PREVIEW_CHARS)
-                    match.groupValues[1] + kept + (if (value.length > kept.length) "…" else "") +
-                        match.groupValues[3]
+                    match.groupValues[1] + shorten(value) + match.groupValues[3]
                 }
             }.getOrDefault(text)
         }
 
-        return if (shortened.length <= MAX_BODY_CHARS) {
-            shortened
-        } else {
-            shortened.take(MAX_BODY_CHARS) + "… (${shortened.length} chars)"
-        }
+        return truncate(shortened)
     }
+
+    /**
+     * One indented `name: value` line per header, or nothing at all when there are none.
+     *
+     * Headers earn their place next to the body because the failures this log exists to
+     * catch are not all in the body. A proxy that answers `200` with `Content-Type:
+     * text/html` is a captive portal, not the licence server; a `Retry-After` explains a
+     * 429 that otherwise reads as an outage. Both are invisible in a body-only log.
+     *
+     * Names are never shortened — a header whose value is redacted still has to be
+     * identifiable, since "is the credential being sent at all" is the question a support
+     * log is usually asked. Values in [SENSITIVE_HEADERS] are cut to [PREVIEW_CHARS], on the
+     * same reasoning as `access_key` in the body: enough to tell two apart, useless to
+     * anyone reading over your shoulder.
+     */
+    private fun Headers.describe(): String =
+        if (size == 0) {
+            ""
+        } else {
+            truncate(
+                joinToString(separator = "") { (name, value) ->
+                    val shown = if (name.lowercase() in SENSITIVE_HEADERS) shorten(value) else value
+                    "\n    $name: $shown"
+                },
+            )
+        }
+
+    private fun shorten(value: String): String {
+        val kept = value.take(PREVIEW_CHARS)
+        return kept + if (value.length > kept.length) "…" else ""
+    }
+
+    private fun truncate(text: String): String =
+        if (text.length <= MAX_BODY_CHARS) text else text.take(MAX_BODY_CHARS) + "… (${text.length} chars)"
 
     private companion object {
         val SENSITIVE = listOf("access_key", "key_id", "signature")
+
+        /**
+         * Header names whose values are cut short. Lowercased for comparison because HTTP
+         * header names are case-insensitive and a server is free to send `Set-Cookie` or
+         * `set-cookie` — matching one spelling would leak on the other.
+         *
+         * The licence client sends none of these today. They are listed anyway: this
+         * interceptor is attached to an OkHttp client a host can hand its own interceptors
+         * to, and a redactor that only covers what is currently sent is one authenticator
+         * away from being wrong.
+         */
+        val SENSITIVE_HEADERS = setOf(
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+            "x-api-key",
+            "x-access-key",
+            "x-auth-token",
+        )
 
         const val PREVIEW_CHARS = 12
         const val MAX_BODY_CHARS = 1_000

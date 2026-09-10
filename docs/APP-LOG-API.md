@@ -346,7 +346,7 @@ on its own id.
 | Saved under the wrong device | `device_id` here ≠ `extraParams["device_id"]` on the points channel. | Make them the same string. |
 | An entry the device never sent | A `lifecycle` row, `code: DEVICE_INFO`, `seq: -1`. | Not a bug and not a duplicate: the server's hardware line (§3). One per session, uncounted. |
 | Gaps on a track the fixes cannot explain | The phone cannot detect a stop. | Read the session's `DEVICE_MOTION` row (§6): `POOR` forced `CONTINUOUS`, `DEGRADED` doubled the stop timeout. |
-| No `DEVICE_MOTION` row on a session | `configureLogs()` was never called during it, or `lifecycle` is not in the device's `types`. | It is written at session start and again when the channel is turned on mid-session. |
+| No `DEVICE_MOTION` row on a session | The channel was off during it — `syncLogs = false`, or it could not be derived from the points config — or `lifecycle` is not in the device's `types`. | It is written at session start and again when the channel is turned on mid-session. |
 | No hardware line on a session | The envelope carried neither `app` nor `device`, or no log batch has named that session yet. | Send both blocks. A session built from points alone has no hardware to report — the metadata only ever arrives on this endpoint. |
 
 ### The audit table

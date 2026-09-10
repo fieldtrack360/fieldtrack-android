@@ -10,42 +10,48 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
 }
 
-val localProperties: Properties = Properties().apply {
-    val file = rootProject.file("local.properties")
+val configurationProperties: Properties = Properties().apply {
+    val file = rootProject.file("configuration.properties")
     if (file.exists()) file.inputStream().use { load(it) }
 }
 
 /**
- * Gradle property, then environment variable, then `local.properties`. The first two exist
- * because CI and JitPack have no `local.properties`; without them a release built there
- * ships with the licence layer inert and **nothing in the build output says so**.
+ * Gradle property, then environment variable, then `configuration.properties`.
+ *
+ * `local.properties` is deliberately **not** consulted. Both values below are product
+ * configuration — one URL and one public key the whole team and every CI runner build
+ * against — and a per-machine override is how one laptop ships a build pointed somewhere
+ * nobody tested. The first two steps exist because CI and JitPack check out the repository
+ * and nothing else; a value passed there beats the committed file for that one run.
+ *
+ * Blank counts as absent at every step, so an empty key does not shadow the file below it.
  */
-fun secret(gradleProperty: String, key: String): String =
-    providers.gradleProperty(gradleProperty).orNull
-        ?: providers.environmentVariable(key).orNull
-        ?: localProperties.getProperty(key, "")
+fun shared(gradleProperty: String, key: String): String =
+    providers.gradleProperty(gradleProperty).orNull?.takeIf { it.isNotBlank() }
+        ?: providers.environmentVariable(key).orNull?.takeIf { it.isNotBlank() }
+        ?: configurationProperties.getProperty(key, "")
 
 /**
  * The licence API root, e.g. `https://licence.example.com/api/v1`.
  *
- * **This keeps the URL out of version control, not out of the artifact.** It is compiled
- * into BuildConfig and is readable in any published AAR or installed APK, exactly like the
- * two public keys below it. That is fine — an endpoint the device has to reach is not a
- * secret, and nothing here should ever be a credential.
+ * Committed in `configuration.properties`, which costs nothing: it is compiled into
+ * BuildConfig and readable in any published AAR or installed APK either way. An endpoint
+ * the device has to reach is not a secret, and nothing here should ever be a credential.
  *
- * Blank is a supported state and the default: `LicenseConfig.baseUrl` falls back to the
- * host manifest, and with neither set the revocation check makes no request at all.
+ * Blank is a supported state: `LicenseConfig.baseUrl` falls back to the host manifest, and
+ * with neither set the revocation check makes no request at all.
  */
-val licenseBaseUrl: String = secret("fieldtrackLicenseUrl", "FIELDTRACK_LICENSE_URL")
+val licenseBaseUrl: String = shared("fieldtrackLicenseUrl", "FIELDTRACK_LICENSE_URL")
 
 /**
  * The key that verifies `/verify` **responses**, standard base64 of 32 raw bytes.
  *
- * A different key from the one above, deliberately: one authenticates what we issued, the
- * other authenticates what the server says about it today. Blank leaves the online check
- * inert — no request is made and no response is ever trusted.
+ * A *public* verification key, which is why it is committed: it authenticates what the
+ * server says about a licence today, while the private half that signs those responses
+ * never leaves the server. Blank leaves the online check inert — no request is made and no
+ * response is ever trusted.
  */
-val licenseResponseKey: String = secret("fieldtrackResponseKey", "FIELDTRACK_RESPONSE_KEY")
+val licenseResponseKey: String = shared("fieldtrackResponseKey", "FIELDTRACK_RESPONSE_KEY")
 
 
 android {

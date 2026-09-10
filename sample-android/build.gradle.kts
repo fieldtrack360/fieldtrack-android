@@ -9,10 +9,30 @@ plugins {
     alias(libs.plugins.compose.compiler)
 }
 
-val localProperties: Properties = Properties().apply {
-    val file = rootProject.file("local.properties")
+fun properties(name: String): Properties = Properties().apply {
+    val file = rootProject.file(name)
     if (file.exists()) file.inputStream().use { load(it) }
 }
+
+/** Gitignored, per-machine. The only source for the two credentials below. */
+val localProperties: Properties = properties("local.properties")
+
+/** Committed, shared. Never holds a credential — see the header of that file. */
+val configurationProperties: Properties = properties("configuration.properties")
+
+/**
+ * Per-developer configuration: `local.properties` wins, this file is the shared fallback.
+ *
+ * Blank counts as absent, so overriding one key does not mean restating the rest — a
+ * developer who sets only `SYNC_URL` still gets the committed `OSRM_BASE_URL`.
+ *
+ * Used **only** for values that are not credentials. The Maps key and the licence token
+ * read `local.properties` directly, with no fallback, so that no path exists by which a
+ * value typed into the committed file reaches the build.
+ */
+fun config(key: String): String =
+    localProperties.getProperty(key)?.takeIf { it.isNotBlank() }
+        ?: configurationProperties.getProperty(key, "")
 
 /**
  * Maps key, from `local.properties` (gitignored) — e.g. `MAPS_API_KEY=AIza…`.
@@ -28,8 +48,8 @@ val localProperties: Properties = Properties().apply {
 val mapsApiKey: String = localProperties.getProperty("MAPS_API_KEY", "")
 
 /**
- * OSRM base URL for road snapping, from `local.properties` — e.g.
- * `OSRM_BASE_URL=https://osrm.internal.example.com`.
+ * OSRM base URL for road snapping — `local.properties` first, else the committed
+ * `configuration.properties`. E.g. `OSRM_BASE_URL=https://osrm.internal.example.com`.
  *
  * Blank by default and blank is a working configuration: the sample installs no
  * `RoadSnapProvider`, `buildTrack` never leaves the device, and the track renders from
@@ -40,11 +60,11 @@ val mapsApiKey: String = localProperties.getProperty("MAPS_API_KEY", "")
  * a default would put every host's traffic on somebody else's free instance without
  * anyone choosing to. This is host configuration, not an SDK constant.
  */
-val osrmBaseUrl: String = localProperties.getProperty("OSRM_BASE_URL", "")
+val osrmBaseUrl: String = config("OSRM_BASE_URL")
 
 /**
- * Upload endpoint for `TrackerSync`, from `local.properties` — e.g.
- * `SYNC_URL=https://api.example.com/locations`.
+ * Upload endpoint for `TrackerSync` — `local.properties` first, else the committed
+ * `configuration.properties`. E.g. `SYNC_URL=https://api.example.com/locations`.
  *
  * The **full** endpoint, not a base: `SyncConfig.url` is what the batch is POSTed to.
  *
@@ -53,12 +73,12 @@ val osrmBaseUrl: String = localProperties.getProperty("OSRM_BASE_URL", "")
  * offline-first default the SDK is built around, so it has to keep working with this
  * unset.
  *
- * In `local.properties` rather than committed here for the same reason the Maps key is:
- * an upload endpoint is per-developer, and a dev tunnel URL in particular is ephemeral
- * and personal. Unlike the Maps key it is not a credential — but a committed default that
- * points at somebody's laptop is a default that silently 404s for everyone else.
+ * Not a credential, unlike the Maps key — which is why a committed fallback is allowed at
+ * all. It is still per-developer: a dev tunnel URL is ephemeral and points at one laptop,
+ * so the committed value silently 404s for everyone else. Override it in
+ * `local.properties` rather than editing the shared file.
  */
-val syncUrl: String = localProperties.getProperty("SYNC_URL", "")
+val syncUrl: String = config("SYNC_URL")
 
 /**
  * Optional Tracker release license token, from `local.properties` — e.g.

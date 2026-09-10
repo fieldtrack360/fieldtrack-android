@@ -19,9 +19,26 @@ come from `gradle/libs.versions.toml`.
 | Kotlin | 2.4.10 | `kotlin` in the catalog. |
 | Android SDK | compileSdk 37 | `local.properties` → `sdk.dir`, or `ANDROID_HOME`. |
 
-`local.properties` is gitignored. It holds `sdk.dir` and, optionally, `MAPS_API_KEY` and
-`FIELDTRACK_LICENSE_URL`. Copy
-[`local.properties.template`](../local.properties.template) and fill in what you need.
+Build configuration is split across two files at the repository root, and which one a key
+lives in is a decision about secrecy, not convenience:
+
+| File | Committed? | Holds |
+|---|---|---|
+| [`configuration.properties`](../configuration.properties) | **yes** | `FIELDTRACK_LICENSE_URL`, `FIELDTRACK_RESPONSE_KEY`, and the shared defaults for `SYNC_URL` and `OSRM_BASE_URL`. Never a credential. |
+| `local.properties` | no, gitignored | `sdk.dir`, `MAPS_API_KEY`, `TRACKER_LICENSE`, and per-machine overrides of `SYNC_URL` / `OSRM_BASE_URL`. |
+
+A fresh clone therefore builds against the right licence endpoint with no setup — only the
+two credentials need filling in. Copy
+[`local.properties.template`](../local.properties.template) for those.
+
+The two lookups differ, on purpose:
+
+- **Product configuration** (`FIELDTRACK_LICENSE_URL`, `FIELDTRACK_RESPONSE_KEY`):
+  `-P…` → environment → `configuration.properties`. `local.properties` is **not** consulted.
+- **Per-developer** (`SYNC_URL`, `OSRM_BASE_URL`): `local.properties` → `configuration.properties`,
+  where blank counts as absent, so overriding one key does not mean restating the rest.
+- **Credentials** (`MAPS_API_KEY`, `TRACKER_LICENSE`): `local.properties` only, no fallback.
+  A value typed into the committed file is ignored rather than silently used — see §1.1.
 
 ### Maps API key
 
@@ -56,33 +73,41 @@ part that makes a leak expensive rather than merely embarrassing.
 `BuildConfig.LICENSE_BASE_URL`, which `LicenseConfig.defaultBaseUrl` returns:
 
 ```properties
-# local.properties
+# configuration.properties — committed, at the repository root
 FIELDTRACK_LICENSE_URL=https://licence.example.com/api/v1
+FIELDTRACK_RESPONSE_KEY=Base64OfThirtyTwoRawBytes=
 ```
 
 Include the version segment. `RetrofitLicenseApi` appends `/verify` and nothing else,
 so moving to `/api/v2` is a configuration change rather than an SDK release.
 
-Resolution order, first non-null wins:
+Resolution order, first non-blank wins:
 
 | Source | For |
 |---|---|
-| `-PfieldtrackLicenseUrl=...` | CI, JitPack, one-off builds |
+| `-PfieldtrackLicenseUrl=...` | one-off builds, a CI job pointed at staging |
 | `FIELDTRACK_LICENSE_URL` environment variable | CI secrets |
-| `FIELDTRACK_LICENSE_URL` in `local.properties` | local development |
+| `FIELDTRACK_LICENSE_URL` in `configuration.properties` | everything else — this is the normal source |
 | `FieldTrackLicenseUrl` manifest meta-data | per-install override, takes precedence over all of the above at runtime |
+
+**`local.properties` is not in that list, deliberately.** These two values are *product
+configuration*: one endpoint and one public verification key that the whole team and every
+CI runner build against. A per-machine override is how one laptop ships a build aimed at a
+server nobody else tested, so the build does not look there for them at all — a line for
+either in `local.properties` does nothing.
 
 Unset is a supported state and the default. With no URL the transport makes no request,
 the check returns `CarryOn`, and every start proceeds.
 
-**`local.properties` keeps the URL out of version control, not out of the artifact.** It is
-compiled into `BuildConfig` and readable in any published AAR or installed APK, the same as
-the two compiled-in public keys. That is the correct trade for an endpoint the device has to
-reach — but it means this mechanism is not a place for a credential of any kind.
+**Committing them gives nothing away.** Both are compiled into `BuildConfig` and readable in
+any published AAR or installed APK whichever file they are typed into. An endpoint the
+device has to reach cannot be hidden from the device, and the response key is the *public*
+half of a signing pair — the private half never leaves the server. Neither is a credential,
+and this mechanism is not a place for one: `MAPS_API_KEY` and `TRACKER_LICENSE` stay in
+gitignored `local.properties`, with no fallback to the committed file.
 
-The Gradle property and environment variable are not conveniences. **CI and JitPack have no
-`local.properties`, so a release built without one of them ships with the revocation check
-inert and nothing in the build output says so** — it looks exactly like a successful build.
+The Gradle property and environment variable remain useful for pointing one build somewhere
+else for one run, without editing a file everyone else pulls.
 
 ---
 
@@ -576,8 +601,8 @@ Room's runtime validation checks them against.
 
 ### The sample installs a `RoadSnapProvider` only if you give it a URL
 
-Set `OSRM_BASE_URL` in `local.properties` (gitignored, same mechanism as `MAPS_API_KEY`)
-and `SampleApplication` installs `OsrmSnapProvider`. Leave it unset — the default — and it
+Set `OSRM_BASE_URL` in `local.properties` — or in the committed `configuration.properties`,
+which it falls back to — and `SampleApplication` installs `OsrmSnapProvider`. Leave it unset — the default — and it
 installs nothing: `buildTrack` never leaves the device, no `snap_unavailable` warning is
 emitted, and the track is drawn from the fixes that were captured.
 
@@ -647,7 +672,7 @@ Reproduce the whole CI run locally:
 |---|---|
 | `The 'org.jetbrains.kotlin.android' plugin is no longer required...` | Remove that alias from the module's `plugins` block. See §7. |
 | `SDK location not found` | Add `sdk.dir` to `local.properties` or set `ANDROID_HOME`. |
-| Map is blank / "no key" message in the sample | `MAPS_API_KEY` missing from `local.properties`. Supported state, not a crash. |
+| Map is blank / "no key" message in the sample | `MAPS_API_KEY` missing from `local.properties`. There is no fallback to `configuration.properties` for it. Supported state, not a crash. |
 | Build fails on a deprecation warning | `allWarningsAsErrors` is on by design. Fix the call site. |
 | Lint fails on a new warning | `lint.warningsAsErrors` is on by design. Fix it or annotate the specific site. |
 | Configuration cache errors after editing a build file | You read mutable state at execution time. Capture it at configuration time instead. See §6. |

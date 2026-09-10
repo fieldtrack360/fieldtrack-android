@@ -2100,9 +2100,11 @@ which writes another one.
 
 ## 15. Log module — diagnostics to your backend
 
-**Optional, off by default, and in the same artifact as [§14](#14-sync-module--upload-to-your-backend).**
-Nothing below happens until you call `configureLogs()`, and an app that never calls it pays
-no network, no database file and no battery.
+**On by default whenever [§14](#14-sync-module--upload-to-your-backend) is configured, and
+in the same artifact.** `configure()` derives this channel from the points config it was
+just given, so a host that set up uploads gets diagnostics without a second setup call. Set
+`SyncConfig.syncLogs = false` and nothing below happens at all — no network, no database
+file, no battery. A host that never calls `configure()` never had a channel to begin with.
 
 Points answer *where the device was*. They cannot answer *why there is nothing there*. A
 track with a twenty-minute hole in it is unreadable on its own — and every plausible cause
@@ -2120,9 +2122,10 @@ This channel makes those durable. `tracker.events` ([§7.1](#71-trackerevent--th
 is a live notification that exists only while something is collecting it; the case you most
 need explained — a process an OEM killed mid-drive — is exactly the case where nobody was.
 
-### 15.1 Turning it on
+### 15.1 It is already on
 
-Two lines. `configureLogs()` **follows the points endpoint** you already configured:
+One line — the one you wrote for points. `configure()` **derives the log channel from the
+points endpoint**:
 
 ```kotlin
 val sync = TrackerSync.getInstance(context)
@@ -2135,19 +2138,42 @@ sync.configure(
         .extraParam("device_id", installId)
         .build()
 )
-
-sync.configureLogs()          // -> <same origin>/v1/logs/batch
+// Diagnostics are now shipping to <same origin>/v1/logs/batch. No second call.
 ```
 
-Called with no argument it derives the URL from the origin of the `SyncConfig` in force plus
-`v1/logs/batch`, inherits `device_id` from `SyncConfig.extraParams`, and reuses the points
-headers.
+The derived config takes the URL from the origin of the `SyncConfig` plus `v1/logs/batch`,
+inherits `device_id` from `SyncConfig.extraParams`, and reuses the points headers.
+
+**Why on rather than off.** These logs exist to explain the report that arrives as
+"tracking stopped on one phone yesterday" — and by the time it arrives, the window to have
+been collecting has closed. A channel switched on afterwards collects nothing about the
+incident that made someone want it.
+
+**It never fails your `configure()` call.** If the endpoint cannot be derived — no
+`device_id` in `extraParams`, an unparseable URL — the SDK logs why under `Tracker/TrackerSync`
+and carries on with points working normally:
+
+```
+No diagnostic log channel: deviceId must not be blank …. Points are unaffected; call
+configureLogs() to set one up.
+```
+
+Turn it off with one builder call, and nothing is derived at all:
+
+```kotlin
+SyncConfig.builder()
+    .url("https://api.example.com/v1/location/batch")
+    .syncLogs(false)
+    .build()
+```
 
 > **`device_id` must be the same string on both channels.** That join — a hole in a track,
 > next to the reason for it — is the whole point. Two spellings of the same phone produce
 > two unrelated datasets. Inheriting it is the default for that reason.
 
-Override any of it with a `LogSyncConfig`:
+Point it somewhere else — or change the level, interval or credential — with an explicit
+`configureLogs()`. **An explicit call always wins**, and keeps winning: once made, later
+`configure()` calls leave your choice alone rather than re-deriving over it.
 
 ```kotlin
 sync.configureLogs(
@@ -2166,8 +2192,10 @@ A 401 here only stops log shipping. Keeping the scopes apart is what stops a dia
 mistake reaching the point queue.
 
 `configureLogs()` is idempotent and safe to call on every launch — call it right after
-`configure()`, in `Application.onCreate`. It throws `IllegalArgumentException` if the
-resolved config does not validate, so wrap it the same way you wrap `configure()`.
+`configure()`, in `Application.onCreate`. Unlike the derived default it **does** throw
+`IllegalArgumentException` if the resolved config does not validate, so wrap it the same way
+you wrap `configure()`: you asked for this endpoint by name, so a broken one is an error
+rather than a line in a log.
 
 **The two channels are independent in both directions.** Either can be set without the
 other, neither can tear the other down, and no log failure can reach `Tracker.stop()`, the
@@ -3019,7 +3047,8 @@ kilobytes per device per shift.
 turn it off again — a `DEBUG` flag set during a ticket and never cleared is how one device
 ends up shipping 29 000 rows a day for a year.
 
-If you never want the channel at all, do nothing: it is off until `configureLogs()`.
+If you never want the channel at all, build your `SyncConfig` with `.syncLogs(false)` — or
+call `disableLogSync()` after the fact. Doing nothing now means the channel is on.
 
 ---
 
@@ -3445,10 +3474,10 @@ fire and the runtime waiver already applies.
 | Background uploads stopped after adding a custom `SyncTransport` | A worker process runs `Application.onCreate` and nothing else, so your transport is only installed if you install it there | Configure sync, and supply your transport, from `Application.onCreate` so every process has both ([§14.6](#146-custom-transport)) |
 | `NetworkAvailable` arrives but nothing uploads | The drain ran and failed — the event says a drain was *requested*, not that it succeeded | Read the `HttpResponse` that follows for the reason; a `null` `statusCode` means the request never completed |
 | Backlog uploads in a scrambled order | Fixed — the queue is FIFO by insertion, including across a reboot | Update the SDK; older builds ordered on a monotonic clock that restarts at boot |
-| Nothing ever reaches the log endpoint | `configureLogs()` was never called — points and diagnostics are separate channels | Call it after `configure()` ([§15.1](#151-turning-it-on)) |
+| Nothing ever reaches the log endpoint | `syncLogs = false`, or the channel could not be derived — most often no `device_id` in `SyncConfig.extraParams` | Look for `No diagnostic log channel: …` under `Tracker/TrackerSync` at `configure()` time; it names what is missing. Or call `configureLogs()` explicitly ([§15.1](#151-it-is-already-on)) |
 | Log entries arrive up to 15 minutes late | Working as designed: the channel is a quarter-hourly heartbeat, and only `nudgeLevel` and above drain promptly | Nothing, or lower `nudgeLevel` to `INFO` — a battery cost, not a free one ([§15.3](#153-logsyncconfig)) |
 | Log shipping stopped on its own, entries still buffered | The endpoint refused the channel: 401/403 on the credential, or 404/405/501 meaning there is no endpoint there | Fix the route or the token; the next `configureLogs()` retries with the buffer intact ([§15.8](#158-results-and-failure-semantics)) |
-| Logs saved under a device your points are not under | `LogSyncConfig.deviceId` differs from `SyncConfig.extraParams["device_id"]` | Leave `deviceId` blank so it inherits. The join between the two channels is that string ([§15.1](#151-turning-it-on)) |
+| Logs saved under a device your points are not under | `LogSyncConfig.deviceId` differs from `SyncConfig.extraParams["device_id"]` | Leave `deviceId` blank so it inherits. The join between the two channels is that string ([§15.1](#151-it-is-already-on)) |
 | `seq` has gaps | The device buffer is bounded and evicted its oldest entries | Expected, and reported rather than hidden. Raise `bufferCapacity` or shorten `uploadIntervalMinutes` ([§15.7](#157-logrecord-and-its-enums)) |
 | A `data` payload is missing from an entry that is otherwise there | It was not a JSON object or array, so it was dropped rather than sent | Pass valid JSON text to `log()`; the entry itself is always kept ([§15.6](#156-writing-your-own-lines)) |
 | Log volume far higher than expected | `LogType.DECISION` is enabled — roughly 29 000 entries per device per shift | Remove it from `types`, or keep it on one named device while a ticket is open ([§15.12](#1512-what-it-costs-and-what-to-leave-off)) |

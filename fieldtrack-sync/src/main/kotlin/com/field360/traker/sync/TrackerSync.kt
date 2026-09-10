@@ -90,6 +90,30 @@ public data class SyncConfig(
      * session was current at the last `configure()`.
      */
     val includePointSessionId: Boolean = false,
+    /**
+     * Ship the SDK's own diagnostic logs to the same backend, without a second setup call.
+     *
+     * **On by default.** [TrackerSync.configure] derives a [LogSyncConfig] from this one —
+     * the origin of [url] plus [LogSyncConfig.DEFAULT_PATH], the `device_id` out of
+     * [extraParams], and these [headers] — and configures the log channel with it. A host
+     * that has set up points has already made every decision the log channel needs, so
+     * asking it to repeat them is asking it to get one of them subtly wrong.
+     *
+     * The default is on rather than off because of what the logs are *for*. They exist to
+     * explain the reports that arrive as "tracking stopped working on one phone yesterday",
+     * and by the time that report arrives the window to have been collecting has closed. A
+     * channel that has to be switched on after the fact collects nothing about the incident
+     * that made someone want it.
+     *
+     * **Nothing here is fatal.** If the endpoint cannot be derived — no `device_id`, an
+     * unparseable [url] — `configure()` logs why and carries on with points working
+     * normally. Deriving a log channel is never a reason to fail a points config.
+     *
+     * An explicit [TrackerSync.configureLogs] call wins, whenever it is made: call it after
+     * `configure()` to point logs somewhere else, and this default steps aside rather than
+     * overwriting it on the next `configure()`. Set this to `false` to send no logs at all.
+     */
+    val syncLogs: Boolean = true,
 ) {
 
     /**
@@ -248,6 +272,7 @@ public data class SyncConfig(
         private var timeouts: SyncTimeouts = SyncTimeouts()
         private val extraParams = LinkedHashMap<String, Any>()
         private var includePointSessionId: Boolean = false
+        private var syncLogs: Boolean = true
 
         /** The whole endpoint. Overrides [baseUrl] and [path] when both are set. */
         public fun url(url: String): Builder = apply { this.url = url }
@@ -306,6 +331,13 @@ public data class SyncConfig(
             apply { includePointSessionId = include }
 
         /**
+         * Ship diagnostic logs to the same backend — see [SyncConfig.syncLogs]. On unless
+         * this is called with `false`.
+         */
+        public fun syncLogs(enabled: Boolean): Builder =
+            apply { syncLogs = enabled }
+
+        /**
          * @throws IllegalArgumentException if [SyncConfig.validate] reports anything.
          *
          * A **path with no base URL is allowed here**, and only here: it means the base is
@@ -338,6 +370,7 @@ public data class SyncConfig(
             timeouts = timeouts,
             extraParams = extraParams.toMap(),
             includePointSessionId = includePointSessionId,
+            syncLogs = syncLogs,
         )
 
         private fun join(base: String?, path: String?): String {
@@ -413,6 +446,18 @@ public class TrackerSync internal constructor(
 
     @Volatile
     private var logTransport: SyncTransport? = null
+
+    /**
+     * Whether [logConfig] was derived by [configure] rather than written by the host.
+     *
+     * This is what keeps the default from fighting the host. [configureLogs] clears it, and
+     * [configure] only overwrites a config this flag still claims — so a host that pointed
+     * logs at a second backend keeps that choice across every later `configure()`, while a
+     * host that never called `configureLogs` keeps getting a channel that follows its
+     * points endpoint when that endpoint moves.
+     */
+    @Volatile
+    private var logsAutoConfigured: Boolean = false
 
     /**
      * The status code that stopped log shipping, or `null`.
@@ -511,6 +556,47 @@ public class TrackerSync internal constructor(
             // one check still has to happen — so make it by hand.
             if (!networkMonitor.start(resolved.requiresUnmeteredNetwork)) {
                 networkMonitor.drainIfQueued()
+            }
+        }
+
+        applyDefaultLogSync(resolved)
+    }
+
+    /**
+     * Turns on the diagnostic channel that [SyncConfig.syncLogs] asks for.
+     *
+     * **Never throws and never fails the caller.** `configure()` has already accepted a
+     * valid points config by the time this runs, and a points endpoint that works must keep
+     * working whether or not a log endpoint can be derived from it — the host asked for
+     * points; logs are this SDK's idea.
+     *
+     * The decision itself is [defaultLogSyncFor], which needs no `Context` and no
+     * `WorkManager` and is tested on its own.
+     */
+    private fun applyDefaultLogSync(points: SyncConfig) {
+        // An explicit configureLogs() outranks this, permanently. Only a config this class
+        // derived itself is replaced when the points endpoint moves.
+        if (logConfig != null && !logsAutoConfigured) return
+
+        when (val setup = defaultLogSyncFor(points, artifacts.baseUrl)) {
+            is DefaultLogSync.Disabled -> Unit
+
+            is DefaultLogSync.Ready -> {
+                configureLogs(setup.config)
+                // configureLogs() clears the flag, as an explicit call should. Re-set it
+                // after the fact: this call was ours, not the host's.
+                logsAutoConfigured = true
+                sdkLog {
+                    logger.d(TAG, "Diagnostics follow the points endpoint: ${setup.config.url}")
+                }
+            }
+
+            is DefaultLogSync.Undeliverable -> sdkLog {
+                logger.d(
+                    TAG,
+                    "No diagnostic log channel: ${setup.errors.joinToString("; ")}. " +
+                        "Points are unaffected; call configureLogs() to set one up.",
+                )
             }
         }
     }
@@ -613,6 +699,9 @@ public class TrackerSync internal constructor(
         logConfig = resolved
         logTransport = transport ?: this.transport ?: defaultTransport()
         logsRejectedWith = null
+        // The host has now stated where its logs go, so the SyncConfig.syncLogs default
+        // stops deriving one — including on every later configure().
+        logsAutoConfigured = false
         // The prompt half of this channel: a WARN or worse asks for a drain rather than
         // waiting out the heartbeat. Throttled inside the recorder.
         logRecorder.configure(resolved) { requestLogSync() }
@@ -640,6 +729,7 @@ public class TrackerSync internal constructor(
      */
     public fun disableLogSync() {
         logConfig = null
+        logsAutoConfigured = false
         logTransport = null
         logRecorder.stop()
         LogSyncWorker.cancel(context)
@@ -1253,5 +1343,54 @@ internal class LogSyncWorker(
 
         private const val BACKOFF_SECONDS = 60L
         private const val MIN_INTERVAL_MINUTES = LogSyncConfig.MIN_INTERVAL_MINUTES
+    }
+}
+
+/**
+ * What [SyncConfig.syncLogs] resolves to for a given points config.
+ *
+ * A value rather than a side effect so the decision is testable without a `Context`, a
+ * `WorkManager`, or a database — see `DefaultLogSyncTest`. [Undeliverable] exists as its own
+ * case, distinct from [Disabled], because the two mean opposite things to a host reading a
+ * log: one is a choice it made, the other is a channel it probably wanted and did not get.
+ */
+internal sealed interface DefaultLogSync {
+
+    /** `syncLogs = false`. Nothing is derived and nothing is logged about it. */
+    object Disabled : DefaultLogSync
+
+    /** A config that passes [LogSyncConfig.validate] and can be applied as-is. */
+    data class Ready(val config: LogSyncConfig) : DefaultLogSync
+
+    /**
+     * Wanted, but not derivable from what the points config carries — most often no
+     * `device_id`, which the log envelope requires and the points envelope does not.
+     *
+     * Carries [errors] rather than a boolean because the host has to be told what to add;
+     * "logs are off" with no reason is a message that gets ignored.
+     */
+    data class Undeliverable(val errors: List<String>) : DefaultLogSync
+}
+
+/**
+ * The default log channel for a points config, or why there is not one.
+ *
+ * Pure: same inputs, same answer, no Android in sight. [TrackerSync.configure] applies the
+ * result; everything worth arguing about happens here.
+ */
+internal fun defaultLogSyncFor(points: SyncConfig, baseUrl: String?): DefaultLogSync {
+    if (!points.syncLogs) return DefaultLogSync.Disabled
+
+    // An empty LogSyncConfig is the whole point: resolvedAgainst fills the url from the
+    // points origin, the device id from its extraParams, and the credential from its
+    // headers. Anything this class chose instead would be a second set of decisions for a
+    // host that already made them once.
+    val resolved = LogSyncConfig().resolvedAgainst(points, baseUrl)
+    val errors = resolved.validate()
+
+    return if (errors.isEmpty()) {
+        DefaultLogSync.Ready(resolved)
+    } else {
+        DefaultLogSync.Undeliverable(errors)
     }
 }

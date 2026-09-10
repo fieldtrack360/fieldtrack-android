@@ -25,17 +25,19 @@ internal object LicenseConfig {
      *
      * Not hardcoded. It comes from `BuildConfig.LICENSE_BASE_URL`, which the module's
      * build file resolves from the Gradle property `fieldtrackLicenseUrl`, the
-     * environment variable `FIELDTRACK_LICENSE_URL`, or `local.properties` — the last of
-     * which is gitignored, which is the whole point of the indirection:
+     * environment variable `FIELDTRACK_LICENSE_URL`, or the committed
+     * `configuration.properties` at the repository root:
      *
      * ```properties
      * FIELDTRACK_LICENSE_URL=https://licence.example.com/api/v1
      * ```
      *
-     * Keeping it out of the repository is not the same as keeping it secret. The value
-     * is compiled into the artifact and is readable in any published AAR or installed
-     * APK. An endpoint the device has to reach cannot be hidden from the device, and
-     * nothing here should ever carry a credential.
+     * **Committed rather than gitignored, and `local.properties` is not consulted for it.**
+     * One endpoint the whole team and every CI runner build against is the point: a
+     * per-machine override is how one laptop ships a build aimed somewhere nobody tested.
+     * Nothing is given away by committing it — the value is compiled into the artifact and
+     * readable in any published AAR or installed APK, an endpoint the device has to reach
+     * cannot be hidden from the device, and nothing here should ever carry a credential.
      *
      * Overridable per install from the host manifest, which takes precedence, for
      * pointing a build at a local server without rebuilding the SDK:
@@ -55,7 +57,7 @@ internal object LicenseConfig {
      *
      * Not hardcoded, and not fetched. It comes from `BuildConfig.LICENSE_RESPONSE_KEY`,
      * which the build file resolves from `-PfieldtrackResponseKey`, the environment
-     * variable `FIELDTRACK_RESPONSE_KEY`, or `local.properties`:
+     * variable `FIELDTRACK_RESPONSE_KEY`, or the committed `configuration.properties`:
      *
      * ```properties
      * FIELDTRACK_RESPONSE_KEY=Base64OfThirtyTwoRawBytes=
@@ -66,9 +68,10 @@ internal object LicenseConfig {
      *
      * **Build-time, never runtime.** Fetching it from the same server whose answers it
      * authenticates would be circular, and a device owner with a proxy would simply serve
-     * their own. `local.properties` keeps it out of the repository; the value still ships
-     * inside the artifact, which is correct — a public key is not a secret, and the whole
-     * point of compiling it in is that nobody can substitute it.
+     * their own. It is committed for the same reason it is compiled in: this is the public
+     * half, the private half that signs those responses never leaves the server, and a
+     * public key nobody can substitute is the entire mechanism. Hiding it would buy
+     * nothing — it ships inside every published AAR and installed APK regardless.
      */
     val responsePublicKeyBase64: String get() = BuildConfig.LICENSE_RESPONSE_KEY
 
