@@ -6,6 +6,7 @@ import com.field360.tracker.domain.model.PermissionTier
 import com.field360.tracker.domain.model.ProviderState
 import com.field360.tracker.domain.model.TrackerEvent
 import com.field360.tracker.sdkLog
+import com.field360.tracker.sdkWarn
 import com.field360.traker.geo.port.TrackLogger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -102,7 +103,7 @@ internal class CaptureGate(
 
         if (!now) {
             val (code, message) = reasonFor(state)
-            sdkLog { logger.w(TAG, "Suspending capture: $message") }
+            sdkWarn { logger.w(TAG, "Suspending capture: $message") }
             captureSwitch.suspendCapture()
             events.tryEmit(TrackerEvent.CaptureSuspended(code, message))
             events.tryEmit(TrackerEvent.Error(code, message))

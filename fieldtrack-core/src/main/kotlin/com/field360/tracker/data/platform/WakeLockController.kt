@@ -5,6 +5,7 @@ import android.os.PowerManager
 import com.field360.tracker.ServiceConfig
 import com.field360.tracker.WakeLockPolicy
 import com.field360.tracker.sdkLog
+import com.field360.tracker.sdkWarn
 import com.field360.traker.geo.port.TrackLogger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -140,7 +141,7 @@ internal class WakeLockController(
                 .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
                 .apply { setReferenceCounted(false) }
         }.onFailure {
-            sdkLog { logger.w(TAG, "PowerManager refused a wake lock: ${it.message}") }
+            sdkWarn { logger.w(TAG, "PowerManager refused a wake lock: ${it.message}") }
         }.getOrNull()?.also { lock = it } ?: return
 
         runCatching { held.acquire(timeoutMs) }

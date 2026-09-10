@@ -66,6 +66,10 @@ abstract class VerifyReleaseObfuscationTask : DefaultTask() {
                     "com/field360/tracker/RawFix.class",
                     "com/field360/tracker/Tracker.class",
                     "com/field360/tracker/TrackerConfig.class",
+                    // A public type reachable from TrackerConfig. Listed here as well as in
+                    // proguard-rules.pro so that stripping it fails this task rather than a
+                    // host's own R8 run, which is where it surfaced the first time.
+                    "com/field360/tracker/WakeLockPolicy.class",
                     "com/field360/tracker/domain/model/ErrorCode.class",
                     "com/field360/tracker/domain/model/LocationAccuracy.class",
                     "com/field360/tracker/domain/model/PermissionTier.class",
@@ -137,15 +141,34 @@ abstract class VerifyReleaseObfuscationTask : DefaultTask() {
             ),
         )
 
+        // A sample of the SDK's own **commentary** that must not reach a published artifact.
+        //
+        // These strings narrate what the SDK does internally — the cadence it chose, the
+        // session it stopped — and R8 renames the classes around them but never the string
+        // constants themselves. Anything still here is readable in any AAR a customer holds.
+        //
+        // Every entry is written through `sdkLog`, which the release variant compiles out
+        // entirely (`SDK_LOGGING_ENABLED = false`), so R8 removes the constant along with
+        // the dead branch that held it.
+        //
+        // WARNINGS ARE DELIBERATELY ABSENT FROM THIS LIST — it used to carry three of them.
+        // They go through `sdkWarn`, which stays live in release whenever a host has
+        // installed an `SdkLogRelay` sink, because that is what lets a phone in the field
+        // explain itself and the incident is never on a debug build. The price is exactly
+        // this: warning strings ship in the artifact. It is a far smaller surface than the
+        // commentary, and at the default `LogSyncConfig.level` warnings are the only thing
+        // the buffer keeps anyway.
+        //
+        // So this guards a narrower claim than it used to, and a true one: the SDK's running
+        // commentary is absent from release artifacts. If an entry here starts failing, the
+        // question to ask is whether its call site moved from `sdkLog` to `sdkWarn`, and
+        // whether that was deliberate.
         val forbiddenLogs = listOf(
             "Tracker/",
             "Cadence ->",
             "Motion ->",
             "No open session; stopping service",
-            "One-shot suppressed after",
             "Activity transitions registered",
-            "Auth expired",
-            "Upload failed (",
         )
 
         artifacts.forEach { artifact ->

@@ -12,6 +12,7 @@ import com.field360.tracker.TrackerConfig
 import com.field360.tracker.di.TrackerGraph
 import com.field360.tracker.domain.model.TrackerEvent
 import com.field360.tracker.sdkLog
+import com.field360.tracker.sdkWarn
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -234,7 +235,7 @@ public class ServiceHeartbeatReceiver : BroadcastReceiver() {
                 // has passed.
                 ServiceRestorer.reset()
 
-                sdkLog {
+                sdkWarn {
                     graph.logger.w(TAG, "Heartbeat: session open with no service; restoring")
                 }
                 graph.events.tryEmit(

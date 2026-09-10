@@ -5,6 +5,7 @@ import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import com.field360.tracker.TrackerConfig
 import com.field360.tracker.sdkLog
+import com.field360.tracker.sdkWarn
 import com.field360.tracker.domain.model.TrackerEvent
 import com.field360.tracker.domain.repository.SessionRepository
 import com.field360.traker.geo.port.Clock
@@ -194,7 +195,7 @@ HealthLoop(
         if (!report.blocked) return false
 
         val message = "Device integrity check failed mid-session: ${report.describeBlocking()}"
-        sdkLog { logger.w(TAG, message) }
+        sdkWarn { logger.w(TAG, message) }
         events.tryEmit(TrackerEvent.Error(ErrorCode.DEVICE_INTEGRITY_BLOCKED, message))
         stopTracking()
         return true
@@ -215,7 +216,7 @@ HealthLoop(
 
         val healthy = infos.any { it.state == WorkInfo.State.ENQUEUED || it.state == WorkInfo.State.RUNNING }
         if (!healthy) {
-            sdkLog { logger.w(TAG, "Backstop work not alive (${infos.map { it.state }}); re-enqueuing") }
+            sdkWarn { logger.w(TAG, "Backstop work not alive (${infos.map { it.state }}); re-enqueuing") }
             BackstopWorker.enqueue(context, config.service.backstopIntervalMin)
         }
     }
@@ -251,7 +252,7 @@ HealthLoop(
         val now = BackgroundRestrictions.read(context)
         if (now == lastRestrictions) return
         lastRestrictions = now
-        sdkLog { logger.w(TAG, now.describe()) }
+        sdkWarn { logger.w(TAG, now.describe()) }
         events.tryEmit(TrackerEvent.Diagnostic(now.describe()))
     }
 

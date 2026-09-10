@@ -7,6 +7,7 @@ import com.field360.tracker.domain.model.ApiResult
 import com.field360.tracker.domain.model.LicenseCheckRequest
 import com.field360.tracker.domain.repository.LicenseApi
 import com.field360.tracker.sdkLog
+import com.field360.tracker.sdkWarn
 import com.field360.traker.geo.port.TrackLogger
 import com.google.gson.GsonBuilder
 import java.util.concurrent.TimeUnit
@@ -74,7 +75,7 @@ internal class RetrofitLicenseApi(
         }
 
         val api = service ?: run {
-            sdkLog { logger.w(API_TAG, "licence URL is not a usable base URL: $baseUrl") }
+            sdkWarn { logger.w(API_TAG, "licence URL is not a usable base URL: $baseUrl") }
             return ApiResult.Failure(ApiError(ApiErrorCode.NOT_CONFIGURED, detail = "bad base URL"))
         }
 

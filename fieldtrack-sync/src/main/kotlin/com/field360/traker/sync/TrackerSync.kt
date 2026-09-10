@@ -961,7 +961,7 @@ public class TrackerSync internal constructor(
      */
     private fun halt() {
         haltedReason = "403 — credential rejected by the server"
-        sdkLog { logger.w(TAG, "Uploads halted after a 403; rows kept. Re-configure to resume") }
+        sdkWarn { logger.w(TAG, "Uploads halted after a 403; rows kept. Re-configure to resume") }
         config = null
         transport = null
         // Core must stop nudging too, or every accepted point re-enters a loop that has
@@ -995,7 +995,7 @@ public class TrackerSync internal constructor(
      * (spec §3.3).
      */
     private suspend fun tearDown() {
-        sdkLog { logger.w(TAG, "Auth expired — stopping tracking and clearing the upload queue") }
+        sdkWarn { logger.w(TAG, "Auth expired — stopping tracking and clearing the upload queue") }
         runCatching { trackIt.stop() }
         queue.clearOnAuthExpiry()
         config = null
@@ -1007,7 +1007,7 @@ public class TrackerSync internal constructor(
     private fun defaultTransport(): SyncTransport = runCatching { OkHttpSyncTransport() }
         .getOrElse {
             // compileOnly — absent unless the host added OkHttp or supplied a transport.
-            sdkLog { logger.w(TAG, "OkHttp not on the classpath; supply your own SyncTransport") }
+            sdkWarn { logger.w(TAG, "OkHttp not on the classpath; supply your own SyncTransport") }
             NoOpTransport
         }
 

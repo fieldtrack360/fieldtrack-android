@@ -104,11 +104,17 @@ and validate the result. It covers every exported version, and a companion case 
     the default `INFO` that means the SDK's warnings are kept and its commentary is not —
     `.level(LogLevel.DEBUG)` captures everything, at several lines per fix.
 
-    **It works in release builds**, which is the point: `sdkLog` now runs its block when
-    either `SDK_LOGGING_ENABLED` is set *or* a relay sink is installed. Logcat stays
-    compiled out of release — anything with `READ_LOGS` can read that — while a private
-    buffer the host asked for does not. A host that never configures log shipping is
-    unchanged: `isActive` is a volatile read returning false and the block is skipped.
+    **Warnings work in release builds**, which is the point — the incident is never on a
+    debug build. `sdkLog` is split in two: it keeps its old debug-only gate for the SDK's
+    commentary, and a new `sdkWarn` runs when either `SDK_LOGGING_ENABLED` is set *or* a
+    relay sink is installed. A host that never configures log shipping is unchanged:
+    `isActive` is a volatile read returning false and the block is skipped.
+
+    The split is where the cost sits. A string can only be written at runtime if it is in
+    the artifact, so `sdkWarn`'s messages now ship inside the release AAR where anyone can
+    read them; `sdkLog`'s do not, and `verifyReleaseObfuscation` still asserts a sample of
+    the commentary never appears. Warnings are the slice worth that trade: small, and the
+    only thing the default `LogSyncConfig.level` keeps anyway.
 
     The relay never recurses (a sink whose write path logs is guarded per thread), never
     throws into its caller, and never relays the `FieldTrackApi` upload log — an entry

@@ -5,6 +5,7 @@ import com.field360.tracker.domain.model.ApiError
 import com.field360.tracker.domain.model.ApiErrorCode
 import com.field360.tracker.domain.model.ApiResult
 import com.field360.tracker.sdkLog
+import com.field360.tracker.sdkWarn
 import com.field360.traker.geo.port.TrackLogger
 import java.io.IOException
 import java.net.SocketTimeoutException
@@ -82,7 +83,7 @@ internal class ApiCall(
     private fun fail(error: ApiError, label: String, startedAt: Long): ApiResult.Failure {
         // Warn, not error: nothing here is a verdict about a licence, and the caller
         // carries on regardless. It is worth noticing, not worth alarming about.
-        sdkLog {
+        sdkWarn {
             logger.w(API_TAG, "$label -> ${error.describe()} after ${startedAt.msSince()}ms")
         }
         return ApiResult.Failure(error)

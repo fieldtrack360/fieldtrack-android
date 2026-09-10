@@ -2402,12 +2402,25 @@ commentary is not**. Set `.level(LogLevel.DEBUG)` to capture everything — with
 warning in [§15.12](#1512-what-it-costs-and-what-to-leave-off) firmly in mind, because the
 SDK writes several lines per fix and a shift is thousands of rows.
 
-**This is the one part of the channel that works in a release build.** `Tracker/…` logcat
-output is compiled out of release APKs — any app on a rooted device can read logcat, so a
-shipped app should not narrate itself there. The buffer is different: it is private, it is
-the host's own backend, and the host asked for it. So a released app records nothing until
-a log channel is configured, and records normally once one is. That is the whole point: the
-incident worth explaining is on a phone in the field, running a release build.
+**In a release build you get the warnings, and only the warnings.** This is the one part of
+the channel that survives release at all, and the line is drawn deliberately:
+
+| | Debug build | Release build |
+|---|---|---|
+| SDK warnings | recorded | **recorded**, once a channel is configured |
+| SDK commentary (`DEBUG`) | recorded at `level = DEBUG` | not present in the artifact |
+| `Tracker/…` logcat | written | compiled out |
+
+Logcat goes because anything holding `READ_LOGS` can read it, and a shipped app should not
+narrate itself there. The commentary goes for a second reason: its *strings* would have to
+ship inside the AAR to be writable at runtime, and those strings describe how the SDK works
+to anyone who unzips it — the release build is verified against a sample of them. Warnings
+are the small, high-value slice worth paying that price for, and at the default
+`level = INFO` they are the only thing the buffer keeps anyway.
+
+So a released app records nothing until a log channel is configured, and records its
+warnings once one is. That is the point: the incident worth explaining is on a phone in the
+field, running a release build. To see the full commentary, reproduce on a debug build.
 
 **`FieldTrackApi` is the one tag never recorded.** That is the upload log — one line per
 request, on both channels. Recorded, a log upload would write an entry describing itself,

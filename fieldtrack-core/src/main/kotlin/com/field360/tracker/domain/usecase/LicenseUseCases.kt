@@ -15,6 +15,7 @@ import com.field360.tracker.domain.repository.LicenseApi
 import com.field360.tracker.domain.repository.LicenseVerdictStore
 import com.field360.tracker.domain.repository.VerdictAuthenticator
 import com.field360.tracker.sdkLog
+import com.field360.tracker.sdkWarn
 import com.field360.traker.geo.port.TrackLogger
 import java.security.SecureRandom
 
@@ -122,7 +123,7 @@ internal class CheckLicenseRevocationUseCase(
             // Worth a warning rather than a debug line: a genuine server does not send
             // these, so this is either a proxy in the way or a key rotation nobody
             // shipped. Either way it silently disables enforcement until someone looks.
-            sdkLog { logger.w(API_TAG, "response failed verification — ignored, carrying on") }
+            sdkWarn { logger.w(API_TAG, "response failed verification — ignored, carrying on") }
             return LicenseCheckResult.inconclusive(
                 ApiError(ApiErrorCode.MALFORMED_BODY, detail = "failed verification"),
             )

@@ -8,6 +8,7 @@ import android.os.SystemClock
 import com.field360.traker.geo.port.TrackLogger
 import com.field360.traker.sync.SyncQueue
 import com.field360.traker.sync.sdkLog
+import com.field360.traker.sync.sdkWarn
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -128,7 +129,7 @@ internal class NetworkMonitor(
         }.getOrElse { failure ->
             // TooManyRequestsException at 100 concurrent callbacks per process, and OEM
             // variants throw their own. Neither is worth a crash for an optimisation.
-            sdkLog { logger.w(TAG, "Could not watch connectivity: ${failure.message}") }
+            sdkWarn { logger.w(TAG, "Could not watch connectivity: ${failure.message}") }
             false
         }
     }

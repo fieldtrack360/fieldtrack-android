@@ -109,17 +109,17 @@ public class SyncQueue internal constructor(
                         uploaded += batch.size
                     }
                     SyncResponse.Unauthorized -> {
-                        sdkLog { logger.w(TAG, "401 on upload; auth expired") }
+                        sdkWarn { logger.w(TAG, "401 on upload; auth expired") }
                         return Result.AuthExpired
                     }
                     SyncResponse.Forbidden -> {
-                        sdkLog { logger.w(TAG, "403 on upload; credential rejected — rows stay queued") }
+                        sdkWarn { logger.w(TAG, "403 on upload; credential rejected — rows stay queued") }
                         return Result.Forbidden
                     }
                     is SyncResponse.Failure -> {
                         // Rows stay queued deliberately. Retried by SyncWorker's backoff, or
                         // by the server's own schedule when it sent one.
-                        sdkLog { logger.w(TAG, "Upload failed (${response.code}): ${response.message}") }
+                        sdkWarn { logger.w(TAG, "Upload failed (${response.code}): ${response.message}") }
                         return Result.Retry(response.message, response.retryAfterMs)
                     }
                 }

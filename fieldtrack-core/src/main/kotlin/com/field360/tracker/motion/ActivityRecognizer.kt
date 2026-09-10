@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import com.field360.tracker.domain.model.TrackerEvent
 import com.field360.tracker.sdkLog
+import com.field360.tracker.sdkWarn
 import com.field360.traker.geo.port.TrackLogger
 import com.field360.tracker.permission.PermissionManager
 import com.google.android.gms.location.ActivityRecognition
@@ -58,7 +59,7 @@ internal class ActivityRecognizer(
     fun register() {
         // EC-09 — guard every AR call. Denied permission must degrade, not throw.
         if (!permissions.hasActivityRecognition()) {
-            sdkLog {
+            sdkWarn {
                 logger.w(TAG, "ACTIVITY_RECOGNITION not granted; motion falls back to speed + displacement")
             }
             return
@@ -73,7 +74,7 @@ internal class ActivityRecognizer(
                 sdkLog { logger.d(TAG, "Activity transitions registered") }
             }
             .addOnFailureListener { error ->
-                sdkLog { logger.w(TAG, "Activity transition registration failed: ${error.message}") }
+                sdkWarn { logger.w(TAG, "Activity transition registration failed: ${error.message}") }
                 events.tryEmit(TrackerEvent.Diagnostic("activity_recognition_unavailable"))
             }
 

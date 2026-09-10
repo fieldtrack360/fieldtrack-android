@@ -15,6 +15,7 @@ import androidx.lifecycle.lifecycleScope
 import com.field360.tracker.ServiceConfig
 import com.field360.tracker.TrackerConfig
 import com.field360.tracker.sdkLog
+import com.field360.tracker.sdkWarn
 import com.field360.tracker.capture.OneShotProvider
 import com.field360.tracker.data.platform.WakeLockController
 import com.field360.tracker.di.TrackerGraph
@@ -341,7 +342,7 @@ public class TrackingService : LifecycleService() {
         // the kind of delay the timer is measuring.
         stopSelf()
 
-        sdkLog { logger.w(TAG, "startForeground(location) refused: ${e.message}") }
+        sdkWarn { logger.w(TAG, "startForeground(location) refused: ${e.message}") }
         events.tryEmit(TrackerEvent.Error(ErrorCode.FGS_START_REFUSED, e.message.orEmpty()))
 
         // The retry this comment has always claimed happens (EC-62), and until now did
@@ -395,7 +396,7 @@ public class TrackingService : LifecycleService() {
         val elapsedMs = SystemClock.elapsedRealtime() - requestedAt
         sdkLog { logger.d(TAG, "startForeground reached ${elapsedMs}ms after start request") }
         if (elapsedMs >= PROMOTION_WARN_MS) {
-            sdkLog { logger.w(TAG, "foreground promotion took ${elapsedMs}ms") }
+            sdkWarn { logger.w(TAG, "foreground promotion took ${elapsedMs}ms") }
             events.tryEmit(
                 TrackerEvent.Diagnostic(
                     "foreground promotion took ${elapsedMs}ms of the platform's ~10s " +
@@ -480,7 +481,7 @@ public class TrackingService : LifecycleService() {
         }.getOrDefault(0)
 
         if (id == 0) {
-            sdkLog { logger.w(TAG, "notificationSmallIconResName '$resName' not found; using default") }
+            sdkWarn { logger.w(TAG, "notificationSmallIconResName '$resName' not found; using default") }
             return DEFAULT_SMALL_ICON
         }
         return id
@@ -570,7 +571,7 @@ public class TrackingService : LifecycleService() {
                 // charge the next successful start with the time since this refusal.
                 startRequestedAtMs = 0L
                 val graph = TrackerGraph.get(context.applicationContext)
-                sdkLog {
+                sdkWarn {
                     graph.logger.w(TAG, "startForegroundService refused: ${e.message}")
                 }
                 graph.events.tryEmit(

@@ -207,7 +207,7 @@ internal class LogRecorder(
 
         val payload = draft.data?.takeIf(::isJsonStructure)
         if (draft.data != null && payload == null) {
-            sdkLog {
+            sdkWarn {
                 logger.w(TAG, "Dropped log data for \"${draft.tag}\": not a JSON object or array")
             }
         }
@@ -263,7 +263,7 @@ internal class LogRecorder(
         if (config == null) return
         scope.launch {
             runCatching { writeSessionMotion() }
-                .onFailure { sdkLog { logger.w(TAG, "Motion probe failed: ${it.message}") } }
+                .onFailure { sdkWarn { logger.w(TAG, "Motion probe failed: ${it.message}") } }
         }
     }
 
@@ -352,7 +352,7 @@ internal class LogRecorder(
         pump = scope.launch {
             for (draft in inbox) {
                 runCatching { write(draft) }
-                    .onFailure { sdkLog { logger.w(TAG, "Log write failed: ${it.message}") } }
+                    .onFailure { sdkWarn { logger.w(TAG, "Log write failed: ${it.message}") } }
             }
         }
     }

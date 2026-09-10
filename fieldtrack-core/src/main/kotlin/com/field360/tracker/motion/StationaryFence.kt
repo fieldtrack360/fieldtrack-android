@@ -8,6 +8,7 @@ import com.field360.tracker.domain.model.TrackerEvent
 import com.field360.tracker.domain.model.TrackerGeofence
 import com.field360.traker.geo.port.TrackLogger
 import com.field360.tracker.sdkLog
+import com.field360.tracker.sdkWarn
 import com.google.android.gms.location.Geofence
 import com.google.android.gms.location.GeofencingClient
 import com.google.android.gms.location.GeofencingRequest
@@ -122,7 +123,7 @@ internal class StationaryFence(
     }
 
     private fun reportRegistrationFailure(error: Throwable) {
-        sdkLog { logger.w(TAG, "Geofence registration failed: ${error.message}") }
+        sdkWarn { logger.w(TAG, "Geofence registration failed: ${error.message}") }
         events.tryEmit(TrackerEvent.Diagnostic("geofence_unavailable: ${error.message}"))
     }
 

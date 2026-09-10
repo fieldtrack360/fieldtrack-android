@@ -63,6 +63,12 @@
 -keep public class com.field360.tracker.TrackerConfig$Builder { public protected *; }
 -keep public class com.field360.tracker.TrackerConfig$Companion { public protected *; }
 -keep public class com.field360.tracker.TrackingMode { public protected *; }
+# ServiceConfig.wakeLockPolicy's type. Added with that property and missed here, so R8
+# stripped it from the AAR while TrackerConfig kept referencing it — every host minifying
+# its own build then failed with "Missing class com.field360.tracker.WakeLockPolicy", which
+# is a link error in the SDK, not in theirs. A public type reachable from the public API has
+# to be on this list; the list is explicit precisely so that adding one is a decision.
+-keep public class com.field360.tracker.WakeLockPolicy { public protected *; }
 -keep public class com.field360.tracker.SecurityConfig { public protected *; }
 -keep public class com.field360.tracker.SecurityConfig$Companion { public protected *; }
 

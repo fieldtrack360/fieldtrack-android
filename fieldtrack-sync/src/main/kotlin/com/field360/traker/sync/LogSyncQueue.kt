@@ -275,12 +275,12 @@ public class LogSyncQueue internal constructor(
             is SyncResponse.Success -> Sent.Ok
 
             SyncResponse.Unauthorized -> {
-                sdkLog { logger.w(TAG, "401 on log upload; shipping stopped, buffer kept") }
+                sdkWarn { logger.w(TAG, "401 on log upload; shipping stopped, buffer kept") }
                 Sent.Stop(Result.Rejected(HTTP_UNAUTHORIZED))
             }
 
             SyncResponse.Forbidden -> {
-                sdkLog { logger.w(TAG, "403 on log upload; shipping stopped, buffer kept") }
+                sdkWarn { logger.w(TAG, "403 on log upload; shipping stopped, buffer kept") }
                 Sent.Stop(Result.Rejected(HTTP_FORBIDDEN))
             }
 
@@ -295,7 +295,7 @@ public class LogSyncQueue internal constructor(
                 // else about the SDK changes: capture, storage and the point queue never
                 // see this.
                 response.isEndpointAbsent() -> {
-                    sdkLog {
+                    sdkWarn {
                         logger.w(
                             TAG,
                             "No log endpoint at this URL (${response.code}); shipping " +
@@ -309,7 +309,7 @@ public class LogSyncQueue internal constructor(
                     // The inversion in the class KDoc. Logged at warn because a silently
                     // discarded batch is exactly what makes a later "the logs are
                     // incomplete" impossible to explain.
-                    sdkLog {
+                    sdkWarn {
                         logger.w(
                             TAG,
                             "Dropping ${records.size} log entries: server answered " +
@@ -320,7 +320,7 @@ public class LogSyncQueue internal constructor(
                 }
 
                 else -> {
-                    sdkLog {
+                    sdkWarn {
                         logger.w(TAG, "Log upload failed (${response.code}): ${response.message}")
                     }
                     Sent.Stop(Result.Retry(response.message, response.retryAfterMs))

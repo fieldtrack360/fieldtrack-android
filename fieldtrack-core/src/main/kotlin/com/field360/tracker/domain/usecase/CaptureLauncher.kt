@@ -22,6 +22,7 @@ import com.field360.tracker.permission.BackgroundRestrictions
 import com.field360.tracker.permission.PermissionManager
 import com.field360.tracker.permission.ProviderStateMonitor
 import com.field360.tracker.sdkLog
+import com.field360.tracker.sdkWarn
 import com.field360.tracker.service.ServiceHeartbeat
 import com.field360.tracker.work.BackstopWorker
 import com.field360.tracker.work.SyncScheduler
@@ -178,7 +179,7 @@ internal class CaptureLauncher(
         // a Settings screen, and opening one uninvited is the host's call (PERMISSIONS.md
         // §5). `HealthLoop` follows the edges from here.
         BackgroundRestrictions.read(context).let { restrictions ->
-            sdkLog { logger.w(TAG, restrictions.describe()) }
+            sdkWarn { logger.w(TAG, restrictions.describe()) }
             events.tryEmit(TrackerEvent.Diagnostic(restrictions.describe()))
         }
     }
@@ -311,7 +312,7 @@ internal class ResumeCaptureUseCase(
 
         launcher.launch(session, config)
 
-        sdkLog { logger.w(TAG, "Capture resumed for session ${session.id} after process death") }
+        sdkWarn { logger.w(TAG, "Capture resumed for session ${session.id} after process death") }
         events.tryEmit(
             TrackerEvent.Diagnostic(
                 "capture resumed for session ${session.id} after the process was killed",

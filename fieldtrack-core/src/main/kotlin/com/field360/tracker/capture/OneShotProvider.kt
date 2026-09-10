@@ -3,6 +3,7 @@ package com.field360.tracker.capture
 import android.os.Build
 import com.field360.tracker.TrackerConfig
 import com.field360.tracker.sdkLog
+import com.field360.tracker.sdkWarn
 import com.field360.tracker.data.location.FixMapper
 import com.field360.tracker.data.location.LocationSource
 import com.field360.tracker.domain.model.ErrorCode
@@ -47,7 +48,7 @@ internal class OneShotProvider(
         suppressAfterRepeatedFailures: Boolean = true,
     ): TrackFix? {
         if (suppressAfterRepeatedFailures && consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-            sdkLog { logger.w(TAG, "One-shot suppressed after $consecutiveFailures consecutive failures") }
+            sdkWarn { logger.w(TAG, "One-shot suppressed after $consecutiveFailures consecutive failures") }
             return null
         }
 
@@ -66,7 +67,7 @@ internal class OneShotProvider(
                 // HIGH_ACCURACY fix landing inside the deadline — surface them at the
                 // timeout site since they're the usual explanation on a given device/OS
                 // combination (e.g. reports isolated to API 33).
-                sdkLog {
+                sdkWarn {
                     logger.w(
                         TAG,
                         "One-shot timed out after ${config.geolocation.oneShotTimeoutMs} ms " +
