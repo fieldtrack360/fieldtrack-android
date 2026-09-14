@@ -185,7 +185,11 @@ public class StartTrackingUseCase internal constructor(
         // NonCancellable does not keep a dying process alive — nothing can. It removes the
         // *cooperative* half of the race, which is the half that needs no OEM at all.
         return withContext(NonCancellable) {
-            val superseded = teardown()
+            // `restartFollows`, because the `TrackingService.start` below is the very next
+            // thing this does. It keeps the stop on the abrupt `stopService` route, where
+            // a start issued immediately behind it cannot be swallowed by the stop's own
+            // `stopSelf` — see `TrackingService.stop`.
+            val superseded = teardown(restartFollows = true)
             if (superseded != null) {
                 events.tryEmit(
                     TrackerEvent.Diagnostic(
@@ -282,9 +286,12 @@ internal class SessionTeardown(
      * session — a sticky restart, an FGS the host never stopped — is exactly what this has
      * to be able to kill.
      *
+     * @param restartFollows true when the caller starts the service again as its very next
+     *   act, which changes how `TrackingService.stop` is allowed to deliver the stop — see
+     *   its `restartFollows` parameter. Only `StartTrackingUseCase` passes true.
      * @return the session that was closed, or `null` if none was open.
      */
-    suspend operator fun invoke(): TrackSession? {
+    suspend operator fun invoke(restartFollows: Boolean = false): TrackSession? {
         val current = sessions.current()
 
         // Order matters: stop feeding the channel, then close the session, so no point
@@ -346,7 +353,7 @@ internal class SessionTeardown(
         // holds.
         val closed = current?.let { sessions.close(it.id) }
 
-        TrackingService.stop(context)
+        TrackingService.stop(context, restartFollows)
         return closed
     }
 }

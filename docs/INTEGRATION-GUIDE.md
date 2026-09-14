@@ -212,6 +212,72 @@ them without upgrading anything:
 arrive transitively; declaring a newer version in your own app wins through normal Gradle
 conflict resolution.
 
+### 1.7 Recommended: take WorkManager off your cold-start path
+
+**Strongly recommended for every host, and it is a manifest block with no Kotlin behind
+it.** Add this inside `<application>` in your app's `AndroidManifest.xml`:
+
+```xml
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <application>
+
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+        </provider>
+
+    </application>
+</manifest>
+```
+
+#### Why
+
+WorkManager installs itself through `androidx.startup`'s `ContentProvider`, which Android
+runs during **Application attach — before `Application.onCreate`, on the main thread, on
+every cold start of your process.**
+
+For most apps that is only a slow start. For this SDK it is a crash risk. `TrackingService`
+is started with `startForegroundService()`, and the platform's **~10 second
+start-foreground deadline opens at that call**, not when the service runs. The process very
+often starts cold in answer to it — a sticky restart, a boot resume, an OEM revival — so
+every ContentProvider in the merged manifest runs inside that window before the service is
+even constructed. Overrun it and the platform kills the app with:
+
+```
+Fatal Exception: android.app.RemoteServiceException$ForegroundServiceDidNotStartInTimeException
+Context.startForegroundService() did not then call Service.startForeground()
+```
+
+That crash is thrown by the system on your main looper. The SDK cannot catch it. Every
+millisecond removed from Application attach is budget handed back to the promotion.
+
+#### You do **not** need `Configuration.Provider`
+
+Removing that initializer normally forces your `Application` to implement
+`androidx.work.Configuration.Provider`, because `WorkManager.getInstance()` throws once
+nothing has initialised it. With this SDK it does not: the SDK routes every handle through
+its own accessor, which initialises WorkManager with the identical default configuration
+the first time it needs one — off the cold-start path, on whatever thread asked.
+
+#### The one case where you should not do this
+
+If **your own app code** calls `WorkManager.getInstance()` — you schedule your own workers —
+then whichever of you touches WorkManager first wins, and your call can throw. In that case
+either leave the block out, or add it *and* implement `Configuration.Provider` on your
+`Application` the way AndroidX documents. Both are safe; the SDK works either way.
+
+This is why the SDK does **not** ship the removal in its own merged manifest: deleting a
+dependency's initializer out from under a host would break hosts that were relying on it.
+
+`sample-android/src/main/AndroidManifest.xml` carries the block as a worked reference.
+
 ---
 
 ## 2. License token

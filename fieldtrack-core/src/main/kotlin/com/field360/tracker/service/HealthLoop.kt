@@ -2,7 +2,6 @@ package com.field360.tracker.service
 
 import android.content.Context
 import androidx.work.WorkInfo
-import androidx.work.WorkManager
 import com.field360.tracker.TrackerConfig
 import com.field360.tracker.sdkLog
 import com.field360.tracker.sdkWarn
@@ -20,6 +19,7 @@ import com.field360.tracker.permission.ProviderStateMonitor
 import com.field360.tracker.work.BackstopWorker
 import com.field360.tracker.work.SyncScheduler
 import com.field360.tracker.work.Watchdog
+import com.field360.tracker.work.WorkManagerAccess
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -209,7 +209,7 @@ HealthLoop(
     private suspend fun ensureBackstopAlive(config: TrackerConfig) {
         // Flow variant so no ListenableFuture/Guava bridge is pulled into the AAR.
         val infos = runCatching {
-            WorkManager.getInstance(context)
+            WorkManagerAccess.get(context)
                 .getWorkInfosForUniqueWorkFlow(BackstopWorker.NAME)
                 .first()
         }.getOrNull() ?: return

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!--
       Note what is NOT here: no location permissions, no service, no receivers.
@@ -34,6 +35,41 @@
         <meta-data
             android:name="TrackItLicense"
             android:value="${TRACKER_LICENSE}" />
+
+        <!--
+          Takes WorkManager's initialisation off the cold-start path.
+
+          `WorkManagerInitializer` runs inside `androidx.startup`'s ContentProvider, which
+          the platform executes during Application attach on EVERY cold start of the
+          process — before `Application.onCreate`, on the main thread. That is ordinarily
+          just a slow start; here it is a crash risk, because the process most often starts
+          cold in answer to `startForegroundService()` (a sticky restart, a boot resume, an
+          OEM revival), and the platform's ~10 second start-foreground deadline opens at
+          that call. Every provider in the merged manifest runs inside the window before
+          `TrackingService` is even constructed, and overrunning it is
+          `ForegroundServiceDidNotStartInTimeException` — fatal, and uncatchable by the SDK.
+
+          Removing it normally forces this Application to implement
+          `Configuration.Provider`. It does not here: `WorkManagerAccess` inside
+          fieldtrack-core initialises WorkManager with the identical default configuration
+          the first time the SDK asks for a handle. So this block is manifest-only, and it
+          is the recommended integration for any host of this SDK.
+
+          One caveat, and it is the reason the SDK does not ship this removal in its own
+          manifest: if the HOST calls `WorkManager.getInstance()` itself before the SDK has
+          taken a handle, it throws. A host that schedules its own work either keeps this
+          block out, or implements `Configuration.Provider` as AndroidX documents.
+        -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+        </provider>
 
         <!-- Lets the capture log be shared to Drive/mail/adb-less laptops. Read-only,
              not exported, and scoped to the external files dir only. -->

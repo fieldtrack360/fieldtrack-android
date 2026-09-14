@@ -25,11 +25,13 @@ import com.field360.tracker.domain.repository.ConfigRepository
 import com.field360.traker.geo.port.TrackLogger
 import com.field360.tracker.motion.MotionController
 import com.field360.tracker.work.UploadQueueStats
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.plus
 
 /**
  * The foreground service that hosts the capture stream.
@@ -70,7 +72,18 @@ public class TrackingService : LifecycleService() {
     /**
      * What [buildNotification] was last given, so [startSupervision] can tell whether the
      * persisted config it just read differs from what is already on screen.
+     *
+     * `@Volatile` since [startSupervision] moved off the main thread. It is written from
+     * two threads now — the main one in [postForegroundNotification] and [teardown], the
+     * supervision dispatcher in [refreshNotification] — and without this the supervision
+     * side could compare against a value the main thread wrote and it never saw, and
+     * re-post a notification that is already on screen.
+     *
+     * A lock would buy nothing beyond the visibility. The only interleaving these two
+     * writers have is "both decide to post"; the loser's cost is one redundant `notify`
+     * of the same content, which the user cannot see.
      */
+    @Volatile
     private var postedNotification: ServiceConfig? = null
 
     /**
@@ -82,7 +95,12 @@ public class TrackingService : LifecycleService() {
      * moves every time a row is queued or drained. Comparing it before re-posting is what
      * keeps a stationary device with a settled queue from re-notifying once a minute
      * forever.
+     *
+     * `@Volatile` for the same reason as [postedNotification]: the sync-status loop that
+     * owns it runs on the supervision dispatcher, and [refreshNotification] reads it from
+     * whichever thread posts.
      */
+    @Volatile
     private var postedStatusLine: String? = null
 
     /**
@@ -153,7 +171,36 @@ public class TrackingService : LifecycleService() {
 
     private fun startSupervision() {
         supervision?.cancel()
-        supervision = lifecycleScope.launch {
+
+        // Siblings of the supervision job, on the same dispatcher as it.
+        //
+        // `lifecycleScope + Dispatchers.Default` keeps the *Job* — so these stay children
+        // of the lifecycle and are cancelled by exactly what cancelled them before, which
+        // [teardown] relies on — and changes only the thread they run on. Passing the
+        // supervision coroutine's own scope instead would have reparented them under
+        // [supervision] and quietly changed what `supervision?.cancel()` brings down.
+        val offMain = lifecycleScope + Dispatchers.Default
+
+        // `Dispatchers.Default`, where this used to inherit `lifecycleScope`'s
+        // `Dispatchers.Main.immediate`.
+        //
+        // Two things were wrong with that. `Main.immediate` runs a coroutine *inline* on
+        // the calling thread until its first real suspension, so this block began
+        // executing inside `onStartCommand` itself and the start command could not return
+        // until it suspended — and a service cannot be destroyed until `onStartCommand`
+        // returns, which is time spent inside every window the platform is measuring.
+        // Then every resumption after that landed back on the main thread: the graph
+        // construction cascade behind `resumeCapture`, the Play Services and
+        // `SensorManager` registrations it performs, the `PowerManager` acquire in
+        // `wakeLocks.configure`, and a `NotificationManager` round trip per refresh.
+        //
+        // None of that needs the main thread. Room's DAOs here are all `suspend` and
+        // dispatch themselves; the fused client is handed `context.mainLooper` explicitly
+        // and the platform one an `Executor` (see `LocationSource`), so neither depends on
+        // the caller having a `Looper`; and `NotificationManager` and `SensorManager` are
+        // both safe to call from any thread. The one thing deliberately left on main is
+        // `stopSelf` below.
+        supervision = lifecycleScope.launch(Dispatchers.Default) {
             val config = configRepository.load() ?: TrackerConfig()
 
             // BEFORE anything else in this scope, because everything below supervises a
@@ -175,7 +222,7 @@ public class TrackingService : LifecycleService() {
             // process restart. The policy decides how much CPU time this actually buys —
             // see `WakeLockController`, which is where the hold lives now that PER_FIX
             // needs it reachable from the ingest path rather than only from here.
-            wakeLocks.configure(config.service, lifecycleScope)
+            wakeLocks.configure(config.service, offMain)
 
             // The one case [promoteToForeground] cannot get right on its own: after the
             // process was killed and the sticky restart brought this service back, the
@@ -194,7 +241,11 @@ public class TrackingService : LifecycleService() {
             }
 
             // 2-minute supervision: worker liveness, session still open, tracker alive.
-            healthLoop.start(lifecycleScope, config) {
+            // The loop itself runs off main; the stop it may decide on does not.
+            // `stopSelf` is a `Service` lifecycle call and the teardown it triggers ends in
+            // `ServiceCompat.stopForeground` from `onDestroy`, so it is kept on the thread
+            // the rest of the service's lifecycle runs on rather than saving a hop.
+            healthLoop.start(offMain, config) {
                 lifecycleScope.launch { stopSelf() }
             }
 
@@ -529,6 +580,23 @@ public class TrackingService : LifecycleService() {
         private var startRequestedAtMs: Long = 0L
 
         /**
+         * Serialises [start] against [stop].
+         *
+         * Without it the two interleave freely, and there are six independent start
+         * callers — `StartTrackingUseCase`, `BootReceiver`, `ServiceHeartbeat`,
+         * `reviveServiceIfNeeded`, `RestoreWorker`, `BackstopWorker` — every one of them
+         * on a background dispatcher, against one stop caller (`SessionTeardown`). Nothing
+         * in that arrangement could express "a start command is in the air, do not tear
+         * this down underneath it", which is the state [stop] now has to read.
+         *
+         * Held across the platform call on purpose. `startForegroundService` and
+         * `stopService` are both asynchronous — they queue a command and return, and
+         * neither re-enters this class — so the section is a binder round trip long and
+         * cannot deadlock against `onStartCommand`, which runs later on the main thread.
+         */
+        private val commandLock = Any()
+
+        /**
          * Used only when the host named an icon that does not resolve, or named none.
          * The title, text, channel and icon a host DID configure live in [ServiceConfig]
          * and are read from there — duplicating their defaults here is how the two drift.
@@ -557,38 +625,115 @@ public class TrackingService : LifecycleService() {
         public fun start(context: Context, config: ServiceConfig): Boolean {
             if (!config.foregroundService) return false
             val intent = Intent(context, TrackingService::class.java).setAction(ACTION_RESUME)
-            return try {
-                // Stamped immediately before the call, because this is the instant the
-                // platform's start-foreground deadline begins — see
-                // [reportPromotionLatency]. Set before rather than after so a process that
-                // is forked to answer this start command cannot promote before the stamp
-                // it is measured against exists.
-                startRequestedAtMs = SystemClock.elapsedRealtime()
-                context.startForegroundService(intent)
-                true
-            } catch (e: Exception) {
-                // Nothing was armed, so nothing is pending: leaving the stamp set would
-                // charge the next successful start with the time since this refusal.
-                startRequestedAtMs = 0L
-                val graph = TrackerGraph.get(context.applicationContext)
-                sdkWarn {
-                    graph.logger.w(TAG, "startForegroundService refused: ${e.message}")
+            return synchronized(commandLock) {
+                try {
+                    // Stamped immediately before the call, because this is the instant the
+                    // platform's start-foreground deadline begins — see
+                    // [reportPromotionLatency]. Set before rather than after so a process
+                    // that is forked to answer this start command cannot promote before the
+                    // stamp it is measured against exists.
+                    //
+                    // It is also what [stop] reads to decide how to stop, which is the
+                    // second reason it may not be set after the call: a stop arriving in
+                    // that gap would see a zero and take the abrupt path against a service
+                    // that is, by then, already spoken for.
+                    startRequestedAtMs = SystemClock.elapsedRealtime()
+                    context.startForegroundService(intent)
+                    true
+                } catch (e: Exception) {
+                    // Nothing was armed, so nothing is pending: leaving the stamp set would
+                    // charge the next successful start with the time since this refusal,
+                    // and would send the next [stop] down the wrong branch.
+                    startRequestedAtMs = 0L
+                    val graph = TrackerGraph.get(context.applicationContext)
+                    sdkWarn {
+                        graph.logger.w(TAG, "startForegroundService refused: ${e.message}")
+                    }
+                    graph.events.tryEmit(
+                        TrackerEvent.Error(ErrorCode.FGS_START_REFUSED, e.message.orEmpty()),
+                    )
+                    false
                 }
-                graph.events.tryEmit(
-                    TrackerEvent.Error(ErrorCode.FGS_START_REFUSED, e.message.orEmpty()),
-                )
-                false
             }
         }
 
         /**
-         * `stopService`, not a `startService(ACTION_STOP)` round trip: on API 26+ the
-         * latter throws `IllegalStateException` when the service is not already running,
-         * and "stop something that may already be dead" is exactly the case that hits.
-         * `onDestroy` runs the same teardown either way.
+         * Stops the service, by whichever of the two routes is safe right now.
+         *
+         * ### The ordinary route
+         *
+         * `stopService`, and for the reason this has always given: on API 26+ a
+         * `startService(ACTION_STOP)` round trip throws `IllegalStateException` when the
+         * service is not already running, and "stop something that may already be dead" is
+         * exactly the case that hits. `onDestroy` runs the same teardown either way.
+         *
+         * ### The route taken while a start is in the air
+         *
+         * A non-zero [startRequestedAtMs] means someone called [start] and the service has
+         * not promoted yet — the platform is holding a ~10 second start-foreground timer
+         * against a command that has not been delivered. Tearing the service down in that
+         * window asks the platform to resolve two contradictory orders, and what it does
+         * with them is a matter of AOSP version: the service may come down having never
+         * called `startForeground`, or the queued start may be handed to an instance whose
+         * `onDestroy` is already scheduled — which sets `running = true`, re-arms
+         * supervision, and then cancels all of it a moment later, leaving an open session
+         * with no service and nothing that noticed (the half of `TrackingUseCases`'s
+         * superseded-instance note that re-arming supervision could not cover).
+         *
+         * So the stop is delivered as a **start command** instead. [ACTION_STOP] is queued
+         * behind the start already in flight, both are delivered in order, and
+         * `onStartCommand` answers the platform properly on each: the first promotes, the
+         * second promotes and immediately tears down (see the [ACTION_STOP] branch, which
+         * exists for precisely this). No interleaving to reason about and no dependence on
+         * which AOSP release is underneath — the contract is simply satisfied both times.
+         *
+         * `startService` can still refuse — the app may have gone background between the
+         * two calls — so a failure falls through to `stopService`, which is no worse than
+         * what this did unconditionally before.
+         *
+         * A stale read in either direction is safe, which is why [startRequestedAtMs] is
+         * not re-synchronised against the instance that clears it: a stale non-zero sends a
+         * live service down the [ACTION_STOP] path, which stops it correctly, and a stale
+         * zero is exactly today's behaviour.
          */
-        public fun stop(context: Context) {
-            runCatching { context.stopService(Intent(context, TrackingService::class.java)) }
+        public fun stop(context: Context): Unit = stop(context, restartFollows = false)
+
+        /**
+         * @param restartFollows true when the caller will issue a [start] as its very next
+         *   act — `StartTrackingUseCase`, which tears the old session down before opening
+         *   the new one. Such a caller **must** pass true: the [ACTION_STOP] route below
+         *   queues the stop as a start command, its `stopSelf` clears the record's
+         *   `startRequested`, and the caller's own start — issued microseconds later and
+         *   sitting in the same undelivered batch — can go down with it. The abrupt route
+         *   has no such ambiguity, and the start that follows is what puts the service
+         *   back, so nothing is lost by taking it here.
+         */
+        internal fun stop(context: Context, restartFollows: Boolean) {
+            synchronized(commandLock) {
+                val startPending = startRequestedAtMs != 0L
+                // Cleared whichever way this goes: the start it measured is being
+                // cancelled, and leaving it set would route every later stop through
+                // ACTION_STOP and charge the next promotion with the time since.
+                startRequestedAtMs = 0L
+
+                if (startPending && !restartFollows && deliverStopCommand(context)) return
+
+                runCatching {
+                    context.stopService(Intent(context, TrackingService::class.java))
+                }
+            }
+        }
+
+        /**
+         * @return true when the platform accepted an [ACTION_STOP] start command, so the
+         *   service is guaranteed an `onStartCommand` in which to satisfy the platform.
+         *   False when it refused or found no service, leaving the caller to fall back.
+         */
+        private fun deliverStopCommand(context: Context): Boolean {
+            val intent = Intent(context, TrackingService::class.java).setAction(ACTION_STOP)
+            // `startService`, never `startForegroundService`: this must not arm a *second*
+            // start-foreground timer on the way to stopping the thing.
+            return runCatching { context.startService(intent) }.getOrNull() != null
         }
     }
 }

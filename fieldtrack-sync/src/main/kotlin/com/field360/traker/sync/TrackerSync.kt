@@ -13,11 +13,11 @@ import androidx.work.OneTimeWorkRequest
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequest
 import androidx.work.PeriodicWorkRequestBuilder
-import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.field360.tracker.Tracker
 import com.field360.tracker.TrackerArtifacts
 import com.field360.tracker.domain.repository.SyncTrigger
+import com.field360.tracker.work.WorkManagerAccess
 import com.field360.traker.geo.port.SdkLogRelay
 import com.field360.traker.geo.port.TrackLogger
 import com.field360.traker.sync.internal.LoggingSyncTransport
@@ -1216,7 +1216,7 @@ internal class SyncWorker(
         )
 
         fun enqueue(context: Context, requiresUnmetered: Boolean) {
-            WorkManager.getInstance(context)
+            WorkManagerAccess.get(context)
                 // KEEP, not REPLACE: a burst of accepted points must not reset the
                 // backoff clock and hammer a server that is already struggling.
                 .enqueueUniqueWork(NAME, ExistingWorkPolicy.KEEP, requestFor(requiresUnmetered))
@@ -1228,7 +1228,7 @@ internal class SyncWorker(
          * sitting in backoff.
          */
         fun enqueueNow(context: Context, requiresUnmetered: Boolean) {
-            WorkManager.getInstance(context)
+            WorkManagerAccess.get(context)
                 .enqueueUniqueWork(
                     NAME,
                     ExistingWorkPolicy.REPLACE,
@@ -1248,7 +1248,7 @@ internal class SyncWorker(
             val request = requestFor(requiresUnmetered) {
                 setInitialDelay(delayMs, TimeUnit.MILLISECONDS)
             }
-            WorkManager.getInstance(context)
+            WorkManagerAccess.get(context)
                 .enqueueUniqueWork(NAME, ExistingWorkPolicy.REPLACE, request)
         }
 
@@ -1340,7 +1340,7 @@ internal class LogSyncWorker(
                 .setBackoffCriteria(BackoffPolicy.LINEAR, BACKOFF_SECONDS, TimeUnit.SECONDS)
                 .build()
 
-            WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+            WorkManagerAccess.get(context).enqueueUniquePeriodicWork(
                 PERIODIC_NAME,
                 // UPDATE, not KEEP: a host changing its interval or its network constraint
                 // and getting the previous one silently is the bug this policy exists for.
@@ -1350,7 +1350,7 @@ internal class LogSyncWorker(
         }
 
         fun enqueue(context: Context, requiresUnmetered: Boolean) {
-            WorkManager.getInstance(context)
+            WorkManagerAccess.get(context)
                 .enqueueUniqueWork(NAME, ExistingWorkPolicy.KEEP, oneShot(requiresUnmetered))
         }
 
@@ -1359,7 +1359,7 @@ internal class LogSyncWorker(
             val request = oneShot(requiresUnmetered) {
                 setInitialDelay(delayMs, TimeUnit.MILLISECONDS)
             }
-            WorkManager.getInstance(context)
+            WorkManagerAccess.get(context)
                 .enqueueUniqueWork(NAME, ExistingWorkPolicy.REPLACE, request)
         }
 
@@ -1368,7 +1368,7 @@ internal class LogSyncWorker(
          * in backoff would otherwise fire once more against a channel the host turned off.
          */
         fun cancel(context: Context) {
-            val manager = WorkManager.getInstance(context)
+            val manager = WorkManagerAccess.get(context)
             manager.cancelUniqueWork(PERIODIC_NAME)
             manager.cancelUniqueWork(NAME)
         }

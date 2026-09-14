@@ -10,7 +10,6 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.OutOfQuotaPolicy
 import androidx.work.PeriodicWorkRequestBuilder
-import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.field360.tracker.TrackerConfig
 import com.field360.tracker.di.TrackerGraph
@@ -28,10 +27,17 @@ import java.util.concurrent.TimeUnit
  *
  * Workers are constructed by WorkManager, so there is no constructor to wire — the graph
  * is looked up from the application context instead. The property that matters is that
- * **the host does nothing**: WorkManager's default initialisation is enough, with no
- * `Configuration.Provider` and no custom `WorkerFactory` to install. That was the
- * argument for `EntryPointAccessors` over `@HiltWorker` when this used Hilt, and it is
- * the same argument now that there is no Hilt at all.
+ * **the host does nothing**: no `Configuration.Provider` and no custom `WorkerFactory` to
+ * install. That was the argument for `EntryPointAccessors` over `@HiltWorker` when this
+ * used Hilt, and it is the same argument now that there is no Hilt at all.
+ *
+ * That promise used to rest on WorkManager's default `androidx.startup` initialiser being
+ * present. It no longer does, and deliberately: a host is encouraged to delete that
+ * ContentProvider so its work does not run on the main thread of every cold start, inside
+ * the start-foreground deadline `TrackingService` is racing. Every handle below therefore
+ * goes through [WorkManagerAccess], which initialises WorkManager on first use when
+ * nothing else has — so the host's side of the opt-in stays a manifest block with no
+ * Kotlin behind it.
  */
 private fun Context.trackItGraph(): TrackerGraph = TrackerGraph.get(applicationContext)
 
@@ -132,7 +138,7 @@ internal class BackstopWorker(
                 .setBackoffCriteria(BackoffPolicy.LINEAR, MIN_BACKOFF_SECONDS, TimeUnit.SECONDS)
                 .build()
 
-            WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+            WorkManagerAccess.get(context).enqueueUniquePeriodicWork(
                 NAME,
                 // KEEP: re-enqueuing on every start would reset the 15-minute clock and
                 // the backstop would never actually fire on a frequently-restarted app.
@@ -142,7 +148,7 @@ internal class BackstopWorker(
         }
 
         fun cancel(context: Context) {
-            WorkManager.getInstance(context).cancelUniqueWork(NAME)
+            WorkManagerAccess.get(context).cancelUniqueWork(NAME)
         }
 
         private const val MIN_BACKOFF_SECONDS = 30L
@@ -203,7 +209,7 @@ internal class RestoreWorker(
                 .setConstraints(Constraints.NONE)
                 .build()
 
-            WorkManager.getInstance(context)
+            WorkManagerAccess.get(context)
                 .enqueueUniqueWork(NAME, ExistingWorkPolicy.REPLACE, request)
         }
 
@@ -223,7 +229,7 @@ internal class RestoreWorker(
                 .setConstraints(Constraints.NONE)
                 .build()
 
-            WorkManager.getInstance(context)
+            WorkManagerAccess.get(context)
                 .enqueueUniqueWork(NAME, ExistingWorkPolicy.REPLACE, request)
         }
 
@@ -239,7 +245,7 @@ internal class RestoreWorker(
          * noticed, up to two minutes later.
          */
         fun cancel(context: Context) {
-            WorkManager.getInstance(context).cancelUniqueWork(NAME)
+            WorkManagerAccess.get(context).cancelUniqueWork(NAME)
         }
     }
 }
@@ -285,7 +291,7 @@ internal class PruneWorker(
                 )
                 .build()
 
-            WorkManager.getInstance(context)
+            WorkManagerAccess.get(context)
                 .enqueueUniquePeriodicWork(NAME, ExistingPeriodicWorkPolicy.KEEP, request)
         }
     }
@@ -371,7 +377,7 @@ internal class LicenseCheckWorker(
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, BACKOFF_MINUTES, TimeUnit.MINUTES)
                 .build()
 
-            WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+            WorkManagerAccess.get(context).enqueueUniquePeriodicWork(
                 NAME,
                 // KEEP, like the backstop: re-enqueuing on every ready() would reset the
                 // 12-hour clock, and an app that is restarted often would never check.
