@@ -129,6 +129,28 @@
 -keep public class com.field360.tracker.motion.DeviceSensors { public protected *; }
 -keep public class com.field360.tracker.motion.MotionQuality { public protected *; }
 
+# The WorkManager seam the sibling artifacts link against.
+#
+# Not host API — @RestrictTo(LIBRARY_GROUP) — but `fieldtrack-sync` compiles against this
+# module's UNMINIFIED jar and links against the MINIFIED one, so the name is load-bearing
+# for exactly the same reason every entry above is. Without this rule R8 renamed it into
+# `tr.dev.core` while sync kept emitting `com.field360.tracker.work.WorkManagerAccess`, and
+# sync's own R8 pass failed the build with
+#
+#     Missing class com.field360.tracker.work.WorkManagerAccess
+#         (referenced from: void ...LogSyncWorker$Companion.cancel(android.content.Context))
+#
+# `-dontwarn` is the wrong answer here and worth naming as such, for the reason
+# consumer-rules.pro spells out about OkHttp: silencing the warning ships an AAR whose
+# workers throw NoClassDefFoundError on the first enqueue, in release only. A cross-module
+# call needs the callee's name to survive, not the warning to stop.
+#
+# Members are kept because the call is `WorkManagerAccess.get(context)` — INSTANCE and
+# get(Context) are both named at the sync call site. Everything else in this package
+# (SyncScheduler, Watchdog, the worker bodies) stays renamed: nothing in this object's
+# signature reaches them, so R8 still repackages them.
+-keep public class com.field360.tracker.work.WorkManagerAccess { public protected *; }
+
 # ── reflective entry points ─────────────────────────────────────────────────
 #
 # Instantiated by name by the framework, so the names must survive whatever the keep
