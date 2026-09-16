@@ -19,9 +19,13 @@ come from `gradle/libs.versions.toml`.
 | Kotlin | 2.4.10 | `kotlin` in the catalog. |
 | Android SDK | compileSdk 37 | `local.properties` → `sdk.dir`, or `ANDROID_HOME`. |
 
-`local.properties` is gitignored. It holds `sdk.dir` and, optionally, `MAPS_API_KEY` and
-`FIELDTRACK_LICENSE_URL`. Copy
+`local.properties` is gitignored. It holds `sdk.dir` and, optionally, the sample app's
+per-developer values such as `MAPS_API_KEY`. Copy
 [`local.properties.template`](../local.properties.template) and fill in what you need.
+
+[`configuration.properties`](../configuration.properties) is committed. It holds the
+product configuration every clone builds against — the licence API URL and the response
+public key that `fieldtrack-core` compiles in. The SDK does not read `local.properties`.
 
 ### Maps API key
 
@@ -53,10 +57,11 @@ part that makes a leak expensive rather than merely embarrassing.
 ### Licence API URL
 
 `fieldtrack-core` reads the licence API root at configuration time and injects it as
-`BuildConfig.LICENSE_BASE_URL`, which `LicenseConfig.defaultBaseUrl` returns:
+`BuildConfig.LICENSE_BASE_URL`, which `LicenseConfig.defaultBaseUrl` returns. It comes from
+the committed `configuration.properties` at the repository root:
 
 ```properties
-# local.properties
+# configuration.properties
 FIELDTRACK_LICENSE_URL=https://licence.example.com/api/v1
 ```
 
@@ -67,22 +72,25 @@ Resolution order, first non-null wins:
 
 | Source | For |
 |---|---|
-| `-PfieldtrackLicenseUrl=...` | CI, JitPack, one-off builds |
-| `FIELDTRACK_LICENSE_URL` environment variable | CI secrets |
-| `FIELDTRACK_LICENSE_URL` in `local.properties` | local development |
+| `-PfieldtrackLicenseUrl=...` | one-off builds |
+| `FIELDTRACK_LICENSE_URL` environment variable | CI overrides |
+| `FIELDTRACK_LICENSE_URL` in `configuration.properties` | every clone, CI and JitPack — the source of truth |
 | `FieldTrackLicenseUrl` manifest meta-data | per-install override, takes precedence over all of the above at runtime |
 
-Unset is a supported state and the default. With no URL the transport makes no request,
-the check returns `CarryOn`, and every start proceeds.
+**The SDK does not read `local.properties`.** A `FIELDTRACK_LICENSE_URL` typed there does
+nothing. This is deliberate: the URL is product configuration that the whole team and every
+CI runner build against, and a per-machine override is how one laptop ships an AAR pointed
+somewhere nobody tested. `FIELDTRACK_RESPONSE_KEY` follows the same rule.
 
-**`local.properties` keeps the URL out of version control, not out of the artifact.** It is
-compiled into `BuildConfig` and readable in any published AAR or installed APK, the same as
-the two compiled-in public keys. That is the correct trade for an endpoint the device has to
-reach — but it means this mechanism is not a place for a credential of any kind.
+Blank is a supported state. With no URL the transport makes no request, the check returns
+`CarryOn`, and every start proceeds. It is not the default any more, because the committed
+file carries a value — but a blank resolution still does not fail the build, so
+`fieldtrack-core` logs a warning naming the blank key at configuration time.
 
-The Gradle property and environment variable are not conveniences. **CI and JitPack have no
-`local.properties`, so a release built without one of them ships with the revocation check
-inert and nothing in the build output says so** — it looks exactly like a successful build.
+The URL is compiled into `BuildConfig` and readable in any published AAR or installed APK,
+the same as the compiled-in public key. That is the correct trade for an endpoint the device
+has to reach, and it is why committing it costs nothing — but it means this mechanism is
+not a place for a credential of any kind.
 
 ---
 

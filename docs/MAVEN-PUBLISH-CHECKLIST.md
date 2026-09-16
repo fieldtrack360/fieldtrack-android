@@ -28,20 +28,20 @@ retry.
 
 ## 1. Verify license configuration is present
 
-The three license values are compiled into `fieldtrack-core`'s `BuildConfig` at build
+The two license values are compiled into `fieldtrack-core`'s `BuildConfig` at build
 time. **A blank value does not fail the build** — it silently ships an AAR with the
-license layer inert (blank keys make every non-debuggable host build fail the offline
-gate). Check `local.properties` contains all three before building:
+license layer inert; the only signal is a `fieldtrack-core: … is blank` warning at
+configuration time. Check the committed `configuration.properties` at the repository root
+carries both before building:
 
 ```properties
 FIELDTRACK_LICENSE_URL=https://licence.example.com/api/v1
-FIELDTRACK_LICENSE_KEYS=1:MCowBQ...
 FIELDTRACK_RESPONSE_KEY=Base64OfThirtyTwoRawBytes=
 ```
 
-Resolution order (first non-blank wins): Gradle property (`-PfieldtrackLicenseUrl`,
-`-PfieldtrackLicenseKeys`, `-PfieldtrackResponseKey`) → environment variable →
-`local.properties`.
+Resolution order (first non-null wins): Gradle property (`-PfieldtrackLicenseUrl`,
+`-PfieldtrackResponseKey`) → environment variable → `configuration.properties`.
+`local.properties` is not consulted by the SDK — a value there does nothing.
 
 Quick sanity check that the URL actually landed in the artifact (run after step 3):
 
@@ -180,7 +180,7 @@ command.)
 | POM version is `0.1.1-alpha01` when you expected another | `-Pversion` not passed; catalog `traker` version is the default | Pass `-Pversion=...` |
 | Publish "succeeds" but nothing reaches the remote | `trakerMavenUrl` not set — remote repo is only added when configured | Set `-PtrakerMavenUrl` / `TRAKER_MAVEN_URL` |
 | 401/403 on remote publish | Missing/expired token, or token lacks `write:packages` | Regenerate token, pass `-PtrakerMavenUser` / `-PtrakerMavenToken` |
-| AAR ships with license layer inert | Blank `FIELDTRACK_LICENSE_URL` / keys at build time | Fill `local.properties` (step 1) and rebuild before publishing |
+| AAR ships with license layer inert | Blank `FIELDTRACK_LICENSE_URL` / `FIELDTRACK_RESPONSE_KEY` at build time | Fill `configuration.properties` (step 1) and rebuild before publishing |
 | `verifyReleaseObfuscation` fails | Release AAR not minified, or sources leaked into javadoc jar | Check `isMinifyEnabled = true` and the javadoc jar contents |
 | `javaDocReleaseGeneration` fails: `PermittedSubclasses requires ASM9` | Sealed Kotlin types compiled at jvmTarget 17+; AGP's embedded Dokka cannot read the attribute | Library modules must use `libs.versions.javaBytecode` (11) for `jvmTarget`/`compileOptions`, never `javaTarget` |
 | Group is `com.github.fieldtrack360` (no `.fieldtrack`) | Something overrode the group | Group is hardcoded in `gradle/publish.gradle.kts`; `-Pgroup` is deliberately ignored |

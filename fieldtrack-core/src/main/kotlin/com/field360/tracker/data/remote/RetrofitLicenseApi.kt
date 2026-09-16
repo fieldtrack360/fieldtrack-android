@@ -50,7 +50,7 @@ internal class RetrofitLicenseApi(
      *
      * `Retrofit.Builder().baseUrl(...)` throws on a malformed URL, and this is constructed
      * from a build property that a human typed. Throwing at graph-construction time would
-     * turn a typo in `local.properties` into a crash at launch, in a layer whose entire
+     * turn a typo in `configuration.properties` into a crash at launch, in a layer whose entire
      * contract is to fail open.
      */
     private val service: LicenseService? by lazy {

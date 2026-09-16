@@ -10,42 +10,68 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
 }
 
-val localProperties: Properties = Properties().apply {
-    val file = rootProject.file("local.properties")
+/**
+ * The committed, shared build configuration — the one file every clone, CI runner and
+ * JitPack build reads, so all of them compile against the same endpoints.
+ *
+ * `local.properties` is deliberately NOT consulted by this module. It is per-machine and
+ * gitignored, and a per-machine override is exactly how one laptop ships an AAR pointed
+ * somewhere nobody tested. Nothing this module compiles in is a credential, so there is
+ * nothing here that needs to stay out of version control.
+ */
+val configurationProperties: Properties = Properties().apply {
+    val file = rootProject.file("configuration.properties")
     if (file.exists()) file.inputStream().use { load(it) }
 }
 
 /**
- * Gradle property, then environment variable, then `local.properties`. The first two exist
- * because CI and JitPack have no `local.properties`; without them a release built there
- * ships with the licence layer inert and **nothing in the build output says so**.
+ * Gradle property, then environment variable, then `configuration.properties`. The first
+ * two exist for one-off builds and CI overrides, not because the file might be missing —
+ * it is committed, so a checkout without it is broken rather than unconfigured.
+ *
+ * Blank counts as absent at every step, so an empty `-P` or an exported-but-empty
+ * environment variable does not shadow the committed value below it.
  */
-fun secret(gradleProperty: String, key: String): String =
-    providers.gradleProperty(gradleProperty).orNull
-        ?: providers.environmentVariable(key).orNull
-        ?: localProperties.getProperty(key, "")
+fun productConfig(gradleProperty: String, key: String): String =
+    providers.gradleProperty(gradleProperty).orNull?.takeIf { it.isNotBlank() }
+        ?: providers.environmentVariable(key).orNull?.takeIf { it.isNotBlank() }
+        ?: configurationProperties.getProperty(key, "")
 
 /**
  * The licence API root, e.g. `https://licence.example.com/api/v1`.
  *
- * **This keeps the URL out of version control, not out of the artifact.** It is compiled
- * into BuildConfig and is readable in any published AAR or installed APK, exactly like the
- * two public keys below it. That is fine — an endpoint the device has to reach is not a
- * secret, and nothing here should ever be a credential.
+ * Product configuration, not a secret. It is compiled into BuildConfig and is readable in
+ * any published AAR or installed APK, exactly like the public key below it. That is fine —
+ * an endpoint the device has to reach cannot be hidden from the device, which is why it
+ * lives in the committed file rather than a gitignored one. Nothing resolved here should
+ * ever be a credential.
  *
- * Blank is a supported state and the default: `LicenseConfig.baseUrl` falls back to the
- * host manifest, and with neither set the revocation check makes no request at all.
+ * Blank is a supported state: `LicenseConfig.baseUrl` falls back to the host manifest, and
+ * with neither set the revocation check makes no request at all.
  */
-val licenseBaseUrl: String = secret("fieldtrackLicenseUrl", "FIELDTRACK_LICENSE_URL")
+val licenseBaseUrl: String = productConfig("fieldtrackLicenseUrl", "FIELDTRACK_LICENSE_URL")
 
 /**
  * The key that verifies `/verify` **responses**, standard base64 of 32 raw bytes.
  *
- * A different key from the one above, deliberately: one authenticates what we issued, the
- * other authenticates what the server says about it today. Blank leaves the online check
- * inert — no request is made and no response is ever trusted.
+ * A public key, so it belongs in the committed file for the same reason the URL does.
+ * Blank leaves the online check inert — no request is made and no response is ever
+ * trusted — which is why a blank resolution is reported below instead of passing silently.
  */
-val licenseResponseKey: String = secret("fieldtrackResponseKey", "FIELDTRACK_RESPONSE_KEY")
+val licenseResponseKey: String = productConfig("fieldtrackResponseKey", "FIELDTRACK_RESPONSE_KEY")
+
+// A blank value does not fail the build — it ships an AAR with the licence layer inert, and
+// nothing else in the build output says so. Name it here so it is at least visible.
+listOf(
+    "FIELDTRACK_LICENSE_URL" to licenseBaseUrl,
+    "FIELDTRACK_RESPONSE_KEY" to licenseResponseKey,
+).filter { (_, value) -> value.isBlank() }.forEach { (key, _) ->
+    logger.warn(
+        // ASCII only: this line lands in CI logs and Windows consoles that mangle anything else.
+        "fieldtrack-core: $key is blank; the licence revocation check will be inert in " +
+            "this build. Set it in configuration.properties, or override with -P / the environment.",
+    )
+}
 
 
 android {

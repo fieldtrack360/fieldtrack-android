@@ -76,6 +76,10 @@ abstract class VerifyReleaseObfuscationTask : DefaultTask() {
                     "com/field360/tracker/domain/model/TrackSession.class",
                     "com/field360/tracker/motion/DeviceSensors.class",
                     "com/field360/tracker/permission/PermissionManager.class",
+                    // The cross-module WorkManager seam. Not host API, but fieldtrack-sync links
+                    // against this name after R8 — stripping it fails sync's own minify pass, which
+                    // is how it surfaced the first time.
+                    "com/field360/tracker/work/WorkManagerAccess.class",
                 ),
                 "tr/dev/core/",
             ),
