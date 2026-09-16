@@ -78,6 +78,12 @@ public class StartTrackingUseCase internal constructor(
      */
     private val launcher: CaptureLauncher,
     /**
+     * Held for the whole transition below. See [CaptureLifecycleLock] for the race it
+     * closes — in one line: the service this starts runs [ResumeCaptureUseCase] on its own
+     * thread, and without the lock that path launches a second pipeline alongside this one.
+     */
+    private val lifecycle: CaptureLifecycleLock,
+    /**
      * Applies the parts of the config that are wired rather than passed: the provider
      * selection [LocationSource] routes on, and the engine constants the accuracy meter
      * moves. A lambda supplied by the graph, because both targets sit in layers this use
@@ -185,68 +191,82 @@ public class StartTrackingUseCase internal constructor(
         // NonCancellable does not keep a dying process alive — nothing can. It removes the
         // *cooperative* half of the race, which is the half that needs no OEM at all.
         return withContext(NonCancellable) {
-            // `restartFollows`, because the `TrackingService.start` below is the very next
-            // thing this does. It keeps the stop on the abrupt `stopService` route, where
-            // a start issued immediately behind it cannot be swallowed by the stop's own
-            // `stopSelf` — see `TrackingService.stop`.
-            val superseded = teardown(restartFollows = true)
-            if (superseded != null) {
+            // Held from the teardown through the launch. The service started below runs
+            // `ResumeCaptureUseCase` on its own thread the moment it is up, and that path
+            // judges "is a pipeline missing" by `FixIngestor.isRunning` — false until
+            // `launcher.launch` below is most of the way through. Without this it launched a
+            // second pipeline next to ours; see `CaptureLifecycleLock`.
+            lifecycle.withTransition {
+                // `restartFollows`, because the `TrackingService.start` below is the very
+                // next thing this does. It keeps the stop on the abrupt `stopService` route,
+                // where a start issued immediately behind it cannot be swallowed by the
+                // stop's own `stopSelf` — see `TrackingService.stop`.
+                val superseded = teardown(restartFollows = true)
+                if (superseded != null) {
+                    events.tryEmit(
+                        TrackerEvent.Diagnostic(
+                            "session ${superseded.id} superseded by a new start(); its " +
+                                "service and workers were stopped",
+                        ),
+                    )
+                }
+
+                // THE FIRST THING THAT HAPPENS AFTER TEARDOWN, and it used to be the last
+                // thing in the whole function.
+                //
+                // The platform gives the app a short window in which starting a foreground
+                // service from a recent-foreground state is legal, and the window is
+                // measured from the user's interaction, not from this call. Everything that
+                // used to run ahead of it spent that window: a Room read and insert in
+                // `sessions.open`, then `launcher.launch` registering a location request,
+                // activity-recognition transitions, a step sensor and a significant-motion
+                // wake — binder calls, each a suspension point, on a cold-started process
+                // whose disk is contended.
+                //
+                // Ordering it here costs nothing, because the service does not need the
+                // session row: `onStartCommand` promotes with the *in-memory* config and
+                // `startSupervision` reads the rest off disk a moment later. If the process
+                // dies between here and the session row below, the service comes up, finds
+                // no open session, and stops itself at the first health-loop tick — the
+                // same tidy outcome as today, reached without losing the ones that would
+                // have survived.
+                //
+                // The service's own resume path cannot launch a pipeline in the meantime:
+                // it backs off while this holds the lifecycle lock, and by the time the lock
+                // is free `launcher.launch` below has made `isRunning` true.
+                //
+                // It cannot move above `teardown()`: that call ends in `TrackingService.stop`,
+                // which would stop the instance we had just asked for.
+                val promoted = TrackingService.start(context, config.service)
                 events.tryEmit(
                     TrackerEvent.Diagnostic(
-                        "session ${superseded.id} superseded by a new start(); its service " +
-                            "and workers were stopped",
+                        if (promoted) {
+                            "foreground service requested before the session row was written"
+                        } else {
+                            "foreground service REFUSED at start(); tracking will depend on " +
+                                "the restore path — check Autostart/battery settings on this " +
+                                "device"
+                        },
                     ),
                 )
+
+                val session = sessions.open(tag, configStore.encode(config))
+
+                // The whole pipeline, in one call, shared with the resume path. Arming the
+                // gate is the last thing it does, which is why `isCapturing` is readable
+                // immediately after this returns: a session opened while location was
+                // switched off is already reported as suspended rather than claiming a
+                // capture that is not running.
+                //
+                // Deliberately not a start() gate: refusing to open a session because the
+                // GPS is off would strand a host that starts tracking from a background
+                // trigger — the session is the record, and the record should exist with a
+                // documented gap in it rather than not exist at all.
+                launcher.launch(session, config)
+
+                events.tryEmit(TrackerEvent.EnabledChange(enabled = true))
+                TrackerResult.Ok(session)
             }
-
-            // THE FIRST THING THAT HAPPENS AFTER TEARDOWN, and it used to be the last thing
-            // in the whole function.
-            //
-            // The platform gives the app a short window in which starting a foreground
-            // service from a recent-foreground state is legal, and the window is measured
-            // from the user's interaction, not from this call. Everything that used to run
-            // ahead of it spent that window: a Room read and insert in `sessions.open`,
-            // then `launcher.launch` registering a location request, activity-recognition
-            // transitions, a step sensor and a significant-motion wake — binder calls, each
-            // a suspension point, on a cold-started process whose disk is contended.
-            //
-            // Ordering it here costs nothing, because the service does not need the session
-            // row: `onStartCommand` promotes with the *in-memory* config and
-            // `startSupervision` reads the rest off disk a moment later. If the process dies
-            // between here and the session row below, the service comes up, finds no open
-            // session, and stops itself at the first health-loop tick — the same tidy
-            // outcome as today, reached without losing the ones that would have survived.
-            //
-            // It cannot move above `teardown()`: that call ends in `TrackingService.stop`,
-            // which would stop the instance we had just asked for.
-            val promoted = TrackingService.start(context, config.service)
-            events.tryEmit(
-                TrackerEvent.Diagnostic(
-                    if (promoted) {
-                        "foreground service requested before the session row was written"
-                    } else {
-                        "foreground service REFUSED at start(); tracking will depend on the " +
-                            "restore path — check Autostart/battery settings on this device"
-                    },
-                ),
-            )
-
-            val session = sessions.open(tag, configStore.encode(config))
-
-            // The whole pipeline, in one call, shared with the resume path. Arming the gate
-            // is the last thing it does, which is why `isCapturing` is readable immediately
-            // after this returns: a session opened while location was switched off is
-            // already reported as suspended rather than claiming a capture that is not
-            // running.
-            //
-            // Deliberately not a start() gate: refusing to open a session because the GPS is
-            // off would strand a host that starts tracking from a background trigger — the
-            // session is the record, and the record should exist with a documented gap in it
-            // rather than not exist at all.
-            launcher.launch(session, config)
-
-            events.tryEmit(TrackerEvent.EnabledChange(enabled = true))
-            TrackerResult.Ok(session)
         }
     }
 }
@@ -263,6 +283,9 @@ public class StartTrackingUseCase internal constructor(
  * A single definition rather than two similar ones on purpose: a teardown that is nearly
  * the same in two places is a teardown that will differ in one of them after the next edit,
  * and the thing that leaks is a foreground service the user can see.
+ *
+ * Takes no lock of its own. Both callers run it under [CaptureLifecycleLock], which is
+ * non-reentrant — so the lock is theirs to hold, and this stays callable from inside it.
  */
 internal class SessionTeardown(
     private val sessions: SessionRepository,
@@ -369,9 +392,14 @@ public class StopTrackingUseCase internal constructor(
     private val teardown: SessionTeardown,
     private val syncScheduler: SyncScheduler,
     private val events: MutableSharedFlow<TrackerEvent>,
+    /** Shared with `start()` and the resume path — see [CaptureLifecycleLock]. */
+    private val lifecycle: CaptureLifecycleLock,
 ) {
     public suspend operator fun invoke(): TrackerResult<TrackSession?> {
-        val closed = teardown()
+        // Under the lock so a revival that has just read `sessions.current()` cannot launch
+        // a pipeline for the session this is about to close, and so a `start()` in flight
+        // finishes before this tears its work down rather than halfway through it.
+        val closed = lifecycle.withTransition { teardown() }
 
         // After the close, and after the backstop is already cancelled: every supervision
         // path in core has now stopped, so this is the last chance to leave a

@@ -85,9 +85,10 @@ internal class CaptureLauncher(
      *
      * Idempotent in the only sense that matters: [FixIngestor.start] and
      * [LocationStreamController.start] both cancel whatever they were running first, so a
-     * second call re-arms rather than stacking. It is still the caller's job not to make
-     * one — `start()` tears the previous session down first, and [ResumeCaptureUseCase]
-     * checks [FixIngestor.isRunning].
+     * *sequential* second call re-arms rather than stacking. Two **concurrent** calls are
+     * not safe — each cancels the same previous job and then registers its own — which is
+     * why every caller runs under [CaptureLifecycleLock]: `start()` holds it across the
+     * whole transition, and [ResumeCaptureUseCase] only proceeds when it is free.
      */
     suspend fun launch(session: TrackSession, config: TrackerConfig) {
         ingestor.mockPolicy = config.geolocation.mockLocationPolicy
@@ -251,6 +252,14 @@ internal class CaptureLauncher(
  * running. [FixIngestor.isRunning] is the test, and it is the same field that separates
  * "start() called twice" from "a session survived the process that was recording it".
  *
+ * **Also a no-op while a `start()` or `stop()` is mid-flight.** `start()` issues the service
+ * command before it launches the pipeline, so the first start command of every session
+ * lands here with `isRunning` still false and the session row possibly already written —
+ * indistinguishable, from this side, from a pipeline lost to process death. The
+ * [CaptureLifecycleLock] is what tells them apart: a start or stop holds it for its whole
+ * transition, and this backs off without waiting when it finds it taken. See that class
+ * for the double launch this prevented.
+ *
  * **Never opens or closes a session.** A session it cannot resume — permission revoked
  * while the process was dead, no persisted config — is left open and reported, exactly as
  * a mid-session revocation is (EC-07). Deciding a drive is over is the host's call.
@@ -260,6 +269,7 @@ internal class ResumeCaptureUseCase(
     private val configRepository: ConfigRepository,
     private val ingestor: FixIngestor,
     private val launcher: CaptureLauncher,
+    private val lifecycle: CaptureLifecycleLock,
     private val permissions: PermissionManager,
     private val providerStateMonitor: ProviderStateMonitor,
     private val events: MutableSharedFlow<TrackerEvent>,
@@ -270,6 +280,17 @@ internal class ResumeCaptureUseCase(
 
     /** @return true if this call actually restarted a dead pipeline. */
     suspend operator fun invoke(): Boolean {
+        // Cheap and lock-free, for the ordinary start command on a healthy session.
+        if (ingestor.isRunning) return false
+        // `ifIdle`, never `withTransition`: this runs inside the service's supervision
+        // coroutine, and a transition in progress means the answer is already decided — a
+        // start is about to launch the pipeline itself, a stop is about to close the
+        // session. Waiting would only stall supervision behind a host call.
+        return lifecycle.ifIdle { resume() } ?: false
+    }
+
+    private suspend fun resume(): Boolean {
+        // Re-checked under the lock: a start that held it a moment ago has launched by now.
         if (ingestor.isRunning) return false
         val session = sessions.current() ?: return false
 

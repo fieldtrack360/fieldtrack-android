@@ -43,6 +43,7 @@ import com.field360.tracker.domain.repository.PendingUploadStore
 import com.field360.tracker.domain.repository.SessionRepository
 import com.field360.tracker.domain.repository.TrackPointRepository
 import com.field360.tracker.domain.usecase.CaptureLauncher
+import com.field360.tracker.domain.usecase.CaptureLifecycleLock
 import com.field360.tracker.domain.usecase.ResolveConfigUseCase
 import com.field360.tracker.domain.usecase.ResumeCaptureUseCase
 import com.field360.tracker.domain.usecase.SessionTeardown
@@ -440,6 +441,12 @@ internal class TrackerGraph private constructor(
     // ── use cases ───────────────────────────────────────────────────────────
 
     /**
+     * Serialises `start()`, `stop()` and the service's resume path. One instance, because
+     * those three race each other and nothing else — see `CaptureLifecycleLock`.
+     */
+    val captureLifecycle: CaptureLifecycleLock by lazy { CaptureLifecycleLock() }
+
+    /**
      * The one teardown, shared by `stop()` and by the start path's "only one session at a
      * time" rule.
      */
@@ -496,6 +503,7 @@ internal class TrackerGraph private constructor(
             configRepository = config,
             ingestor = ingestor,
             launcher = captureLauncher,
+            lifecycle = captureLifecycle,
             permissions = permissions,
             providerStateMonitor = providerStateMonitor,
             events = events,
@@ -516,6 +524,7 @@ internal class TrackerGraph private constructor(
             context = context,
             events = events,
             launcher = captureLauncher,
+            lifecycle = captureLifecycle,
             applyConfig = ::applyConfig,
         )
     }
@@ -538,6 +547,7 @@ internal class TrackerGraph private constructor(
             teardown = sessionTeardown,
             syncScheduler = syncScheduler,
             events = events,
+            lifecycle = captureLifecycle,
         )
     }
 
