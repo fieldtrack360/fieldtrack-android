@@ -75,3 +75,6 @@ $RECYCLE.BIN/
 keystore.properties
 secrets.properties
 /.artifacts
+
+# Per-developer Firebase project for the sample (FCM remote wake)
+sample-android/google-services.json

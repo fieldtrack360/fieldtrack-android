@@ -1,6 +1,7 @@
 package com.field360.tracker
 
 import android.content.Context
+import androidx.annotation.WorkerThread
 import com.field360.tracker.capture.FixIngestor
 import com.field360.tracker.capture.LiveTrackFeed
 import com.field360.tracker.capture.OneShotProvider
@@ -14,6 +15,8 @@ import com.field360.tracker.domain.model.TrackerGeofence
 import com.field360.tracker.domain.model.TrackerGeofenceEvent
 import com.field360.tracker.domain.model.TrackerEvent
 import com.field360.tracker.domain.model.TrackerResult
+import com.field360.tracker.domain.model.WakeResult
+import com.field360.tracker.service.RemoteWake
 import com.field360.tracker.domain.model.TrackerState
 import com.field360.tracker.domain.model.TrackSession
 import com.field360.tracker.data.db.RawFixDao
@@ -886,6 +889,31 @@ public class Tracker internal constructor(
          */
         @JvmStatic
         public fun getInstance(context: Context): Tracker = TrackerGraph.get(context).trackIt
+
+        /**
+         * Remote wake: call from `FirebaseMessagingService.onMessageReceived` when the
+         * server sends a high-priority data message for a device that has gone quiet.
+         *
+         * - Service alive → forces a fix and an upload ([WakeResult.ALIVE]).
+         * - Session open, service dead → starts the service ([WakeResult.REVIVED]); a
+         *   high-priority FCM message is an API 31+ exemption for doing that from the
+         *   background. Refused → the counted restore path is queued
+         *   ([WakeResult.REFUSED]).
+         * - No session → nothing ([WakeResult.NO_SESSION]). A wake never starts one.
+         *
+         * Blocks for one database read, bounded at a few seconds, so call it off the main
+         * thread — `onMessageReceived` already is. A main-thread call does not block; it
+         * dispatches and returns [WakeResult.DISPATCHED].
+         *
+         * Safe in a cold process and before [ready]: it only acts on a session already on
+         * disk. The result is also emitted as a `remote wake: <result>` diagnostic.
+         *
+         * Does not help an app the OEM has force-stopped — Android does not deliver FCM to
+         * a stopped package. Battery-optimisation exemption is still required for that.
+         */
+        @JvmStatic
+        @WorkerThread
+        public fun wake(context: Context): WakeResult = RemoteWake.wake(context)
     }
 
 }

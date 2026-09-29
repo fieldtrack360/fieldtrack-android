@@ -81,30 +81,61 @@ internal class StationaryFence(
             .fold(onSuccess = { registrations.size }, onFailure = { null })
     }
 
-    /** Fire-and-observe path used by the motion controller, which is not suspend-based. */
+    /**
+     * Fire-and-observe path used by the motion controller, which is not suspend-based.
+     *
+     * The store row is written BEFORE the system call, not in its success listener. The
+     * listener used to own the write, and every way it could miss left Play Services
+     * holding a fence the store did not know: a process killed between the call and the
+     * callback, or an [unregister] whose success listener landed after this one's and
+     * deleted the row just written. The receiver then saw the exit as
+     * `unknown_geofence:fieldtrack-stationary` and dropped the one wake a parked, killed
+     * process has — the tracker stayed STATIONARY through the drive that followed.
+     */
     @SuppressLint("MissingPermission") // StartTrackingUseCase already gates permission.
     override fun register(geofence: TrackerGeofence): Boolean {
+        store.put(RegisteredGeofence(geofence, isStationaryWakeFence = true))
         return runCatching { client.addGeofences(requestFor(geofence), pendingIntent) }
             .onSuccess { task ->
                 task.addOnSuccessListener {
-                    store.put(RegisteredGeofence(geofence, isStationaryWakeFence = true))
                     events.tryEmit(TrackerEvent.GeofenceAdded(geofence))
-                }.addOnFailureListener(::reportRegistrationFailure)
+                }.addOnFailureListener { error ->
+                    forgetFailedRegistration(geofence)
+                    reportRegistrationFailure(error)
+                }
             }
-            .onFailure(::reportRegistrationFailure)
+            .onFailure { error ->
+                forgetFailedRegistration(geofence)
+                reportRegistrationFailure(error)
+            }
             .isSuccess
     }
 
+    /**
+     * Row removed synchronously, system fence removed unconditionally.
+     *
+     * Synchronous so an unregister → register pair resolves in call order on disk, whatever
+     * order Play Services completes them in. Unconditional because a missing row is not
+     * proof there is no system fence — that mismatch is exactly the failure [register]
+     * describes, and skipping the removal is how the fence outlived its session.
+     * `removeGeofences` on an unknown id is a successful no-op.
+     */
     override fun unregister(id: String): Boolean {
-        val registration = store.registration(id) ?: return true
+        val registration = store.remove(id)
         return runCatching { client.removeGeofences(listOf(id)) }
             .onSuccess { task ->
-                task.addOnSuccessListener {
-                    store.remove(id)
-                    events.tryEmit(TrackerEvent.GeofenceRemoved(registration.geofence.id))
+                if (registration != null) {
+                    task.addOnSuccessListener {
+                        events.tryEmit(TrackerEvent.GeofenceRemoved(registration.geofence.id))
+                    }
                 }
             }
             .isSuccess
+    }
+
+    /** Only if the row is still this attempt's — a newer [register] may have replaced it. */
+    private fun forgetFailedRegistration(geofence: TrackerGeofence) {
+        if (store.registration(geofence.id)?.geofence == geofence) store.remove(geofence.id)
     }
 
     private fun requestFor(geofence: TrackerGeofence): GeofencingRequest {

@@ -264,6 +264,32 @@ is the SDK's own verdict on the three fields above it:
 `step_detector` and `step_counter`, so a `false` on either could mean *no sensor* or *no
 permission* — a different phone and a prompt are not the same remedy.
 
+One `lifecycle` row per **process** marks a restart mid-session: `code: "process_start"`,
+`tag: "Session"`, level **`warn`**. It is written when the host configures the log channel in a
+process that starts while a session is already open — so the process that was recording that
+session is gone. On Android 11+ it carries how Android says the previous process ended:
+
+```jsonc
+{ "phase": "process_start",
+  "previous_exit_reason": "OTHER",          // ApplicationExitInfo.REASON_* as a name
+  "previous_exit_time_ms": 1790307308000,   // when it died, wall clock
+  "previous_exit_description": "…",         // platform/OEM text, may be absent
+  "previous_exit_importance": 125,          // 125 = foreground service at the time
+  "previous_exit_status": 0,
+  "previous_exit_process": "com.acme.field" }
+```
+
+`OTHER` and `SIGNALED` are what OEM battery managers (vivo, OPPO/realme, Xiaomi, OnePlus)
+usually leave behind; `USER_REQUESTED` is a force stop or a recents swipe the ROM treats as one;
+`LOW_MEMORY` is the kernel. The gap on the track runs from the last point before
+`previous_exit_time_ms` to the first point after this row. Below Android 11 the row is written
+without the `previous_exit_*` fields.
+
+Entries emitted **before** the log channel attached in a process — in a revived process that is
+"capture resumed for session … after the process was killed" and its `session_start` — are held
+by the SDK and written once it attaches, stamped with the instant they happened rather than the
+instant they were written.
+
 One `lifecycle` row per session is **not** from the device: `code: "DEVICE_INFO"`, `tag:
 "Device"`, `seq: -1`, the hardware line of §3. Its `data` is the envelope's two metadata blocks
 verbatim, under a marker saying where it came from.

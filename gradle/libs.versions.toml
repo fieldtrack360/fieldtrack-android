@@ -48,6 +48,10 @@ gson = "2.11.0"
 # Ed25519 below API 33. java.security only gained it at 33 and minSdk is 26, so the
 # licence gate needs its own implementation — see license/Ed25519.kt.
 tink = "1.13.0"
+# Sample app only — the SDK never depends on Firebase. 33.x, not 34.x: kept on the same
+# Kotlin-2.1-readable / compileSdk-36 baseline as everything above.
+firebaseBom = "33.16.0"
+googleServices = "4.4.3"
 # Lint tooling tracks AGP with a +23 major offset (AGP 8.11.0 -> lint 31.11.0).
 lint = "31.11.0"
 
@@ -100,6 +104,10 @@ androidx-work-testing = { module = "androidx.work:work-testing", version.ref = "
 play-services-location = { module = "com.google.android.gms:play-services-location", version.ref = "playServicesLocation" }
 play-services-maps = { module = "com.google.android.gms:play-services-maps", version.ref = "playServicesMaps" }
 
+# --- Firebase (sample-android only: remote wake via FCM) ---
+firebase-bom = { module = "com.google.firebase:firebase-bom", version.ref = "firebaseBom" }
+firebase-messaging = { module = "com.google.firebase:firebase-messaging" }
+
 # --- Licensing ---
 gson = { module = "com.google.code.gson:gson", version.ref = "gson" }
 tink-android = { module = "com.google.crypto.tink:tink-android", version.ref = "tink" }
@@ -142,3 +150,4 @@ ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }
 # on the same file — see fieldtrack-core/build.gradle.kts.
 room = { id = "androidx.room", version.ref = "room" }
 compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+google-services = { id = "com.google.gms.google-services", version.ref = "googleServices" }

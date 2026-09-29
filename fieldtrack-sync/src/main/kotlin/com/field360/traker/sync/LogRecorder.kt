@@ -14,6 +14,8 @@ import com.field360.traker.sync.data.db.LogCounterRow
 import com.field360.traker.sync.data.db.LogDao
 import com.field360.traker.sync.data.db.LogEntryRow
 import com.field360.traker.sync.data.db.seqKey
+import com.field360.traker.sync.internal.EarlyEvent
+import com.field360.traker.sync.internal.ProcessExit
 import com.field360.traker.sync.internal.isJsonStructure
 import com.field360.traker.sync.internal.jsonObjectOrNull
 import com.field360.traker.sync.internal.logEntryId
@@ -23,9 +25,13 @@ import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.onSubscription
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.util.Collections
+import java.util.IdentityHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Writes the diagnostic buffer.
@@ -113,6 +119,19 @@ internal class LogRecorder(
      * describes, so it resolves the session itself.
      */
     private val openSessionId: suspend () -> String? = { sessionId() },
+    /**
+     * The events this process emitted before [attach] subscribed, each with its own
+     * instant — core's `EarlyEventBuffer`, drained once. Empty in tests and whenever core
+     * has already handed them over.
+     */
+    private val earlyEvents: () -> List<EarlyEvent> = { emptyList() },
+    /** How the previous process of this app ended, or `null` below Android 11. */
+    private val lastProcessExit: () -> ProcessExit? = { null },
+    /**
+     * Whether [configure] writes the `process_start` entry. On in the production wiring;
+     * off by default so a test about something else does not see it.
+     */
+    private val recordsProcessStart: Boolean = false,
 ) {
 
     @Volatile
@@ -157,6 +176,9 @@ internal class LogRecorder(
      */
     private var locationRecordedFor: String? = null
 
+    /** Whether this process has written its `process_start` entry. */
+    private val processStartRecorded = AtomicBoolean(false)
+
     /** Serialises the check-then-write above; two start signals can race on it. */
     private val motionLock = Mutex()
 
@@ -172,6 +194,7 @@ internal class LogRecorder(
         this.onNudge = onNudge
         start()
         attach()
+        recordProcessStart()
         // For the host that calls `configureLogs()` *after* `start()`. The session-start
         // signal that normally carries these has already been and gone, and a session
         // missing its motion line is the one case this whole entry exists to cover.
@@ -520,25 +543,124 @@ internal class LogRecorder(
     private fun attach() {
         if (collector != null) return
         collector = scope.launch {
-            events.collect { event ->
-                event.toDraft()?.let(::submit)
-                // Launched rather than awaited: resolving the session is a store read, and
-                // a collector that blocks on one delays every entry queued behind it.
-                if (event is TrackerEvent.EnabledChange && event.enabled) {
-                    recordSessionMotion()
-                    recordSessionLocation()
-                }
+            // Identity, never equality: the flow hands every subscriber the same instance,
+            // and two equal `Diagnostic`s a minute apart are two facts.
+            val replayed: MutableSet<TrackerEvent> =
+                Collections.newSetFromMap(IdentityHashMap())
+            var deduplicating = true
 
-                // The other half, and the half that has no session behind it. A start
-                // refused at a gate emits one of these and returns — no session row, no
-                // EnabledChange, and until now nothing in the channel describing the
-                // device that refused. `force` because there is nothing to deduplicate
-                // against and every refusal is worth having.
-                if (event is TrackerEvent.Error && event.code in START_BLOCKING) {
-                    recordSessionLocation(force = true)
+            events
+                .onSubscription {
+                    // Only once the live subscription exists, so nothing falls between the
+                    // two. What the process emitted before this point was held by core
+                    // (`EarlyEventBuffer`) — in a revived process that is the "capture
+                    // resumed" line and the session start, which were otherwise lost.
+                    earlyEvents().forEach { early ->
+                        replayed += early.event
+                        handle(early.event, early)
+                    }
+                }
+                .collect { event ->
+                    // An event emitted between the subscription above and core's claim is in
+                    // both. Such events are the first this collector sees, so the first one
+                    // that is not a replay ends the overlap.
+                    if (deduplicating && event.toDraft() != null) {
+                        if (replayed.remove(event)) return@collect
+                        deduplicating = false
+                        replayed.clear()
+                    }
+                    handle(event, at = null)
+                }
+        }
+    }
+
+    /** @param at the instant a held event was emitted; `null` for a live one. */
+    private fun handle(event: TrackerEvent, at: EarlyEvent?) {
+        event.toDraft()
+            ?.let { draft ->
+                if (at == null) {
+                    draft
+                } else {
+                    draft.copy(timeMs = at.wallTimeMs, elapsedRealtimeNanos = at.elapsedRealtimeNanos)
                 }
             }
+            ?.let(::submit)
+        // Launched rather than awaited: resolving the session is a store read, and
+        // a collector that blocks on one delays every entry queued behind it.
+        if (event is TrackerEvent.EnabledChange && event.enabled) {
+            recordSessionMotion()
+            recordSessionLocation()
         }
+
+        // The other half, and the half that has no session behind it. A start
+        // refused at a gate emits one of these and returns — no session row, no
+        // EnabledChange, and until now nothing in the channel describing the
+        // device that refused. `force` because there is nothing to deduplicate
+        // against and every refusal is worth having.
+        if (event is TrackerEvent.Error && event.code in START_BLOCKING) {
+            recordSessionLocation(force = true)
+        }
+    }
+
+    /**
+     * Writes one `process_start` entry for this process, when it starts with a session
+     * already open — and how Android says the previous process ended.
+     *
+     * A session that is open when a process starts was being recorded by a process that
+     * is gone. Nothing else in the channel says so: the old process could not log its own
+     * death, and a host that calls `start()` on launch replaces the session before any
+     * resume path runs. On an OEM that kills the app with the screen off, this is the line
+     * that separates "the phone killed it at 08:55" from "the SDK stopped".
+     *
+     * `WARN`, so it survives the default level and prompts a drain. Once per process — the
+     * guard is in memory, which is the point.
+     */
+    private fun recordProcessStart() {
+        if (!recordsProcessStart || !processStartRecorded.compareAndSet(false, true)) return
+        scope.launch {
+            runCatching { writeProcessStart() }
+                .onFailure { sdkWarn { logger.w(TAG, "Process-start probe failed: ${it.message}") } }
+        }
+    }
+
+    private suspend fun writeProcessStart() {
+        val session = openSessionId() ?: return
+        val exit = lastProcessExit()
+        val nowMs = clock.wallTimeMs()
+        val message = buildString {
+            append("Process started with session $session open")
+            if (exit != null) {
+                append("; previous process ended ")
+                append((nowMs - exit.timestampMs).coerceAtLeast(0) / MILLIS_PER_MINUTE)
+                append(" min ago: ${exit.reason}")
+                exit.description?.takeIf { it.isNotBlank() }?.let { append(" ($it)") }
+            }
+        }
+        submit(
+            Draft(
+                sessionId = session,
+                timeMs = nowMs,
+                elapsedRealtimeNanos = clock.elapsedRealtimeNanos(),
+                level = LogLevel.WARN,
+                type = LogType.LIFECYCLE,
+                tag = TAG_SESSION,
+                code = LifecyclePhase.PROCESS_START,
+                message = message,
+                data = jsonObjectOrNull(
+                    buildMap {
+                        put("phase", LifecyclePhase.PROCESS_START)
+                        if (exit != null) {
+                            put("previous_exit_reason", exit.reason)
+                            put("previous_exit_time_ms", exit.timestampMs)
+                            put("previous_exit_description", exit.description)
+                            put("previous_exit_importance", exit.importance)
+                            put("previous_exit_status", exit.status)
+                            put("previous_exit_process", exit.processName)
+                        }
+                    },
+                ),
+            ),
+        )
     }
 
     private suspend fun write(draft: Draft) {
@@ -947,6 +1069,7 @@ internal class LogRecorder(
         const val INBOX_CAPACITY = 256
         const val UNSET_NANOS = Long.MIN_VALUE
         const val NANOS_PER_MILLI = 1_000_000L
+        const val MILLIS_PER_MINUTE = 60_000L
         const val DEFAULT_CAPACITY = 5_000
 
         /**

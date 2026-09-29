@@ -822,6 +822,7 @@ val tracker = Tracker.getInstance(context)   // @JvmStatic, idempotent, thread-s
 | `stop` | `suspend fun stop(): TrackerResult<TrackSession?>` | Closes the open session |
 | `state` | `val state: StateFlow<TrackerState>` | Coarse lifecycle state |
 | `events` | `val events: SharedFlow<TrackerEvent>` | Replay 0, unlimited subscribers |
+| `wake` | `@JvmStatic @WorkerThread fun Tracker.wake(context: Context): WakeResult` | **Static, on the companion.** Remote wake for a high-priority FCM message — forces a fix and an upload if the service is alive, restarts it if a session is open and the service is dead, does nothing otherwise. Safe in a cold process and before `ready()`. See [§12.4](#124-remote-wake--fcm) |
 
 ### 6.2 Location
 
@@ -1161,6 +1162,7 @@ data class PointQuery(
 | `PowerSource` | `NONE`, `AC`, `USB`, `WIRELESS`, `DOCK`, `UNKNOWN` |
 | `MotionQuality` | `FULL`, `DEGRADED`, `POOR` |
 | `GeofenceTransition` | `ENTER`, `EXIT` |
+| `WakeResult` | `ALIVE`, `REVIVED`, `REFUSED`, `NO_SESSION`, `DISABLED`, `DISPATCHED`, `TIMED_OUT` — see [§12.4](#124-remote-wake--fcm) |
 
 `ActivityType` is **enrichment only, never a capture gate** — some devices report entire
 17-minute drives as `STILL` under battery saver.
@@ -1411,8 +1413,13 @@ data class TrackerGeofenceEvent(
 )
 ```
 
-Constants: `TrackerGeofence.MAX_GEOFENCES = 19`, `DEFAULT_ID = "trackit-stationary"`,
+Constants: `TrackerGeofence.MAX_GEOFENCES = 19`, `DEFAULT_ID = "fieldtrack-stationary"`,
 `DEFAULT_ENTER_EVENT`, `DEFAULT_EXIT_EVENT`.
+
+**Do not reuse `DEFAULT_ID` (or your `motion.stationaryGeofenceId`) for a host fence.** That id
+is the SDK's stationary wake fence: an EXIT on it is how a parked, killed process learns the
+user has driven off. The SDK recognises it by id even when its own bookkeeping has lost the
+registration, so a host fence under the same id would be treated as the wake fence too.
 
 ---
 
@@ -1566,6 +1573,87 @@ missing you can see exactly which fixes were withheld and why.
 Requires an accelerometer. Without one the flag is turned off at `ready()` and a `Diagnostic`
 says so — the same hardware that reaches `MotionQuality.POOR` in
 [§12.1](#121-motion-hardware-and-what-it-can-override).
+
+### 12.4 Remote wake — FCM
+
+A process that an OEM battery manager has frozen, or that Android has parked in Doze, uploads
+nothing and notices nothing. The device cannot see that gap, but your server can: an open shift
+with no upload for N minutes. The fix is for the server to wake the device.
+
+Of the ways to wake an Android app, only a **high-priority FCM data message** gets through
+Doze. It is also one of the few things that lets an app start a foreground service from the
+background on API 31+. The SDK has no Firebase dependency. You own FCM, and you pass the
+message to the SDK:
+
+```kotlin
+class AppMessagingService : FirebaseMessagingService() {
+    override fun onMessageReceived(message: RemoteMessage) {
+        if (message.data["type"] == "fieldtrack_wake") {
+            Tracker.wake(applicationContext)   // already on a background thread
+        }
+    }
+
+    override fun onNewToken(token: String) {
+        // send to your backend against the signed-in user + device
+    }
+}
+```
+
+```xml
+<service
+    android:name=".AppMessagingService"
+    android:exported="false">
+    <intent-filter>
+        <action android:name="com.google.firebase.MESSAGING_EVENT" />
+    </intent-filter>
+</service>
+```
+
+`Tracker.wake()` decides whether there is anything to do:
+
+| `WakeResult` | Meaning |
+|---|---|
+| `ALIVE` | The service was running. A fix and an upload drain were requested |
+| `REVIVED` | A session was open with no service behind it; the service was started |
+| `REFUSED` | The platform refused the start. The SDK's counted restore path is queued and retries with backoff |
+| `NO_SESSION` | No session is open. Nothing was started — **a wake never starts a session** |
+| `DISABLED` | `service.foregroundService = false`; nothing to start |
+| `DISPATCHED` | Called on the main thread, so it ran in the background instead of blocking |
+| `TIMED_OUT` | The session lookup did not finish within ~8 s; nothing was started |
+
+It blocks for one database read (bounded), so call it off the main thread;
+`onMessageReceived` already runs off it. Each call is also written to the diagnostic log as a
+`Tracker` line, `remote wake: <RESULT>` ([§15.5](#155-what-the-sdk-records-without-being-asked)).
+That line is how you tell whether a push reached the device at all.
+
+**What the server must send.** Data-only and high priority. A `notification` block makes
+Android display the message itself while the app is in the background, and
+`onMessageReceived` is never called. Normal priority waits until Doze ends.
+
+```json
+{ "message": {
+    "token": "<device FCM token>",
+    "android": { "priority": "high", "ttl": "300s" },
+    "data": { "type": "fieldtrack_wake" } } }
+```
+
+**When to send it.** Send it on *no upload or heartbeat for N minutes while a shift is open*.
+Do not send it on *no movement*: a parked user legitimately stores nothing, and pushing every
+few minutes at a healthy device wastes the high-priority budget. Back off (for example 3 → 6 →
+12 → 30 min) and stop once the device's last-seen time moves. FCM may downgrade high-priority
+messages that rarely lead to anything the user sees. A revival posts the tracking
+notification, which counts.
+
+**What it cannot do.** It cannot reach an app that has been **force-stopped**. Android does not
+deliver FCM to a stopped package until the user opens it again. Some OEM killers (ColorOS
+`o-kill`, some MIUI paths) amount to a force-stop. On those devices only exempting the app from
+battery optimisation, and enabling the OEM's auto-launch or background-activity toggle, keeps
+tracking alive.
+
+**Cold start.** `firebase-messaging` adds `FirebaseInitProvider` to every cold start of your
+process, and that runs inside the window before the tracking service must promote to the
+foreground ([§1.7](#17-recommended-take-workmanager-off-your-cold-start-path)). It is normally
+tens of milliseconds, but measure it on your slowest device.
 
 ---
 
@@ -3616,3 +3704,8 @@ fire and the runtime waiver already applies.
 | Integrity findings never appear | The host app is debuggable, so the layer is waived | Expected. Check `IntegrityReport.waived`; exercise the layer in a release build |
 | `assembleRelease` fails on `FieldTrackSecurityDisabled` | A release source set disables the integrity layer | Move the override to `src/debug/` ([§20.6](#206-build-time-checks)) |
 | Live map jumps backwards | Drawing a stale frame | Drop any `LiveTrackUpdate` whose `sequence` is not newer than the last drawn |
+| Long straight lines on the map, with nothing recorded in between | The process was frozen, killed or in Doze. Look in the device log for `ProcessExit` (`o-kill`, `PACKAGE_UPDATED`) and gaps between `DEVICE_LOCATION` re-inits | Exempt the app from battery optimisation and enable the OEM auto-launch toggle; wire remote wake ([§12.4](#124-remote-wake--fcm)); draw time gaps as breaks on your map, not as travel |
+| `unknown_geofence:fieldtrack-stationary`, then minutes with no points while driving | Fixed. The stationary wake fence could stay registered with Play Services after the SDK lost its record of it, and the exit was dropped | Update the SDK. The exit now wakes tracking whether or not the record exists ([§11](#11-geofences)) |
+| Server sends idle pushes but `last_seen` never moves | Nothing on the device handles them, the message has a `notification` block, or it is not high priority | Handle it with `Tracker.wake()` and send data-only, high-priority messages ([§12.4](#124-remote-wake--fcm)) |
+| `remote wake: NO_SESSION` in the log | The push arrived, but no session was open on the device | Expected after end-of-day or a sign-out. Stop pushing to that device |
+| `remote wake: REFUSED` in the log | The platform refused the foreground-service start — usually a normal-priority message, or an OEM rule | Confirm `"priority": "high"`. The SDK retries on its own restore path |

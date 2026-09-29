@@ -148,6 +148,19 @@ internal class SyncScheduler(
      * Still asks the queue first: a session that ended with everything uploaded should
      * leave no work behind at all.
      */
+    suspend fun onRemoteWake() {
+        val active = trigger ?: return
+
+        val pending = runCatching { queue.pendingCount() }.getOrDefault(0)
+        if (pending == 0) return
+
+        // Bypasses the throttle: the server sent this wake because it stopped hearing from
+        // the device, so the backlog is the answer it is waiting for.
+        lastRequestMs = clock.wallTimeMs()
+        sdkLog { logger.d(TAG, "Remote wake with $pending row(s) queued; requesting a drain") }
+        active.requestSync()
+    }
+
     suspend fun onSessionClosed() {
         val active = trigger ?: return
 

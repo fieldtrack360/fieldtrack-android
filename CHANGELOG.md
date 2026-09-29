@@ -38,6 +38,30 @@ and validate the result. It covers every exported version, and a companion case 
 
 ### Added
 
+- **`Tracker.wake(context)` — remote wake for FCM** (`fieldtrack-core`). Call it from the
+  host's `FirebaseMessagingService.onMessageReceived` when the server sends a high-priority,
+  data-only message for a device whose open shift has stopped uploading. Service alive →
+  forces a fix and an upload drain (`WakeResult.ALIVE`); session open with no service →
+  starts it, which a high-priority FCM message makes legal from the background on API 31+
+  (`REVIVED`, or `REFUSED` with the counted restore path queued); no session → nothing
+  (`NO_SESSION`). Blocking for one bounded database read, `@WorkerThread`; a main-thread call
+  dispatches and returns `DISPATCHED`. Emits `remote wake: <result>` as a diagnostic, so
+  delivery shows up in the device log. The SDK takes no Firebase dependency. It does not
+  reach a force-stopped app — Android withholds FCM from a stopped package. The shared
+  revival body is now `reviveTrackingService()`, used by the geofence and
+  activity-transition receivers too; their behaviour is unchanged.
+  The sample ships `SampleMessagingService`, active once a `google-services.json` is dropped
+  into `sample-android/` (the google-services plugin is applied only when that file exists).
+
+- **Diagnostic log: `process_start` entry and early-event replay** (`fieldtrack-sync`). A process
+  that starts with a session open now writes one `lifecycle` row (`code: "process_start"`,
+  `warn`) carrying `ApplicationExitInfo`'s account of how the previous process died (Android
+  11+). Events emitted before the log channel attached — in a revived process, "capture
+  resumed … after the process was killed" and its `session_start` — are held by core and
+  written once it attaches, with their original timestamps; they used to be lost because
+  `Tracker.events` does not replay. `Tracker.events` itself is unchanged for host collectors.
+  New in core: `TrackerArtifacts.drainEarlyEvents` (module seam, not host API).
+
 - **Every upload is written to logcat as one line, under `FieldTrackApi`.** Debug builds
   only — the lines go through `sdkLog`, which the release variant compiles out.
 
@@ -279,6 +303,18 @@ and validate the result. It covers every exported version, and a companion case 
   - Turned off automatically, with a `Diagnostic`, on a device with no accelerometer.
 
 ### Fixed
+
+- **Stationary wake-fence exit dropped as `unknown_geofence:fieldtrack-stationary`, leaving
+  the tracker STATIONARY through the drive that followed.** Seen on an OPPO CPH2681: a
+  25-minute straight line on the map. `StationaryFence.register()` wrote its store row only
+  in the `addGeofences` success listener, so a process killed before the callback — or an
+  `unregister()` whose listener landed after it and deleted the new row — left Play Services
+  holding a fence the store did not know. `unregister()` also skipped the system removal
+  when the row was missing, which is how such a fence outlived its session. Now the row is
+  written before the system call (and removed again only if that call fails), `unregister()`
+  drops the row synchronously and always asks Play Services to remove the fence, and
+  `StationaryFenceReceiver` treats an EXIT for the configured `stationaryGeofenceId` as the
+  wake fence even with no row.
 
 - **A point plotted on a street the device never entered, mid-session and again at the end of
   it.** Reported from Delhi: the track left the route mid-journey, ran past a school the user

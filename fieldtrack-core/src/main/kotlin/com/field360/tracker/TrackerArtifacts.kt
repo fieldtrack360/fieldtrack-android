@@ -2,6 +2,7 @@ package com.field360.tracker
 
 import android.content.Context
 import com.field360.tracker.di.TrackerGraph
+import com.field360.tracker.domain.model.TrackerEvent
 import com.field360.tracker.domain.repository.PendingUploadStore
 import com.field360.tracker.domain.repository.SyncTrigger
 import com.field360.traker.geo.port.Clock
@@ -55,6 +56,24 @@ public class TrackerArtifacts private constructor(private val graph: TrackerGrap
      * a fallback and reports a missing endpoint rather than waiting for one.
      */
     public val baseUrl: String? get() = graph.configStore.cached?.baseUrl
+
+    /**
+     * Hands [consumer] the events this process emitted before anything collected
+     * [Tracker.events], oldest first, each with the instant it was emitted — **once per
+     * process**; later calls deliver nothing.
+     *
+     * For `fieldtrack-sync`'s diagnostic log. `Tracker.events` does not replay, so in a
+     * process revived to restart capture, the entries that say so are emitted before the
+     * host has configured the log channel. This is where they wait. Per-fix, heartbeat and
+     * battery events are not held.
+     */
+    public fun drainEarlyEvents(
+        consumer: (event: TrackerEvent, wallTimeMs: Long, elapsedRealtimeNanos: Long) -> Unit,
+    ) {
+        graph.earlyEvents.claim().forEach {
+            consumer(it.event, it.wallTimeMs, it.elapsedRealtimeNanos)
+        }
+    }
 
     public companion object {
         /** Same process-wide graph [Tracker.getInstance] returns from. */

@@ -153,12 +153,18 @@ internal class TrackerGraph private constructor(
      * the first, and the host UI plus a background collector is the normal case (EC-112).
      */
     val events: MutableSharedFlow<TrackerEvent> by lazy {
-        MutableSharedFlow(
+        MutableSharedFlow<TrackerEvent>(
             replay = 0,
             extraBufferCapacity = EVENT_BUFFER,
             onBufferOverflow = BufferOverflow.DROP_OLDEST,
-        )
+        ).also { earlyEvents.attach(it, scope) }
     }
+
+    /**
+     * The events this process emitted before the log channel attached. Subscribed as
+     * [events] is created, so nothing can be emitted ahead of it; see [EarlyEventBuffer].
+     */
+    val earlyEvents: EarlyEventBuffer by lazy { EarlyEventBuffer(clock) }
 
     /** The SDK's own application-scoped coroutine scope; outlives any Activity. */
     val scope: CoroutineScope by lazy { CoroutineScope(SupervisorJob() + Dispatchers.Default) }

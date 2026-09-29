@@ -9,6 +9,17 @@ plugins {
     alias(libs.plugins.compose.compiler)
 }
 
+/**
+ * FCM remote wake (`SampleMessagingService` -> `Tracker.wake`) needs a Firebase project.
+ * Drop that project's `google-services.json` into `sample-android/` to turn it on.
+ *
+ * Applied only when the file exists, so the sample still builds for anyone without one.
+ * Without it Firebase never initialises: no token, no messages, and the service is inert.
+ */
+if (file("google-services.json").exists()) {
+    apply(plugin = libs.plugins.google.services.get().pluginId)
+}
+
 fun properties(name: String): Properties = Properties().apply {
     val file = rootProject.file(name)
     if (file.exists()) file.inputStream().use { load(it) }
@@ -197,4 +208,9 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.kotlinx.coroutines.android)
+
+    // Remote wake. The SDK has no Firebase dependency — the host owns FCM and calls
+    // `Tracker.wake()` from its own service. See SampleMessagingService.
+    implementation(platform(libs.firebase.bom))
+    implementation(libs.firebase.messaging)
 }

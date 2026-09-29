@@ -1064,6 +1064,8 @@ public class TrackerSync internal constructor(
                 logger = access.logger,
                 tracker = access.trackIt,
                 events = access.trackIt.events,
+                access = access,
+                context = app,
             )
 
             val logSink = MutableSharedFlow<SyncEvent>(

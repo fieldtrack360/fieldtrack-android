@@ -112,6 +112,7 @@
 -keep public class com.field360.tracker.domain.model.TrackerResult$* { public protected *; }
 -keep public class com.field360.tracker.domain.model.TrackerState { public protected *; }
 -keep public class com.field360.tracker.domain.model.TrackSession { public protected *; }
+-keep public class com.field360.tracker.domain.model.WakeResult { public protected *; }
 -keep public class com.field360.tracker.domain.repository.** { public protected *; }
 
 # The permission ladder — PermissionManager and its nested BackgroundRequest hierarchy.

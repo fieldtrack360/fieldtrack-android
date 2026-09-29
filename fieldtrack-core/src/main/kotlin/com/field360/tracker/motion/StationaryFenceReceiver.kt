@@ -6,6 +6,7 @@ import android.content.Intent
 import com.field360.tracker.di.TrackerGraph
 import com.field360.tracker.domain.model.GeofenceTransition
 import com.field360.tracker.domain.model.TrackerEvent
+import com.field360.tracker.domain.model.TrackerGeofence
 import com.google.android.gms.location.Geofence
 import com.field360.tracker.service.CaptureBus
 import com.field360.tracker.service.reviveServiceIfNeeded
@@ -47,11 +48,22 @@ public class StationaryFenceReceiver : BroadcastReceiver() {
             }
         }
 
+        // The wake fence is also recognised by id, not only by its store row. A system fence
+        // with no row is a store that fell behind Play Services, and treating that exit as
+        // unknown discarded the only wake a killed, parked process gets. `cached` rather
+        // than a disk read — this is the main thread; a cold process falls back to the
+        // default id, and a host-customised id is still revived by the call above.
+        val wakeFenceId = graph.configStore.cached?.motion?.stationaryGeofenceId
+            ?: TrackerGeofence.DEFAULT_ID
+
         var stationaryFenceExited = false
         event.triggeringGeofences.orEmpty().forEach { triggered ->
             val registration = graph.stationaryFence.store.registration(triggered.requestId)
             if (registration == null) {
                 events.tryEmit(TrackerEvent.Diagnostic("unknown_geofence:${triggered.requestId}"))
+                if (transition == GeofenceTransition.EXIT && triggered.requestId == wakeFenceId) {
+                    stationaryFenceExited = true
+                }
                 return@forEach
             }
             graph.stationaryFence.store.record(registration, transition, System.currentTimeMillis())

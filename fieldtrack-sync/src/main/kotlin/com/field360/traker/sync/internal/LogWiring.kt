@@ -1,6 +1,8 @@
 package com.field360.traker.sync.internal
 
+import android.content.Context
 import com.field360.tracker.Tracker
+import com.field360.tracker.TrackerArtifacts
 import com.field360.traker.geo.port.Clock
 import com.field360.traker.geo.port.TrackLogger
 import com.field360.traker.sync.LogAppInfo
@@ -36,6 +38,8 @@ internal fun newLogRecorder(
     logger: TrackLogger,
     tracker: Tracker,
     events: SharedFlow<TrackerEvent>,
+    access: TrackerArtifacts,
+    context: Context,
 ): LogRecorder = LogRecorder(
     dao = dao,
     clock = clock,
@@ -67,6 +71,11 @@ internal fun newLogRecorder(
         runCatching { tracker.currentSession()?.id }.getOrNull()
             ?: tracker.state.value.currentSessionId
     },
+    // What the process emitted before the recorder attached — in a revived process, the
+    // resume itself. Drained once; see `EarlyEventBuffer` in core.
+    earlyEvents = { drainEarlyEvents(access) },
+    lastProcessExit = { lastProcessExit(context) },
+    recordsProcessStart = true,
 )
 
 /** @see newLogRecorder — the same packaging reason applies to both suspend lambdas here. */
