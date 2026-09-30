@@ -2,6 +2,7 @@ package com.field360.tracker.permission
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.AlarmManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -11,6 +12,7 @@ import android.provider.Settings
 import androidx.core.content.ContextCompat
 import com.field360.tracker.domain.model.LocationAccuracy
 import com.field360.tracker.domain.model.PermissionTier
+import com.field360.tracker.service.ServiceHeartbeat
 
 /**
  * Permission state, and the ladder needed to improve it.
@@ -191,18 +193,62 @@ public class PermissionManager internal constructor(
     }
 
     /**
-     * Whether the merged manifest declares the exemption permission.
+     * Whether the service heartbeat can use an **exact** alarm right now.
      *
-     * `requestedPermissions` rather than a `checkSelfPermission`: this is a normal-level
-     * permission, so it is granted at install time and a runtime check answers "is it in
-     * the manifest" in a roundabout way that returns the wrong thing on the OEMs that
-     * pre-grant it. Asking the package manager what was declared is the direct question.
+     * This is more than timing. On API 31+ an exact alarm is on the platform's allowlist
+     * for starting a foreground service from the background; an inexact one is not. So
+     * `false` here means an OEM-killed or recents-swiped service is restored only when
+     * something else makes the app eligible, and field logs show that taking 15–55 minutes.
+     *
+     * Always `true` below API 31. Above it, `true` only when the **host** declared
+     * `SCHEDULE_EXACT_ALARM` or `USE_EXACT_ALARM` and the user has not revoked "Alarms &
+     * reminders" — the SDK declares neither (EC-15). Read it in `onResume`: the user can
+     * flip it in Settings at any time and the heartbeat re-checks on every schedule.
      */
-    private fun declaresBatteryExemptionPermission(): Boolean = runCatching {
+    public fun canScheduleExactAlarms(): Boolean {
+        val manager = context.getSystemService(AlarmManager::class.java) ?: return false
+        return ServiceHeartbeat.canScheduleExact(manager)
+    }
+
+    /**
+     * The system "Alarms & reminders" page for this app, or `null` when there is nothing
+     * to ask for.
+     *
+     * **Null unless the host declares `SCHEDULE_EXACT_ALARM` in its own manifest**, for the
+     * same reason and by the same runtime check as [batteryExemptionRequestIntent]: the
+     * page does nothing for an app that did not declare it. Also null below API 31, where
+     * no grant exists, and when [canScheduleExactAlarms] already holds — which is always
+     * the case for a host on `USE_EXACT_ALARM`.
+     *
+     * Needed in practice on API 34+, where `SCHEDULE_EXACT_ALARM` is denied by default for
+     * every app that is not an alarm clock or calendar.
+     */
+    public fun exactAlarmSettingsIntent(): Intent? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return null
+        if (canScheduleExactAlarms()) return null
+        if (!declaresPermission(Manifest.permission.SCHEDULE_EXACT_ALARM)) return null
+        return Intent(
+            Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,
+            Uri.fromParts("package", context.packageName, null),
+        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+
+    private fun declaresBatteryExemptionPermission(): Boolean =
+        declaresPermission(Manifest.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+
+    /**
+     * Whether the merged manifest declares [permission].
+     *
+     * `requestedPermissions` rather than a `checkSelfPermission`: these are install-time
+     * or special-access permissions, so a runtime check answers "is it in the manifest" in
+     * a roundabout way that returns the wrong thing on the OEMs that pre-grant them. Asking
+     * the package manager what was declared is the direct question.
+     */
+    private fun declaresPermission(permission: String): Boolean = runCatching {
         context.packageManager
             .getPackageInfo(context.packageName, PackageManager.GET_PERMISSIONS)
             .requestedPermissions
-            ?.contains(Manifest.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS) == true
+            ?.contains(permission) == true
     }.getOrDefault(false)
 
     private fun hasBackgroundLocation(): Boolean =

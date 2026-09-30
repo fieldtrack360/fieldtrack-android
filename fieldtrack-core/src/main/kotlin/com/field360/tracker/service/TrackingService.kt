@@ -164,6 +164,33 @@ public class TrackingService : LifecycleService() {
         return START_STICKY
     }
 
+    /**
+     * The user swiped the app out of recents while a session was being served.
+     *
+     * `stopWithTask="false"` already keeps the service on stock Android, where this is the
+     * whole story. It is not on Funtouch, ColorOS, OxygenOS and MIUI: there the ROM kills
+     * the process a moment after this callback, and the next thing that could notice is the
+     * heartbeat alarm up to [ServiceConfig.serviceHeartbeatMin] later. Field logs show
+     * exactly that — 15-to-55-minute holes that end on a heartbeat restore.
+     *
+     * So the pending heartbeat is pulled forward to a few seconds from now. Same alarm,
+     * same receiver, same `PendingIntent`: nothing new can stack, and the receiver re-arms
+     * the normal cadence as its first act. If the process survives (stock), the tick finds
+     * the service running and costs one wakeup. If the ROM force-stops the package instead
+     * of killing it, the alarm is cancelled with everything else and nothing here can help —
+     * that case belongs to the host's "lock in recents" guidance, not to code.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        if (!running) return
+        val service = graph.configStore.cached?.service ?: ServiceConfig()
+        ServiceHeartbeat.scheduleSoon(applicationContext, service)
+        sdkWarn { logger.w(TAG, "Task removed during an active session; fast restore armed") }
+        events.tryEmit(
+            TrackerEvent.Diagnostic("task removed from recents during an active session; fast restore armed"),
+        )
+    }
+
     override fun onDestroy() {
         teardown()
         super.onDestroy()

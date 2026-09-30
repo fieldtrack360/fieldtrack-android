@@ -89,6 +89,25 @@ internal object ServiceHeartbeat {
      * rather than taking a broadcast receiver or a session start down with it.
      */
     fun schedule(context: Context, config: ServiceConfig) {
+        arm(context, config, config.serviceHeartbeatMin * MILLIS_PER_MINUTE)
+    }
+
+    /**
+     * Pulls the next tick forward to [FAST_RESTORE_DELAY_MS] from now.
+     *
+     * For the moments the SDK *knows* the process is about to die — `onTaskRemoved` on a
+     * ROM that kills on a recents swipe — so the restore lands in seconds instead of a full
+     * heartbeat period later. It replaces the pending alarm rather than adding one, and the
+     * receiver re-arms the normal cadence first thing, so the chain is unchanged after it.
+     *
+     * The delay is not zero on purpose: fired inside the dying process the tick would see
+     * the service still running, skip, and leave the next chance a whole period away.
+     */
+    fun scheduleSoon(context: Context, config: ServiceConfig) {
+        arm(context, config, FAST_RESTORE_DELAY_MS)
+    }
+
+    private fun arm(context: Context, config: ServiceConfig, delayMs: Long) {
         if (config.serviceHeartbeatMin <= 0) return
         // Nothing to restore. Guarded here rather than at each caller so a host running
         // without a foreground service cannot end up with an alarm chain waking the device
@@ -98,8 +117,7 @@ internal object ServiceHeartbeat {
         val manager = appContext.getSystemService(AlarmManager::class.java) ?: return
         val pending = pendingIntent(appContext, PendingIntent.FLAG_UPDATE_CURRENT) ?: return
 
-        val triggerAt = SystemClock.elapsedRealtime() +
-            config.serviceHeartbeatMin * MILLIS_PER_MINUTE
+        val triggerAt = SystemClock.elapsedRealtime() + delayMs
 
         // ELAPSED_REALTIME_WAKEUP, never RTC: the heartbeat measures an interval since the
         // last tick, and an RTC alarm would fire early or late by however far a user or an
@@ -160,7 +178,7 @@ internal object ServiceHeartbeat {
      * when a user revokes "Alarms & reminders", so it is asked on every schedule rather
      * than cached.
      */
-    private fun canScheduleExact(manager: AlarmManager): Boolean =
+    internal fun canScheduleExact(manager: AlarmManager): Boolean =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             runCatching { manager.canScheduleExactAlarms() }.getOrDefault(false)
         } else {
@@ -173,6 +191,9 @@ internal object ServiceHeartbeat {
     private const val REQUEST_CODE = 8_302
 
     private const val MILLIS_PER_MINUTE = 60_000L
+
+    /** Long enough for the ROM to finish killing the swiped process first. */
+    private const val FAST_RESTORE_DELAY_MS = 5_000L
 }
 
 /**

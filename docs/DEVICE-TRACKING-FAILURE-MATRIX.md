@@ -93,7 +93,7 @@ these ROMs those layers are themselves the thing being disabled (PERMISSIONS.md 
 | Device / ROM | Android | Scenario → why tracking breaks | SDK signal | Fix — host app | Fix — user / device |
 |---|---|---|---|---|---|
 | All | all | **Force stop** (App info → Force stop). App enters *stopped state*: alarms cancelled, jobs cancelled, no broadcasts (BOOT_COMPLETED included until next launch). **KILL** | `SessionInterrupted` on next `ready()` (EC-66) | Resume prompt on `SessionInterrupted`; MDM `DISALLOW_APPS_CONTROL` | Open the app |
-| All | all | **Swipe from recents.** Stock: `stopWithTask="false"` keeps the FGS. MIUI/ColorOS/Funtouch/EMUI: process killed → revival layers rebuild it in minutes if allowed (§2). **GAP** on those ROMs | `Diagnostic` "capture resumed for session … after the process was killed" | Nothing (already handled) | Lock the app in recents on §2 ROMs |
+| All | all | **Swipe from recents.** Stock: `stopWithTask="false"` keeps the FGS. MIUI/ColorOS/Funtouch/EMUI: process killed → `onTaskRemoved` pulls the heartbeat alarm forward to ~5 s, so revival lands in seconds when the alarm is exact (host `SCHEDULE_EXACT_ALARM`), else at the next eligible moment (§2). A swipe the ROM treats as force-stop cancels the alarm too. **GAP** on those ROMs | `Diagnostic` "task removed from recents during an active session; fast restore armed", then "capture resumed for session … after the process was killed" | Nothing (already handled) | Lock the app in recents on §2 ROMs |
 | All | all | **Clear storage / Clear data**: sessions, config, filter state gone. **KILL** (nothing to resume) | `Error(NOT_READY)` until `ready()`; `STORAGE_RESET` if the DB was recreated | Re-run `ready()` and `configure()` on every launch | — |
 | All | all | **Uninstall / reinstall**: same as clear data plus permissions reset. | as above | as above | — |
 | All | all | **App update**: process killed by the installer. `MY_PACKAGE_REPLACED` → `BootReceiver` resumes the open session (`startOnBoot = true`). **GAP** seconds | `Diagnostic` capture resumed | Keep `startOnBoot` on | — |
@@ -200,7 +200,7 @@ Minimum viable "keep tracking alive" UX, derived from the rows above:
 | Full permission ladder incl. notifications, physical activity, "Allow all the time" | `PermissionManager.backgroundRequest()`, `foregroundPermissions()`, `notificationPermissions()`, `activityRecognitionPermissions()`, `appSettingsIntent()` |
 | Battery/background status on the settings screen, re-read in `onResume` | `PermissionManager.backgroundRestrictions()` → `degraded`, `backgroundRestricted`, `standbyBucket`, `ignoringBatteryOptimizations` |
 | Two-tap exemption always; one-tap when your listing qualifies | `batteryOptimizationSettingsIntent()`; `batteryExemptionRequestIntent()` (null unless **you** declared `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`) |
-| Exact heartbeat where policy allows | Declare `SCHEDULE_EXACT_ALARM` in **your** manifest; `ServiceHeartbeat` upgrades at runtime |
+| Exact heartbeat where policy allows | Declare `SCHEDULE_EXACT_ALARM` in **your** manifest; `ServiceHeartbeat` upgrades at runtime. Check `PermissionManager.canScheduleExactAlarms()`; on API 34+ launch `exactAlarmSettingsIntent()` (null when nothing to ask) |
 | OEM setup screen keyed on `Build.MANUFACTURER` with the §2 menu paths | — |
 | Banner on `PowerSaveChange`, `CaptureSuspended`, `Error(TRACKER_DEAD)`, `Error(FGS_START_REFUSED)`, `SessionInterrupted` | `Tracker.events` |
 | Lean `Application.onCreate`; WorkManager initializer removed | INTEGRATION-GUIDE §1.7 |
